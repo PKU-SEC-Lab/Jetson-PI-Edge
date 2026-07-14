@@ -1,6 +1,6 @@
-# Jetson-PI
+# Jetson-PI-Edge
 
-Jetson-PI is the codebase for the paper "Jetson-PI: Towards Onboard Real-Time Robot Control via Foresight-Aligned Asynchronous Inference." It serves PI0 and PI0.5 models through a llama.cpp-based HTTP server and supports multiple deployment backends for embedded robot inference, including CPU-only builds, NVIDIA Jetson Orin/Thor, and NPU-oriented integrations.
+Jetson-PI-Edge is the inference engine for the paper "Jetson-PI: Towards Onboard Real-Time Robot Control via Foresight-Aligned Asynchronous Inference." It serves PI0 and PI0.5 models through a llama.cpp-based HTTP server and supports multiple deployment backends for embedded robot inference, including CPU-only builds, NVIDIA Jetson Orin/Thor, and NPU-oriented integrations.
 
 The main runtime path is the foreground server used by robot control loops. Images, robot state, and instruction text are submitted to a persistent server session, and the server returns action tensors with timing breakdowns. This keeps the model interface simple for robot applications: send sensor inputs, run one foreground inference call, and consume the final action output.
 
