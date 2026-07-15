@@ -1,0 +1,30 @@
+{
+  "_name_or_path": "Pi05_VIT",
+  "architectures": [
+    "pi0"
+  ],
+  "initializer_factor": 1.0,
+  "model_type": "pi0",
+  "text_config": {
+    "hidden_size": 1152,
+    "intermediate_size": 4304,
+    "max_position_embeddings": 16,
+    "model_type": "siglip_text_model",
+    "num_attention_heads": 16,
+    "num_hidden_layers": 27
+  },
+  "torch_dtype": "float32",
+  "transformers_version": "4.57.6",
+  "vision_config": {
+    "hidden_size": 1152,
+    "intermediate_size": 4304,
+    "model_type": "pi0",
+    "num_attention_heads": 16,
+    "num_hidden_layers": 27,
+    "patch_size": 14,
+    "image_size": 224,
+    "layer_norm_eps": 1e-6,
+    "hidden_act": "gelu_pytorch_tanh",
+    "projection_dim": 2048
+  }
+}

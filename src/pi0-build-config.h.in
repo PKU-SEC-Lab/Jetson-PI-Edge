@@ -1,0 +1,5 @@
+#pragma once
+
+#cmakedefine01 PI0_ENABLE_REUSE_LOG
+#cmakedefine01 PI0_ENABLE_NVTX
+#cmakedefine01 PI0_ENABLE_AE_STEP_DEBUG
