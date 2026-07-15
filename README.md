@@ -46,9 +46,26 @@ cmake --build build --target llama-server -j
 
 See [docs/model_conversion.md](docs/model_conversion.md) for model download, config preparation, PI surgery, and GGUF conversion steps.
 
+## Start The Foreground Server
+
+The server command is the same across backends. On GPU builds, `-ngl 99` offloads model layers to the accelerator. On CPU-only builds, omit `-ngl` or set it to `0`.
+
+```bash
+PI_MODEL=auto \
+PI0_ACTION_NOISE_BIN=/path/to/noise_10x32_or_50x32.bin \
+./build/bin/llama-server \
+  -m /path/to/pi_llm.gguf \
+  --mmproj /path/to/mmproj.gguf \
+  -ngl 99 \
+  --host 0.0.0.0 \
+  --port 8080
+```
+
+For PI0.5, use the PI0.5 LLM and matching PI0.5 vision GGUF. For PI0, use the PI0 LLM and matching PI0 vision GGUF.
+
 ## FlashRT Python API Example
 
-Install FlashRT by following the [FlashRT README](https://github.com/flashrt-project/FlashRT) before using this API path. The same JetsonPI provider can then be called through FlashRT without starting the HTTP foreground server. The FlashRT runtime loads a provider library and calls the JetsonPI C API exposed by this branch.
+Install FlashRT by following the [FlashRT README](https://github.com/flashrt-project/FlashRT) before using this API path. The same JetsonPI provider can then be called through FlashRT without starting the HTTP foreground server. The provider library is usually produced under the FlashRT build tree, for example `<FlashRT repo>/cpp/<build-dir>/libflashrt_cpp_llama_cpp_provider_c.so`.
 
 ```python
 import os
@@ -95,23 +112,6 @@ actions = model.predict(
 
 np.savetxt("actions_10x32.txt", np.asarray(actions, dtype=np.float32), fmt="%.9g")
 ```
-
-## Start The Foreground Server
-
-The server command is the same across backends. On GPU builds, `-ngl 99` offloads model layers to the accelerator. On CPU-only builds, omit `-ngl` or set it to `0`.
-
-```bash
-PI_MODEL=auto \
-PI0_ACTION_NOISE_BIN=/path/to/noise_10x32_or_50x32.bin \
-./build/bin/llama-server \
-  -m /path/to/pi_llm.gguf \
-  --mmproj /path/to/mmproj.gguf \
-  -ngl 99 \
-  --host 0.0.0.0 \
-  --port 8080
-```
-
-For PI0.5, use the PI0.5 LLM and matching PI0.5 vision GGUF. For PI0, use the PI0 LLM and matching PI0 vision GGUF.
 
 ## Minimal Foreground Example
 
