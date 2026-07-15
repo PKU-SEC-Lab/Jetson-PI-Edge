@@ -65,7 +65,7 @@ For PI0.5, use the PI0.5 LLM and matching PI0.5 vision GGUF. For PI0, use the PI
 
 ## FlashRT Python API Example
 
-Install FlashRT by following the [FlashRT README](https://github.com/flashrt-project/FlashRT) before using this API path. The same JetsonPI provider can then be called through FlashRT without starting the HTTP foreground server. The provider library is usually produced under the FlashRT build tree, for example `<FlashRT repo>/cpp/<build-dir>/libflashrt_cpp_llama_cpp_provider_c.so`.
+Install FlashRT by following the [FlashRT README](https://github.com/flashrt-project/FlashRT) before using this API path. The same JetsonPI provider can then be called through FlashRT without starting the HTTP foreground server.
 
 ```python
 import os
@@ -94,6 +94,7 @@ model = flash_rt.load_model(
     action_steps=10,
     action_dim=32,
     # Optional: set this when the provider library is not on the default path.
+    # The provider library is usually produced under the FlashRT build tree, for example `<FlashRT repo>/cpp/<build-dir>/libflashrt_cpp_llama_cpp_provider_c.so`.
     lib_path="/path/to/libflashrt_cpp_llama_cpp_provider_c.so",
 )
 
