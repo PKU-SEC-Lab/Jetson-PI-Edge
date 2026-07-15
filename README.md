@@ -2,6 +2,8 @@
 
 Jetson-PI is the codebase for the paper "Jetson-PI: Towards Onboard Real-Time Robot Control via Foresight-Aligned Asynchronous Inference." It serves PI0 and PI0.5 models through a llama.cpp-based HTTP server and supports multiple deployment backends for embedded robot inference, including CPU-only builds, NVIDIA Jetson Orin/Thor, and NPU-oriented integrations.
 
+This branch also exposes JetsonPI as a FlashRT-loadable provider through a C API, so FlashRT can run the same PI0/PI0.5 model path without using the HTTP foreground server.
+
 The main runtime path is the foreground server used by robot control loops. Images, robot state, and instruction text are submitted to a persistent server session, and the server returns action tensors with timing breakdowns. This keeps the model interface simple for robot applications: send sensor inputs, run one foreground inference call, and consume the final action output.
 
 This project is based on [llama.cpp](https://github.com/ggml-org/llama.cpp).
