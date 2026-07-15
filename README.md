@@ -107,6 +107,56 @@ curl http://127.0.0.1:8080/foreground/session
 
 See [docs/foreground_server_usage.md](docs/foreground_server_usage.md) for endpoint details and response fields.
 
+## FlashRT Python API Example
+
+The same JetsonPI provider can be called through [FlashRT](https://github.com/flashrt-project/FlashRT) without starting the HTTP foreground server. The FlashRT runtime loads a provider library and calls the JetsonPI C API exposed by this branch.
+
+```python
+import os
+
+import flash_rt
+import numpy as np
+from PIL import Image
+
+
+def load_rgb224(path):
+    image = Image.open(path).convert("RGB")
+    if image.size != (224, 224):
+        image = image.resize((224, 224), Image.BILINEAR)
+    return np.asarray(image, dtype=np.uint8)
+
+
+os.environ["PI0_ACTION_NOISE_BIN"] = "/path/to/pi0_noise_10x32.bin"
+
+model = flash_rt.load_model(
+    "/path/to/pi_llm.gguf",
+    framework="jetson_pi",
+    config="pi0",
+    mmproj_path="/path/to/mmproj.gguf",
+    backend="cuda",
+    num_views=2,
+    action_steps=10,
+    action_dim=32,
+    # Optional: set this when the provider library is not on the default path.
+    lib_path="/path/to/libflashrt_cpp_llama_cpp_provider_c.so",
+)
+
+image = load_rgb224("/path/to/image.png")
+images = [image, image]
+state = np.asarray([
+    -1.8731, -1.0370, 1.9652, 7.0876, 0.2546, -9.1432, -0.0147, -0.5037,
+    0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+], dtype=np.float32)
+
+actions = model.predict(
+    images=images,
+    prompt="/do something",
+    state=state,
+)
+
+np.savetxt("actions_10x32.txt", np.asarray(actions, dtype=np.float32), fmt="%.9g")
+```
+
 ## Response Fields
 
 PI foreground responses commonly include:
