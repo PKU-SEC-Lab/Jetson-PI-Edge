@@ -86,34 +86,12 @@ static bool server_resolve_pi_model_before_load(const common_params & params) {
     }
 
     const pi_model_detect_result llm = pi_model_detect_gguf_file(params.model.path);
-    const pi_model_detect_result mmproj = params.mmproj.path.empty()
-        ? pi_model_detect_result{}
-        : pi_model_detect_gguf_file(params.mmproj.path);
-
-    if (params.mmproj.path.empty()) {
-        if (llm.kind == PI_MODEL_PI0 || llm.kind == PI_MODEL_PI05) {
-            if (!server_set_pi_model_env(llm.kind)) {
-                SRV_ERR("failed to set auto-detected PI_MODEL=%s\n", pi_model_kind_name(llm.kind));
-                return false;
-            }
-            SRV_INF("PI_MODEL auto-detected from LLM: %s (%s)\n",
-                    pi_model_kind_name(llm.kind), llm.reason.c_str());
-            return true;
-        }
-        SRV_WRN("PI_MODEL not set and no mmproj was provided; leaving PI_MODEL=auto (%s). "
-                "If automatic detection is wrong, explicitly set PI_MODEL=pi0 or PI_MODEL=pi05.\n",
+    const bool llm_known = llm.kind == PI_MODEL_PI0 || llm.kind == PI_MODEL_PI05;
+    if (!llm_known) {
+        SRV_WRN("PI_MODEL not set and LLM GGUF auto-detection was unavailable; leaving PI_MODEL=auto (%s). "
+                "If automatic detection is wrong or unavailable, explicitly set PI_MODEL=pi0 or PI_MODEL=pi05.\n",
                 llm.reason.c_str());
         return true;
-    }
-
-    const bool llm_known = llm.kind == PI_MODEL_PI0 || llm.kind == PI_MODEL_PI05;
-    const bool mmproj_known = mmproj.kind == PI_MODEL_PI0 || mmproj.kind == PI_MODEL_PI05;
-    if (!llm_known || !mmproj_known || llm.kind != mmproj.kind) {
-        SRV_ERR("failed to auto-detect PI_MODEL from GGUF files: llm=%s (%s), mmproj=%s (%s). "
-                "If automatic detection is wrong or unavailable, explicitly set PI_MODEL=pi0 or PI_MODEL=pi05.\n",
-                pi_model_kind_name(llm.kind), llm.reason.c_str(),
-                pi_model_kind_name(mmproj.kind), mmproj.reason.c_str());
-        return false;
     }
 
     if (!server_set_pi_model_env(llm.kind)) {
@@ -121,8 +99,8 @@ static bool server_resolve_pi_model_before_load(const common_params & params) {
         return false;
     }
 
-    SRV_INF("PI_MODEL auto-detected as %s: llm=%s; mmproj=%s\n",
-            pi_model_kind_name(llm.kind), llm.reason.c_str(), mmproj.reason.c_str());
+    SRV_INF("PI_MODEL auto-detected from LLM as %s: %s\n",
+            pi_model_kind_name(llm.kind), llm.reason.c_str());
     return true;
 }
 
