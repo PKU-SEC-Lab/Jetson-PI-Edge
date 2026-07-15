@@ -2,7 +2,7 @@
 
 Jetson-PI is the codebase for the paper "Jetson-PI: Towards Onboard Real-Time Robot Control via Foresight-Aligned Asynchronous Inference." It serves PI0 and PI0.5 models through a llama.cpp-based HTTP server and supports multiple deployment backends for embedded robot inference, including CPU-only builds, NVIDIA Jetson Orin/Thor, and NPU-oriented integrations.
 
-This branch also exposes JetsonPI as a [FlashRT](https://github.com/flashrt-project/FlashRT)-loadable provider through a C API, so [FlashRT](https://github.com/flashrt-project/FlashRT) can run the same PI0/PI0.5 model path without using the HTTP foreground server.
+[FlashRT](https://github.com/flashrt-project/FlashRT) is a high-performance realtime inference engine for small-batch, latency-sensitive AI workloads, with VLA control integrations among its main use cases. This branch exposes JetsonPI as a FlashRT-loadable provider through a C API, so FlashRT can run the same PI0/PI0.5 model path without using the HTTP foreground server.
 
 The main runtime path is the foreground server used by robot control loops. Images, robot state, and instruction text are submitted to a persistent server session, and the server returns action tensors with timing breakdowns. This keeps the model interface simple for robot applications: send sensor inputs, run one foreground inference call, and consume the final action output.
 
@@ -45,6 +45,56 @@ cmake --build build --target llama-server -j
 ## Model Preparation
 
 See [docs/model_conversion.md](docs/model_conversion.md) for model download, config preparation, PI surgery, and GGUF conversion steps.
+
+## FlashRT Python API Example
+
+Install FlashRT by following the [FlashRT README](https://github.com/flashrt-project/FlashRT) before using this API path. The same JetsonPI provider can then be called through FlashRT without starting the HTTP foreground server. The FlashRT runtime loads a provider library and calls the JetsonPI C API exposed by this branch.
+
+```python
+import os
+
+import flash_rt
+import numpy as np
+from PIL import Image
+
+
+def load_rgb224(path):
+    image = Image.open(path).convert("RGB")
+    if image.size != (224, 224):
+        image = image.resize((224, 224), Image.BILINEAR)
+    return np.asarray(image, dtype=np.uint8)
+
+
+os.environ["PI0_ACTION_NOISE_BIN"] = "/path/to/pi0_noise_10x32.bin"
+
+model = flash_rt.load_model(
+    "/path/to/pi_llm.gguf",
+    framework="jetson_pi",
+    config="pi0",
+    mmproj_path="/path/to/mmproj.gguf",
+    backend="cuda",
+    num_views=2,
+    action_steps=10,
+    action_dim=32,
+    # Optional: set this when the provider library is not on the default path.
+    lib_path="/path/to/libflashrt_cpp_llama_cpp_provider_c.so",
+)
+
+image = load_rgb224("/path/to/image.png")
+images = [image, image]
+state = np.asarray([
+    -1.8731, -1.0370, 1.9652, 7.0876, 0.2546, -9.1432, -0.0147, -0.5037,
+    0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+], dtype=np.float32)
+
+actions = model.predict(
+    images=images,
+    prompt="/do something",
+    state=state,
+)
+
+np.savetxt("actions_10x32.txt", np.asarray(actions, dtype=np.float32), fmt="%.9g")
+```
 
 ## Start The Foreground Server
 
@@ -106,56 +156,6 @@ curl http://127.0.0.1:8080/foreground/session
 ```
 
 See [docs/foreground_server_usage.md](docs/foreground_server_usage.md) for endpoint details and response fields.
-
-## FlashRT Python API Example
-
-The same JetsonPI provider can be called through [FlashRT](https://github.com/flashrt-project/FlashRT) without starting the HTTP foreground server. The FlashRT runtime loads a provider library and calls the JetsonPI C API exposed by this branch.
-
-```python
-import os
-
-import flash_rt
-import numpy as np
-from PIL import Image
-
-
-def load_rgb224(path):
-    image = Image.open(path).convert("RGB")
-    if image.size != (224, 224):
-        image = image.resize((224, 224), Image.BILINEAR)
-    return np.asarray(image, dtype=np.uint8)
-
-
-os.environ["PI0_ACTION_NOISE_BIN"] = "/path/to/pi0_noise_10x32.bin"
-
-model = flash_rt.load_model(
-    "/path/to/pi_llm.gguf",
-    framework="jetson_pi",
-    config="pi0",
-    mmproj_path="/path/to/mmproj.gguf",
-    backend="cuda",
-    num_views=2,
-    action_steps=10,
-    action_dim=32,
-    # Optional: set this when the provider library is not on the default path.
-    lib_path="/path/to/libflashrt_cpp_llama_cpp_provider_c.so",
-)
-
-image = load_rgb224("/path/to/image.png")
-images = [image, image]
-state = np.asarray([
-    -1.8731, -1.0370, 1.9652, 7.0876, 0.2546, -9.1432, -0.0147, -0.5037,
-    0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
-], dtype=np.float32)
-
-actions = model.predict(
-    images=images,
-    prompt="/do something",
-    state=state,
-)
-
-np.savetxt("actions_10x32.txt", np.asarray(actions, dtype=np.float32), fmt="%.9g")
-```
 
 ## Response Fields
 
