@@ -18,54 +18,49 @@ This project is based on [llama.cpp](https://github.com/ggml-org/llama.cpp).
 - PI0.5 preprocessing and action expert support.
 - GGUF conversion scripts for PI language and vision components.
 
-## Build
-
-For a CPU-only build:
-
-```bash
-cmake -S . -B build -DCMAKE_BUILD_TYPE=Release
-cmake --build build --target llama-server -j
-```
-
-For NVIDIA Jetson Orin or other CUDA-capable targets:
-
-```bash
-cmake -S . -B build -DGGML_CUDA=ON -DCMAKE_BUILD_TYPE=Release
-cmake --build build --target llama-server -j
-```
-
-Other ggml/llama.cpp backends can be selected with the corresponding CMake options for the target platform. Keep the foreground server target the same; only the backend configuration changes.
-
-Use the same build directory for later rebuilds:
-
-```bash
-cmake --build build --target llama-server -j
-```
-
 ## Model Preparation
 
 See [docs/model_conversion.md](docs/model_conversion.md) for model download, config preparation, PI surgery, and GGUF conversion steps.
 
-## Start The Foreground Server
-
-The server command is the same across backends. On GPU builds, `-ngl 99` offloads model layers to the accelerator. On CPU-only builds, omit `-ngl` or set it to `0`.
-
-```bash
-PI_MODEL=auto \
-PI0_ACTION_NOISE_BIN=/path/to/noise_10x32_or_50x32.bin \
-./build/bin/llama-server \
-  -m /path/to/pi_llm.gguf \
-  --mmproj /path/to/mmproj.gguf \
-  -ngl 99 \
-  --host 0.0.0.0 \
-  --port 8080
-```
-
-For PI0.5, use the PI0.5 LLM and matching PI0.5 vision GGUF. For PI0, use the PI0 LLM and matching PI0 vision GGUF.
-
 ## FlashRT Python API Example
 
 Install FlashRT by following the [FlashRT README](https://github.com/flashrt-project/FlashRT) before using this API path. The same JetsonPI provider can then be called through FlashRT without starting the HTTP foreground server.
+
+Use a C++17-capable compiler for the build. If the system default compiler is too old, enable a newer toolchain first or pass `-DCMAKE_C_COMPILER=...` and `-DCMAKE_CXX_COMPILER=...` to CMake.
+
+You do not need to build Jetson-PI separately before running this example. The FlashRT build below links against this Jetson-PI source tree with `add_subdirectory` and builds the required Jetson-PI/llama.cpp libraries as dependencies of `flashrt_cpp_llama_cpp_provider_c`:
+
+```bash
+cmake -S /path/to/FlashRT/cpp -B /path/to/FlashRT/cpp/build-jetson-pi \
+  -DCMAKE_BUILD_TYPE=Release \
+  -DFLASHRT_CPP_WITH_JETSON_PI=ON \
+  -DJETSON_PI_ROOT=/path/to/Jetson-PI
+
+cmake --build /path/to/FlashRT/cpp/build-jetson-pi \
+  --target flashrt_cpp_llama_cpp_provider_c -j
+```
+
+For a CUDA build, add the usual Jetson-PI/llama.cpp CUDA options to the same
+configure command:
+
+```bash
+cmake -S /path/to/FlashRT/cpp -B /path/to/FlashRT/cpp/build-jetson-pi-cuda \
+  -DCMAKE_BUILD_TYPE=Release \
+  -DFLASHRT_CPP_WITH_JETSON_PI=ON \
+  -DJETSON_PI_ROOT=/path/to/Jetson-PI \
+  -DGGML_CUDA=ON \
+  -DGGML_CUDA_FA=ON \
+  -DCMAKE_CUDA_ARCHITECTURES=<target-sm>
+
+cmake --build /path/to/FlashRT/cpp/build-jetson-pi-cuda \
+  --target flashrt_cpp_llama_cpp_provider_c -j
+```
+
+This produces the provider library at:
+
+```text
+/path/to/FlashRT/cpp/<build-dir>/libflashrt_cpp_llama_cpp_provider_c.so
+```
 
 ```python
 import os
@@ -114,7 +109,44 @@ actions = model.predict(
 np.savetxt("actions_10x32.txt", np.asarray(actions, dtype=np.float32), fmt="%.9g")
 ```
 
-## Minimal Foreground Example
+## Foreground Server Example
+
+The foreground server is the standalone Jetson-PI HTTP server path. It builds and runs the `llama-server` target, and is not required when using the FlashRT Python API example above.
+
+For a CPU-only server build:
+
+```bash
+cmake -S . -B build -DCMAKE_BUILD_TYPE=Release
+cmake --build build --target llama-server -j
+```
+
+For NVIDIA Jetson Orin or other CUDA-capable targets:
+
+```bash
+cmake -S . -B build -DGGML_CUDA=ON -DCMAKE_BUILD_TYPE=Release
+cmake --build build --target llama-server -j
+```
+
+Other ggml/llama.cpp backends can be selected with the corresponding CMake options for the target platform. Keep the foreground server target the same; only the backend configuration changes. For later rebuilds, use:
+
+```bash
+cmake --build build --target llama-server -j
+```
+
+The server command is the same across backends. On GPU builds, `-ngl 99` offloads model layers to the accelerator. On CPU-only builds, omit `-ngl` or set it to `0`.
+
+```bash
+PI_MODEL=auto \
+PI0_ACTION_NOISE_BIN=/path/to/noise_10x32_or_50x32.bin \
+./build/bin/llama-server \
+  -m /path/to/pi_llm.gguf \
+  --mmproj /path/to/mmproj.gguf \
+  -ngl 99 \
+  --host 0.0.0.0 \
+  --port 8080
+```
+
+For PI0.5, use the PI0.5 LLM and matching PI0.5 vision GGUF. For PI0, use the PI0 LLM and matching PI0 vision GGUF.
 
 Reset the persistent foreground session:
 
@@ -157,8 +189,6 @@ curl http://127.0.0.1:8080/foreground/session
 ```
 
 See [docs/foreground_server_usage.md](docs/foreground_server_usage.md) for endpoint details and response fields.
-
-## Response Fields
 
 PI foreground responses commonly include:
 
