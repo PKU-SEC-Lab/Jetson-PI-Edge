@@ -18,6 +18,7 @@
   </p>
 
   <p>
+    <a href="#real-world-demo">Demo</a> ·
     <a href="#quick-start">Quick Start</a> ·
     <a href="#performance-on-jetson-orin">Performance</a> ·
     <a href="docs/model_conversion.md">Model Conversion</a> ·
@@ -44,6 +45,16 @@ Jetson-PI-Edge is the inference engine accompanying our paper:
 Deploying VLA policies on low-power onboard hardware is difficult because model latency directly limits control frequency and responsiveness. Jetson-PI combines foresight-aligned asynchronous correction with confidence-aware scheduling and system-level acceleration. This repository provides the llama.cpp-based execution layer: GGUF model loading, multimodal encoding, PI action-expert inference, graph reuse, and a persistent foreground server for robot control loops.
 
 The project is built on [llama.cpp](https://github.com/ggml-org/llama.cpp). The asynchronous control algorithm lives in [PKU-SEC-Lab/Jetson-PI](https://github.com/PKU-SEC-Lab/Jetson-PI).
+
+## Real-World Demo
+
+<p align="center">
+  <img src="video/demo.gif" alt="Jetson-PI real-world comparison demo" width="720" />
+</p>
+
+<p align="center">
+  <a href="video/demo.mp4">▶ Watch the full-resolution demo (MP4)</a>
+</p>
 
 ## Current Support and Roadmap
 
