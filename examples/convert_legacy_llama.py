@@ -1050,7 +1050,6 @@ class OutputFile:
 
 
 def pick_output_type(model: LazyModel, output_type_str: str | None) -> GGMLFileType:
-    import pdb;pdb.set_trace()
     wq_type = model[gguf.TENSOR_NAMES[gguf.MODEL_TENSOR.ATTN_Q].format(bid=0) + ".weight"].data_type
 
     if output_type_str == "f32" or (output_type_str is None and wq_type in (DT_F32, DT_BF16)):
@@ -1309,7 +1308,8 @@ def do_dump_model(model_plus: ModelPlus) -> None:
 
 def main(args_in: list[str] | None = None) -> None:
     output_choices = ["f32", "f16"]
-    if np.uint32(1) == np.uint32(1).newbyteorder("<"):
+    dummy_val = np.uint32(1)
+    if dummy_val == dummy_val.view(dummy_val.dtype.newbyteorder("<")):
         # We currently only support Q8_0 output on little endian systems.
         output_choices.append("q8_0")
     parser = argparse.ArgumentParser(description="Convert a LLaMA model to a GGML compatible file")

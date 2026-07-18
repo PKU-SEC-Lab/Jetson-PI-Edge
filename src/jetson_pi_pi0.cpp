@@ -1,4 +1,4 @@
-// jetson_pi_pi0 — Pi0 policy whole-graph inference wrapped behind a narrow
+// jetson_pi_pi0 - Pi0 policy whole-graph inference wrapped behind a narrow
 // C handle. See include/jetson_pi_pi0.h for the public contract.
 //
 // This translation unit deliberately keeps every llama.cpp/mtmd/GGML symbol
@@ -44,9 +44,6 @@ struct Pi0Engine {
     // Model-derived action chunk shape.
     uint32_t action_steps = 0;
     uint32_t action_dim   = 0;
-    pi_model_kind model_kind = PI_MODEL_AUTO;
-
-    mtmd_pi0_context * pending_context = nullptr;
     std::vector<float> action_cache;
 
     std::string last_error;
@@ -74,17 +71,6 @@ void free_bitmaps(std::vector<mtmd_bitmap*> & bmps) {
     bmps.clear();
 }
 
-struct PiModelKindScope {
-    pi_model_kind previous;
-
-    explicit PiModelKindScope(pi_model_kind kind)
-        : previous(pi_model_set_thread_override(kind)) {}
-
-    ~PiModelKindScope() {
-        pi_model_set_thread_override(previous);
-    }
-};
-
 } // namespace
 
 extern "C" {
@@ -110,8 +96,8 @@ int32_t jetson_pi_pi0_open(const jetson_pi_pi0_config * config,
         return JETSON_PI_PI0_INVALID;
     }
     // The selected build must contain the requested GGML backend. Compiling a
-    // backend does not guarantee every model op is supported on it — verify
-    // each model×backend combination independently.
+    // backend does not guarantee every model op is supported on it - verify
+    // each model x backend combination independently.
     if (std::strcmp(config->backend, "cpu") != 0 &&
         std::strcmp(config->backend, "cuda") != 0 &&
         std::strcmp(config->backend, "vulkan") != 0 &&
@@ -143,9 +129,6 @@ int32_t jetson_pi_pi0_open(const jetson_pi_pi0_config * config,
         delete e;
         return JETSON_PI_PI0_INVALID;
     }
-    e->model_kind = detected.kind;
-    PiModelKindScope model_kind_scope(e->model_kind);
-
     int32_t hw = static_cast<int32_t>(std::thread::hardware_concurrency());
     e->n_threads_eff = (e->n_threads_cfg > 0) ? e->n_threads_cfg
                                               : (hw > 0 ? hw : 1);
@@ -154,7 +137,6 @@ int32_t jetson_pi_pi0_open(const jetson_pi_pi0_config * config,
     // is *out == NULL on failure (no handle to query last_error from).
     auto fail_open = [&](int32_t status, const char * msg) -> int32_t {
         g_open_error = msg ? msg : "";
-        mtmd_helper_free_pi0_context(e->pending_context);
         if (e->mtmd)  mtmd_free(e->mtmd);
         if (e->lctx)  llama_free(e->lctx);
         if (e->model) llama_model_free(e->model);
@@ -220,8 +202,7 @@ int32_t jetson_pi_pi0_open(const jetson_pi_pi0_config * config,
     mdp.print_timings    = false;
     mdp.n_threads        = e->n_threads_eff;
     mdp.flash_attn_type  = LLAMA_FLASH_ATTN_TYPE_AUTO;
-    e->mtmd = mtmd_init_from_file_with_device(
-        e->mmproj_path.c_str(), e->model, mdp, selected_device);
+    e->mtmd = mtmd_init_from_file(e->mmproj_path.c_str(), e->model, mdp);
     if (!e->mtmd) {
         return fail_open(JETSON_PI_PI0_LOAD_FAILED,
                          "mtmd_init_from_file failed");
@@ -236,11 +217,6 @@ int32_t jetson_pi_pi0_open(const jetson_pi_pi0_config * config,
     e->action_steps = static_cast<uint32_t>(steps);
     e->action_dim   = static_cast<uint32_t>(dim);
 
-    if (!mtmd_is_pi0_model(e->mtmd)) {
-        return fail_open(JETSON_PI_PI0_INVALID,
-                         "mmproj is not a Pi0 vision model");
-    }
-
     e->clear_error();
     *out = reinterpret_cast<jetson_pi_pi0*>(e);
     return JETSON_PI_PI0_OK;
@@ -250,8 +226,6 @@ void jetson_pi_pi0_close(jetson_pi_pi0 * handle) {
     Pi0Engine * e = reinterpret_cast<Pi0Engine*>(handle);
     if (!e) return;
     if (e->refs.fetch_sub(1, std::memory_order_acq_rel) == 1) {
-        PiModelKindScope model_kind_scope(e->model_kind);
-        mtmd_helper_free_pi0_context(e->pending_context);
         if (e->mtmd)  mtmd_free(e->mtmd);
         if (e->lctx)  llama_free(e->lctx);
         if (e->model) llama_model_free(e->model);
@@ -290,8 +264,6 @@ int32_t jetson_pi_pi0_infer(jetson_pi_pi0 * handle,
     if (actions_written) *actions_written = 0;
     if (!e) return JETSON_PI_PI0_INVALID;
     e->clear_error();
-    mtmd_helper_free_pi0_context(e->pending_context);
-    e->pending_context = nullptr;
     e->action_cache.clear();
     if (!actions_out || !actions_written) {
         return reject(e, JETSON_PI_PI0_INVALID,
@@ -318,10 +290,7 @@ int32_t jetson_pi_pi0_context(jetson_pi_pi0 * handle,
                               const float * state, size_t n_state) {
     Pi0Engine * e = reinterpret_cast<Pi0Engine*>(handle);
     if (!e) return JETSON_PI_PI0_INVALID;
-    PiModelKindScope model_kind_scope(e->model_kind);
     e->clear_error();
-    mtmd_helper_free_pi0_context(e->pending_context);
-    e->pending_context = nullptr;
     e->action_cache.clear();
     if (!images_rgb || n_images != e->n_views || !prompt || prompt_len == 0) {
         return reject(e, JETSON_PI_PI0_INVALID, "invalid context arguments");
@@ -439,8 +408,7 @@ int32_t jetson_pi_pi0_discard_context(jetson_pi_pi0 * handle) {
     Pi0Engine * e = reinterpret_cast<Pi0Engine*>(handle);
     if (!e) return JETSON_PI_PI0_INVALID;
     e->clear_error();
-    mtmd_helper_free_pi0_context(e->pending_context);
-    e->pending_context = nullptr;
+    e->action_cache.clear();
     return JETSON_PI_PI0_OK;
 }
 
@@ -450,7 +418,6 @@ int32_t jetson_pi_pi0_action(jetson_pi_pi0 * handle,
     Pi0Engine * e = reinterpret_cast<Pi0Engine*>(handle);
     if (actions_written) *actions_written = 0;
     if (!e || !actions_out || !actions_written) return JETSON_PI_PI0_INVALID;
-    PiModelKindScope model_kind_scope(e->model_kind);
     e->clear_error();
     const size_t need_elems = static_cast<size_t>(e->action_steps) *
                               static_cast<size_t>(e->action_dim);
@@ -465,27 +432,8 @@ int32_t jetson_pi_pi0_action(jetson_pi_pi0 * handle,
         e->action_cache.clear();
         return JETSON_PI_PI0_OK;
     }
-    if (!e->pending_context) {
-        return reject(e, JETSON_PI_PI0_ACTION_NOT_READY,
-                      "Pi0 context not ready");
-    }
-    mtmd_pi0_context * context = e->pending_context;
-    e->pending_context = nullptr;
-    int32_t er = mtmd_helper_decode_pi0(e->lctx, context);
-    mtmd_helper_free_pi0_context(context);
-    if (er != 0) {
-        return reject(e, JETSON_PI_PI0_INFER_FAILED,
-                      "mtmd_helper_decode_pi0 failed");
-    }
-
-    const float * action = llama_get_pi0_action(e->lctx);
-    if (action == nullptr) {
-        return reject(e, JETSON_PI_PI0_ACTION_NOT_READY,
-                      "Pi0 action not ready after infer");
-    }
-    std::memcpy(actions_out, action, need_elems * sizeof(float));
-    *actions_written = need_elems;
-    return JETSON_PI_PI0_OK;
+    return reject(e, JETSON_PI_PI0_ACTION_NOT_READY,
+                  "Pi0 context not ready");
 }
 
 } // extern "C"

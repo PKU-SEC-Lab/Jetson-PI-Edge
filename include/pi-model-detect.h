@@ -262,8 +262,19 @@ static inline pi_model_detect_result pi_model_detect_gguf_file(const std::string
     result.file_kind = is_mmproj ? PI_MODEL_FILE_MMPROJ : PI_MODEL_FILE_LLM;
 
     if (is_mmproj) {
-        result.kind = PI_MODEL_AUTO;
-        result.reason = "mmproj PI model detection is ignored; LLM GGUF decides pi0/pi05";
+        if (contains_ci(probe.general_name, "pi05") || contains_ci(probe.general_name, "pi0.5")) {
+            result.kind = PI_MODEL_PI05;
+            result.reason = "mmproj general.name contains pi05";
+        } else if (probe.clip_use_gelu_known && !probe.clip_use_gelu) {
+            result.kind = PI_MODEL_PI05;
+            result.reason = "mmproj clip.use_gelu is false";
+        } else if (lower_ascii(probe.general_name) == "vit" && probe.clip_use_gelu_known && probe.clip_use_gelu) {
+            result.kind = PI_MODEL_PI0;
+            result.reason = "mmproj general.name=vit and clip.use_gelu is true";
+        } else {
+            result.kind = PI_MODEL_AUTO;
+            result.reason = "no strong mmproj feature matched";
+        }
         return result;
     }
 
@@ -308,16 +319,31 @@ static inline pi_model_detect_result pi_model_detect_gguf_file(const std::string
 static inline pi_model_detect_result pi_model_detect_gguf_pair(
         const std::string & llm_path,
         const std::string & mmproj_path) {
-    (void) mmproj_path;
     const pi_model_detect_result llm = llm_path.empty()
         ? pi_model_detect_result{}
         : pi_model_detect_gguf_file(llm_path);
+    const pi_model_detect_result mmproj = mmproj_path.empty()
+        ? pi_model_detect_result{}
+        : pi_model_detect_gguf_file(mmproj_path);
+
+    if (llm.kind != PI_MODEL_AUTO && mmproj.kind != PI_MODEL_AUTO && llm.kind != mmproj.kind) {
+        pi_model_detect_result conflict;
+        conflict.kind = PI_MODEL_AUTO;
+        conflict.file_kind = PI_MODEL_FILE_UNKNOWN;
+        conflict.reason = std::string("conflicting model files: llm=") +
+            pi_model_kind_name(llm.kind) + " (" + llm.reason + "), mmproj=" +
+            pi_model_kind_name(mmproj.kind) + " (" + mmproj.reason + ")";
+        return conflict;
+    }
 
     if (llm.kind != PI_MODEL_AUTO) {
         return llm;
     }
+    if (mmproj.kind != PI_MODEL_AUTO) {
+        return mmproj;
+    }
 
     pi_model_detect_result unknown;
-    unknown.reason = "no strong llm feature matched";
+    unknown.reason = "no strong llm/mmproj feature matched";
     return unknown;
 }

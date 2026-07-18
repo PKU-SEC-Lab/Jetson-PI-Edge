@@ -11,8 +11,8 @@ FLOAT_TYPE get_dm(uint ib) {
 #endif
 
 #if defined(DATA_A_Q4_1) || defined(DATA_A_Q5_1)
-FLOAT_TYPE_VEC2 get_dm(uint ib) {
-    return FLOAT_TYPE_VEC2(data_a_packed32[ib].dm);
+FLOAT_TYPEV2 get_dm(uint ib) {
+    return FLOAT_TYPEV2(data_a_packed32[ib].dm);
 }
 #endif
 
@@ -23,9 +23,9 @@ FLOAT_TYPE get_dm(uint ib) {
 #endif
 
 #if defined(DATA_A_Q2_K)
-FLOAT_TYPE_VEC2 get_dm(uint ib) {
+FLOAT_TYPEV2 get_dm(uint ib) {
     const uint ib_k = ib / 8;
-    return FLOAT_TYPE_VEC2(data_a_packed32[ib_k].dm);
+    return FLOAT_TYPEV2(data_a_packed32[ib_k].dm);
 }
 #endif
 
@@ -212,28 +212,40 @@ i32vec4 repack4(uint ib, uint iqs) {
     const uint qs_shift = ((iqs_k % 32) / 8) * 2;
     const uint hm_shift = iqs_k / 8;
 
-    // bitwise OR to add 4 if hmask is set, subtract later
-    const i8vec2 vals00 = unpack8(int16_t((data_a_packed16[ib_k].qs[qs_idx  * 2    ] >> qs_shift) & uint16_t(0x0303))) |
-                          unpack8(int16_t(((data_a_packed16[ib_k].hmask[iqs * 2    ] >> hm_shift) & uint16_t(0x0101)) << 2));
-    const i8vec2 vals01 = unpack8(int16_t((data_a_packed16[ib_k].qs[qs_idx  * 2 + 1] >> qs_shift) & uint16_t(0x0303))) |
-                          unpack8(int16_t(((data_a_packed16[ib_k].hmask[iqs * 2 + 1] >> hm_shift) & uint16_t(0x0101)) << 2));
-    const i8vec2 vals10 = unpack8(int16_t((data_a_packed16[ib_k].qs[qs_idx  * 2 + 2] >> qs_shift) & uint16_t(0x0303))) |
-                          unpack8(int16_t(((data_a_packed16[ib_k].hmask[iqs * 2 + 2] >> hm_shift) & uint16_t(0x0101)) << 2));
-    const i8vec2 vals11 = unpack8(int16_t((data_a_packed16[ib_k].qs[qs_idx  * 2 + 3] >> qs_shift) & uint16_t(0x0303))) |
-                          unpack8(int16_t(((data_a_packed16[ib_k].hmask[iqs * 2 + 3] >> hm_shift) & uint16_t(0x0101)) << 2));
-    const i8vec2 vals20 = unpack8(int16_t((data_a_packed16[ib_k].qs[qs_idx  * 2 + 4] >> qs_shift) & uint16_t(0x0303))) |
-                          unpack8(int16_t(((data_a_packed16[ib_k].hmask[iqs * 2 + 4] >> hm_shift) & uint16_t(0x0101)) << 2));
-    const i8vec2 vals21 = unpack8(int16_t((data_a_packed16[ib_k].qs[qs_idx  * 2 + 5] >> qs_shift) & uint16_t(0x0303))) |
-                          unpack8(int16_t(((data_a_packed16[ib_k].hmask[iqs * 2 + 5] >> hm_shift) & uint16_t(0x0101)) << 2));
-    const i8vec2 vals30 = unpack8(int16_t((data_a_packed16[ib_k].qs[qs_idx  * 2 + 6] >> qs_shift) & uint16_t(0x0303))) |
-                          unpack8(int16_t(((data_a_packed16[ib_k].hmask[iqs * 2 + 6] >> hm_shift) & uint16_t(0x0101)) << 2));
-    const i8vec2 vals31 = unpack8(int16_t((data_a_packed16[ib_k].qs[qs_idx  * 2 + 7] >> qs_shift) & uint16_t(0x0303))) |
-                          unpack8(int16_t(((data_a_packed16[ib_k].hmask[iqs * 2 + 7] >> hm_shift) & uint16_t(0x0101)) << 2));
+    const uvec4 qs = uvec4( uint32_t(data_a_packed16[ib_k].qs[qs_idx * 2    ]) |
+                           (uint32_t(data_a_packed16[ib_k].qs[qs_idx * 2 + 1]) << 16),
+                            uint32_t(data_a_packed16[ib_k].qs[qs_idx * 2 + 2]) |
+                           (uint32_t(data_a_packed16[ib_k].qs[qs_idx * 2 + 3]) << 16),
+                            uint32_t(data_a_packed16[ib_k].qs[qs_idx * 2 + 4]) |
+                           (uint32_t(data_a_packed16[ib_k].qs[qs_idx * 2 + 5]) << 16),
+                            uint32_t(data_a_packed16[ib_k].qs[qs_idx * 2 + 6]) |
+                           (uint32_t(data_a_packed16[ib_k].qs[qs_idx * 2 + 7]) << 16));
 
-    return i32vec4(pack32(i8vec4(vals00.x, vals00.y, vals01.x, vals01.y) - int8_t(4)),
-                   pack32(i8vec4(vals10.x, vals10.y, vals11.x, vals11.y) - int8_t(4)),
-                   pack32(i8vec4(vals20.x, vals20.y, vals21.x, vals21.y) - int8_t(4)),
-                   pack32(i8vec4(vals30.x, vals30.y, vals31.x, vals31.y) - int8_t(4)));
+    const uvec4 hmask = uvec4( uint32_t(data_a_packed16[ib_k].hmask[iqs * 2    ]) |
+                              (uint32_t(data_a_packed16[ib_k].hmask[iqs * 2 + 1]) << 16),
+                               uint32_t(data_a_packed16[ib_k].hmask[iqs * 2 + 2]) |
+                              (uint32_t(data_a_packed16[ib_k].hmask[iqs * 2 + 3]) << 16),
+                               uint32_t(data_a_packed16[ib_k].hmask[iqs * 2 + 4]) |
+                              (uint32_t(data_a_packed16[ib_k].hmask[iqs * 2 + 5]) << 16),
+                               uint32_t(data_a_packed16[ib_k].hmask[iqs * 2 + 6]) |
+                              (uint32_t(data_a_packed16[ib_k].hmask[iqs * 2 + 7]) << 16));
+
+    // bitwise OR to add 4 if hmask is set, subtract later
+    const uint vals0 = ((    qs.x >> qs_shift) & 0x03030303) |
+                       (((hmask.x >> hm_shift) & 0x01010101) << 2);
+    const uint vals1 = ((    qs.y >> qs_shift) & 0x03030303) |
+                       (((hmask.y >> hm_shift) & 0x01010101) << 2);
+    const uint vals2 = ((    qs.z >> qs_shift) & 0x03030303) |
+                       (((hmask.z >> hm_shift) & 0x01010101) << 2);
+    const uint vals3 = ((    qs.w >> qs_shift) & 0x03030303) |
+                       (((hmask.w >> hm_shift) & 0x01010101) << 2);
+
+    // Subtract 4 by twiddling bits rather than using re-packing as mesa
+    // compiles repacking poorly.
+    return i32vec4(int32_t(((vals0 ^ 0x80808080) - 0x04040404) ^ 0x80808080),
+                   int32_t(((vals1 ^ 0x80808080) - 0x04040404) ^ 0x80808080),
+                   int32_t(((vals2 ^ 0x80808080) - 0x04040404) ^ 0x80808080),
+                   int32_t(((vals3 ^ 0x80808080) - 0x04040404) ^ 0x80808080));
 }
 
 float get_d_scale(uint ib, uint iqs) {
@@ -296,15 +308,24 @@ vec2 get_dm_scale(uint ib, uint iqs) {
     const uint ib_k = ib / 8;
     const uint iqs_k = (ib % 8) * 8 + iqs;
     const uint is = iqs_k / 8;
-    u8vec2 scale_dm;
-    if (is < 4) {
-        scale_dm = u8vec2(data_a[ib_k].scales[is] & 0x3F, data_a[ib_k].scales[is + 4] & 0x3F);
-    } else {
-        scale_dm = u8vec2((data_a[ib_k].scales[is+4] & 0xF) | ((data_a[ib_k].scales[is-4] & 0xC0) >> 2),
-                          (data_a[ib_k].scales[is+4] >>  4) | ((data_a[ib_k].scales[is  ] & 0xC0) >> 2));
-    }
 
-    return FLOAT_TYPE_VEC2(data_a_packed32[ib_k].dm) * FLOAT_TYPE_VEC2(scale_dm);
+    const uvec3 scales = uvec3(data_a_packed32[ib_k].scales[0],
+                               data_a_packed32[ib_k].scales[1],
+                               data_a_packed32[ib_k].scales[2]);
+    const uint scalesoffs = (is & 3) * 8;
+
+    const uint scidx0 = (is < 4) ? 0 : 2;
+    const uint scidxshift0 = scalesoffs;
+    const uint scidxshift1 = (is < 4) ? scalesoffs : scalesoffs + 2;
+    const uint mbidx0 = (is < 4) ? 1 : 2;
+    const uint mbidxshift0 = (is < 4) ? scalesoffs : scalesoffs + 4;
+    const uint mbidxshift1 = (is < 4) ? scalesoffs : scalesoffs + 2;
+
+    const uint8_t sc    = uint8_t(((scales[scidx0] >> scidxshift0) & 0xF) | ((scales[0] >> scidxshift1) & 0x30));
+    const uint8_t mbyte = uint8_t(((scales[mbidx0] >> mbidxshift0) & 0xF) | ((scales[1] >> mbidxshift1) & 0x30));
+    u8vec2 scale_dm = u8vec2(sc, mbyte);
+
+    return FLOAT_TYPEV2(data_a_packed32[ib_k].dm) * FLOAT_TYPEV2(scale_dm);
 }
 
 FLOAT_TYPE mmvq_dot_product(const uint ib_a, const uint iqs) {
@@ -334,27 +355,39 @@ i32vec4 repack4(uint ib, uint iqs) {
     const uint qh_idx = (iqs_k / 32) * 8 + iqs;
     const uint qh_shift = ((iqs_k % 32) / 8) * 2;
 
-    const i8vec2 vals00 = (unpack8(int16_t((data_a_packed16[ib_k].ql[ql_idx * 2    ] >> ql_shift) & uint16_t(0x0F0F))) |
-                          unpack8(int16_t(((data_a_packed16[ib_k].qh[qh_idx * 2    ] >> qh_shift) & uint16_t(0x0303)) << 4))) - int8_t(32);
-    const i8vec2 vals01 = (unpack8(int16_t((data_a_packed16[ib_k].ql[ql_idx * 2 + 1] >> ql_shift) & uint16_t(0x0F0F))) |
-                          unpack8(int16_t(((data_a_packed16[ib_k].qh[qh_idx * 2 + 1] >> qh_shift) & uint16_t(0x0303)) << 4))) - int8_t(32);
-    const i8vec2 vals10 = (unpack8(int16_t((data_a_packed16[ib_k].ql[ql_idx * 2 + 2] >> ql_shift) & uint16_t(0x0F0F))) |
-                          unpack8(int16_t(((data_a_packed16[ib_k].qh[qh_idx * 2 + 2] >> qh_shift) & uint16_t(0x0303)) << 4))) - int8_t(32);
-    const i8vec2 vals11 = (unpack8(int16_t((data_a_packed16[ib_k].ql[ql_idx * 2 + 3] >> ql_shift) & uint16_t(0x0F0F))) |
-                          unpack8(int16_t(((data_a_packed16[ib_k].qh[qh_idx * 2 + 3] >> qh_shift) & uint16_t(0x0303)) << 4))) - int8_t(32);
-    const i8vec2 vals20 = (unpack8(int16_t((data_a_packed16[ib_k].ql[ql_idx * 2 + 4] >> ql_shift) & uint16_t(0x0F0F))) |
-                          unpack8(int16_t(((data_a_packed16[ib_k].qh[qh_idx * 2 + 4] >> qh_shift) & uint16_t(0x0303)) << 4))) - int8_t(32);
-    const i8vec2 vals21 = (unpack8(int16_t((data_a_packed16[ib_k].ql[ql_idx * 2 + 5] >> ql_shift) & uint16_t(0x0F0F))) |
-                          unpack8(int16_t(((data_a_packed16[ib_k].qh[qh_idx * 2 + 5] >> qh_shift) & uint16_t(0x0303)) << 4))) - int8_t(32);
-    const i8vec2 vals30 = (unpack8(int16_t((data_a_packed16[ib_k].ql[ql_idx * 2 + 6] >> ql_shift) & uint16_t(0x0F0F))) |
-                          unpack8(int16_t(((data_a_packed16[ib_k].qh[qh_idx * 2 + 6] >> qh_shift) & uint16_t(0x0303)) << 4))) - int8_t(32);
-    const i8vec2 vals31 = (unpack8(int16_t((data_a_packed16[ib_k].ql[ql_idx * 2 + 7] >> ql_shift) & uint16_t(0x0F0F))) |
-                          unpack8(int16_t(((data_a_packed16[ib_k].qh[qh_idx * 2 + 7] >> qh_shift) & uint16_t(0x0303)) << 4))) - int8_t(32);
+    const uvec4 ql = uvec4( uint32_t(data_a_packed16[ib_k].ql[ql_idx * 2    ]) |
+                           (uint32_t(data_a_packed16[ib_k].ql[ql_idx * 2 + 1]) << 16),
+                            uint32_t(data_a_packed16[ib_k].ql[ql_idx * 2 + 2]) |
+                           (uint32_t(data_a_packed16[ib_k].ql[ql_idx * 2 + 3]) << 16),
+                            uint32_t(data_a_packed16[ib_k].ql[ql_idx * 2 + 4]) |
+                           (uint32_t(data_a_packed16[ib_k].ql[ql_idx * 2 + 5]) << 16),
+                            uint32_t(data_a_packed16[ib_k].ql[ql_idx * 2 + 6]) |
+                           (uint32_t(data_a_packed16[ib_k].ql[ql_idx * 2 + 7]) << 16));
 
-    return i32vec4(pack32(i8vec4(vals00.x, vals00.y, vals01.x, vals01.y)),
-                   pack32(i8vec4(vals10.x, vals10.y, vals11.x, vals11.y)),
-                   pack32(i8vec4(vals20.x, vals20.y, vals21.x, vals21.y)),
-                   pack32(i8vec4(vals30.x, vals30.y, vals31.x, vals31.y)));
+    const uvec4 qh = uvec4( uint32_t(data_a_packed16[ib_k].qh[qh_idx * 2    ]) |
+                           (uint32_t(data_a_packed16[ib_k].qh[qh_idx * 2 + 1]) << 16),
+                            uint32_t(data_a_packed16[ib_k].qh[qh_idx * 2 + 2]) |
+                           (uint32_t(data_a_packed16[ib_k].qh[qh_idx * 2 + 3]) << 16),
+                            uint32_t(data_a_packed16[ib_k].qh[qh_idx * 2 + 4]) |
+                           (uint32_t(data_a_packed16[ib_k].qh[qh_idx * 2 + 5]) << 16),
+                            uint32_t(data_a_packed16[ib_k].qh[qh_idx * 2 + 6]) |
+                           (uint32_t(data_a_packed16[ib_k].qh[qh_idx * 2 + 7]) << 16));
+
+    const uint vals0 = (( ql.x >> ql_shift) & 0x0F0F0F0F) |
+                       (((qh.x >> qh_shift) & 0x03030303) << 4);
+    const uint vals1 = (( ql.y >> ql_shift) & 0x0F0F0F0F) |
+                       (((qh.y >> qh_shift) & 0x03030303) << 4);
+    const uint vals2 = (( ql.z >> ql_shift) & 0x0F0F0F0F) |
+                       (((qh.z >> qh_shift) & 0x03030303) << 4);
+    const uint vals3 = (( ql.w >> ql_shift) & 0x0F0F0F0F) |
+                       (((qh.w >> qh_shift) & 0x03030303) << 4);
+
+    // Subtract 32 by twiddling bits rather than using re-packing as mesa
+    // compiles repacking poorly.
+    return i32vec4(int32_t(((vals0 ^ 0x80808080) - 0x20202020) ^ 0x80808080),
+                   int32_t(((vals1 ^ 0x80808080) - 0x20202020) ^ 0x80808080),
+                   int32_t(((vals2 ^ 0x80808080) - 0x20202020) ^ 0x80808080),
+                   int32_t(((vals3 ^ 0x80808080) - 0x20202020) ^ 0x80808080));
 }
 
 float get_d_scale(uint ib, uint iqs) {
@@ -375,5 +408,120 @@ FLOAT_TYPE mmvq_dot_product(const uint ib_a, const uint iqs) {
     q_sum += dotPacked4x8EXT(qs_a.w, cache_b_qs[3]);
 
     return FLOAT_TYPE(float(cache_b_ds.x) * float(d_scale) * float(q_sum));
+}
+#endif
+
+#if defined(DATA_A_IQ1_S)
+void repack8(uint ib, uint iqs, out i32vec4 out0, out i32vec4 out1) {
+    const uint ib32 = iqs / 32;
+
+    const uint qh = data_a[ib].qh[ib32];
+
+    const uint qs16_0 = data_a_packed16[ib].qs[(4 * ib32 + 0) / 2];
+    const uint qs16_1 = data_a_packed16[ib].qs[(4 * ib32 + 2) / 2];
+
+    const uint qs0 = qs16_0 & 0xFF;
+    const uint qs1 = qs16_0 >> 8;
+    const uint qs2 = qs16_1 & 0xFF;
+    const uint qs3 = qs16_1 >> 8;
+
+    const uint hi0 = bitfieldExtract(qh, 3 * int(0), 3);
+    const uint hi1 = bitfieldExtract(qh, 3 * int(1), 3);
+    const uint hi2 = bitfieldExtract(qh, 3 * int(2), 3);
+    const uint hi3 = bitfieldExtract(qh, 3 * int(3), 3);
+
+    const int32_t grid0 = int32_t(iq1s_grid_gpu[qs0 | (hi0 << 8)]);
+    const int32_t grid1 = int32_t(iq1s_grid_gpu[qs1 | (hi1 << 8)]);
+    const int32_t grid2 = int32_t(iq1s_grid_gpu[qs2 | (hi2 << 8)]);
+    const int32_t grid3 = int32_t(iq1s_grid_gpu[qs3 | (hi3 << 8)]);
+
+    out0 = i32vec4((grid0 >> 0) & 0x0F0F0F0F,
+                   (grid0 >> 4) & 0x0F0F0F0F,
+                   (grid1 >> 0) & 0x0F0F0F0F,
+                   (grid1 >> 4) & 0x0F0F0F0F);
+    out1 = i32vec4((grid2 >> 0) & 0x0F0F0F0F,
+                   (grid2 >> 4) & 0x0F0F0F0F,
+                   (grid3 >> 0) & 0x0F0F0F0F,
+                   (grid3 >> 4) & 0x0F0F0F0F);
+}
+
+vec2 get_dm(uint ib, uint iqs) {
+    const uint ib32 = iqs / 32;
+
+    const uint qh = data_a[ib].qh[ib32];
+    const float delta = ((qh & 0x8000) != 0) ? -IQ1S_DELTA : IQ1S_DELTA;
+
+    const float d = float(data_a[ib].d);
+    const float dl = d * float(2 * bitfieldExtract(qh, 12, 3) + 1);
+
+    // the -1 cancels out the bias in iq1s_grid_gpu
+    return FLOAT_TYPEV2(dl, dl * (delta - 1));
+}
+
+FLOAT_TYPE mmvq_dot_product(const uint ib_a, const uint iqs) {
+    int32_t q_sum = 0;
+
+    const uint ib_k = ib_a / 8;
+    const uint iqs_k = (ib_a % 8) * 32 + iqs * 32;
+
+    i32vec4 qs_a0;
+    i32vec4 qs_a1;
+    repack8(ib_k, iqs_k, qs_a0, qs_a1);
+
+    const vec2 dm = get_dm(ib_k, iqs_k);
+
+    q_sum += dotPacked4x8EXT(qs_a0.x, cache_b_qs[0]);
+    q_sum += dotPacked4x8EXT(qs_a0.y, cache_b_qs[1]);
+    q_sum += dotPacked4x8EXT(qs_a0.z, cache_b_qs[2]);
+    q_sum += dotPacked4x8EXT(qs_a0.w, cache_b_qs[3]);
+    q_sum += dotPacked4x8EXT(qs_a1.x, cache_b_qs[4]);
+    q_sum += dotPacked4x8EXT(qs_a1.y, cache_b_qs[5]);
+    q_sum += dotPacked4x8EXT(qs_a1.z, cache_b_qs[6]);
+    q_sum += dotPacked4x8EXT(qs_a1.w, cache_b_qs[7]);
+
+    return FLOAT_TYPE(float(cache_b_ds.x) * float(dm.x) * float(q_sum) + float(dm.y) * float(cache_b_ds.y));
+}
+#endif
+
+#if defined(DATA_A_IQ1_M)
+FLOAT_TYPE mmvq_dot_product(const uint ib_a, const uint iqs) {
+    const uint ib_k = ib_a / 8;
+    const uint iqs_k = (ib_a % 8) * 32 + iqs * 32;
+
+    const uint ib32 = iqs_k / 32;
+    const uint ib64 = ib32 / 2;
+
+    const uint16_t[4] scales = data_a[ib_k].scales;
+    const u16vec4 s = u16vec4(scales[0], scales[1], scales[2], scales[3]) >> 12;
+    const float d = float(unpackHalf2x16(s.x | (s.y << 4) | (s.z << 8) | (s.w << 12)).x);
+
+    const uint qs32 = data_a_packed32[ib_k].qs[ib32];
+    const uint qh16 = data_a_packed16[ib_k].qh[ib32];
+
+    float sum = 0;
+    const uint sc = data_a[ib_k].scales[ib64];
+    [[unroll]] for (int l = 0; l < 4; ++l) {
+        const uint ib16 = 2 * ib32 + l / 2;
+        const float dl = d * (2 * bitfieldExtract(sc, 3 * int(ib16 & 3), 3) + 1);
+        const uint qh = qh16 >> (4 * l);
+        const uint qs = (qs32 >> (8 * l)) & 0xFF;
+        const float delta = ((qh & 8) != 0) ? -IQ1M_DELTA : IQ1M_DELTA;
+
+        const int32_t grid = int32_t(iq1s_grid_gpu[qs | ((qh & 7) << 8)]);
+
+        int32_t q_sum = 0;
+        q_sum += dotPacked4x8EXT((grid >> 0) & 0x0F0F0F0F, cache_b_qs[2 * l + 0]);
+        q_sum += dotPacked4x8EXT((grid >> 4) & 0x0F0F0F0F, cache_b_qs[2 * l + 1]);
+
+        int32_t y_sum = 0;
+        y_sum += dotPacked4x8EXT(int(0x01010101), cache_b_qs[2 * l + 0]);
+        y_sum += dotPacked4x8EXT(int(0x01010101), cache_b_qs[2 * l + 1]);
+
+        // the -1 cancels out the bias in iq1s_grid_gpu
+        sum += dl * (q_sum + y_sum * (delta - 1));
+    }
+    sum *= float(cache_b_ds.x);
+
+    return sum;
 }
 #endif

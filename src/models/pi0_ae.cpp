@@ -6,7 +6,7 @@
 
 
 llm_build_pi0_ae::llm_build_pi0_ae(const llama_model & model, const llm_graph_params & params) : llm_graph_context(params) {
-    const int64_t n_embd_head = hparams.n_embd_head_v;
+    const int64_t n_embd_head = hparams.n_embd_head_v();
     const int64_t n_inference_steps = hparams.inference_steps;
     const int64_t action_steps = hparams.action_steps;
     const int64_t ae_hidden_dim = hparams.n_embd_ae;
@@ -82,7 +82,7 @@ llm_build_pi0_ae::llm_build_pi0_ae(const llama_model & model, const llm_graph_pa
 
                         
                         cur = build_attn(inp_attn_ae,
-                                model.layers[il].wo, NULL,
+                                model.layers[il].wo, NULL, nullptr,
                                 Qcur, Kcur, Vcur, nullptr, nullptr, nullptr, 1.0f, il);
 
                     }
@@ -339,7 +339,7 @@ llm_build_pi0_ae::llm_build_pi0_ae(const llama_model & model, const llm_graph_pa
                 Qcur = ggml_scale(ctx0, Qcur, 1.0f / sqrtf(float(n_embd_head)));
 
                 cur_local = build_attn(inp_attn_ae,
-                        is_pi05 ? nullptr : model.layers[il].wo, NULL,
+                        is_pi05 ? nullptr : model.layers[il].wo, NULL, nullptr,
                         Qcur, Kcur, Vcur, nullptr, nullptr, nullptr, 1.0f, il);
                 if (is_pi05) {
                     cur_local = pi05_dense(model.layers[il].wo, nullptr, cur_local);
@@ -504,7 +504,7 @@ llm_build_pi0_ae::llm_build_pi0_ae(const llama_model & model, const llm_graph_pa
             Vcur = ggml_concat(ctx0, Vcur_old, Vcur, 2);
             Qcur = ggml_scale(ctx0, Qcur, 1.0f / sqrtf(float(n_embd_head)));
 
-            cur = build_attn(inp_attn_ae, model.layers[il].wo, NULL,
+            cur = build_attn(inp_attn_ae, model.layers[il].wo, NULL, nullptr,
                     Qcur, Kcur, Vcur, nullptr, nullptr, nullptr, 1.0f, il);
 
             ggml_tensor * sa_out = ggml_add(ctx0, cur, inpL);

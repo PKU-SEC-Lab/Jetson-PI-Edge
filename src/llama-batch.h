@@ -18,7 +18,7 @@ struct llama_ubatch {
     }
 
     // typical for M-RoPE cases:
-    //   0 - sequantial position of the tokens/embeddings in the sequence
+    //   0 - sequential position of the tokens/embeddings in the sequence
     //   1 - y position in the image
     //   2 - x position in the image
     //   3 - other
@@ -37,10 +37,6 @@ struct llama_ubatch {
     uint32_t n_seqs_unq;   // unique sequence ids in the ubatch
     uint32_t n_pos;        // number of position inputs for each token/embedding
 
-
-    int32_t      img_token_num;   // [n_img_tokens]     | i   | -
-    int32_t      single_img_token_num;   // [n_single_img_tokens]     | i   | -
-
     // seq_id_unq: unique sequence ids in the ubatch
     // seq_idx:    indices of the unique sequence ids in the ubatch in [0, n_seqs_unq)
     //             used for extracting sequence pooled embeddings
@@ -48,15 +44,12 @@ struct llama_ubatch {
     //                          // size               | idx | val
     llama_token  *  token;      // [n_tokens]         | i   | id, token
     float        *  embd;       // [n_embd, n_tokens] | i   | embd
-    float        *  embd2;       // [n_embd, n_tokens] | i   | embd
-    float        *  embd3;       // [n_embd, n_tokens] | i   | embd
     llama_pos    *  pos;        // [n_tokens*n_pos]   | i   | pos
     int32_t      *  n_seq_id;   // [n_tokens]         | i   | -
     llama_seq_id ** seq_id;     // [n_tokens]         | s   | s0, s1, seq_id
     llama_seq_id *  seq_id_unq; // [n_seqs_unq]       | s   | seq_id
     int32_t      *  seq_idx;    // [LLAMA_MAX_SEQ]    | -   | seq_idx
     int8_t       *  output;     // [n_tokens]         | i   | -
-    // float        *  state;       // pi0
 
     struct data_t {
         std::vector<llama_token>    token;
@@ -65,17 +58,21 @@ struct llama_ubatch {
         std::vector<float>          embd3;
         std::vector<llama_pos>      pos;
         std::vector<int32_t>        n_seq_id;
-        std::vector<llama_seq_id *> seq_id;
+        std::vector<llama_seq_id *> seq_id;      // these point into the seq_id_data below
         std::vector<llama_seq_id>   seq_id_unq;
         std::vector<int32_t>        seq_idx;
         std::vector<int8_t>         output;
-        int32_t img_token_num;
-        int32_t single_img_token_num;
-        // std::vector<float>          state; //pi0
+
+        std::vector<llama_seq_id> seq_id_data;
     };
 
-    // the llama_ubatch pointers above point to this data if set. otherwise - points to non-owning data
+    // the llama_ubatch pointers above point to this data if set. otherwise - point to external non-owning data
     std::shared_ptr<data_t> data;
+
+    float        *  embd2 = nullptr; // [n_embd, n_tokens] | i | embd
+    float        *  embd3 = nullptr; // [n_embd, n_tokens] | i | embd
+    int32_t         img_token_num = 0;
+    int32_t         single_img_token_num = 0;
 };
 
 // a helper for sanitizing, fulfilling and splitting a batch
@@ -114,7 +111,8 @@ public:
 
     // make ubatches of equal-length sequences sets
     // if sequential == true, the tokens in the ubatch will have increasing sequential sequence ids
-    llama_ubatch split_equal(uint32_t n_ubatch, bool sequential);
+    // n_keep_tail = minimum trailing tokens of a seq that must land in the same ubatch
+    llama_ubatch split_equal(uint32_t n_ubatch, bool sequential, uint32_t n_keep_tail);
 
     // sequence-set-wise split - each ubatch contains a single sequence-set
     llama_ubatch split_seq(uint32_t n_ubatch);

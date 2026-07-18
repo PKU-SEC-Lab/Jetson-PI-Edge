@@ -5,7 +5,9 @@
 #include "ggml-cuda.h"
 
 #include <cstdint>
+#include <cstdlib>
 #include <memory>
+#include <mutex>
 
 #if defined(GGML_USE_HIP)
 #define GGML_COMMON_DECL_HIP
@@ -27,6 +29,7 @@
 #include <cstdio>
 #include <string>
 #include <unordered_map>
+#include <utility>
 #include <vector>
 
 #if defined(GGML_USE_HIP)
@@ -50,6 +53,12 @@
 #define GGML_CUDA_CC_TURING          750
 #define GGML_CUDA_CC_AMPERE          800
 #define GGML_CUDA_CC_ADA_LOVELACE    890
+#define GGML_CUDA_CC_HOPPER          900
+// While BW spans CC 1000, 1100 & 1200, we are integrating Tensor Core instructions available to 1200 family, see
+// https://docs.nvidia.com/cutlass/media/docs/cpp/blackwell_functionality.html#blackwell-sm120-gemms
+#define GGML_CUDA_CC_BLACKWELL       1200
+#define GGML_CUDA_CC_DGX_SPARK       1210
+#define GGML_CUDA_CC_RUBIN           1300
 #define GGML_CUDA_CC_OFFSET_AMD      0x1000000
 #define GGML_CUDA_CC_OFFSET_MTHREADS 0x0100000
 #define GGML_CUDA_CC_IS_NVIDIA(cc)   (cc < GGML_CUDA_CC_OFFSET_MTHREADS)
@@ -60,26 +69,31 @@
 #define GGML_CUDA_CC_VEGA       (GGML_CUDA_CC_OFFSET_AMD + 0x900)  // Vega56/64, minimum for fp16 dual issue
 #define GGML_CUDA_CC_VEGA20     (GGML_CUDA_CC_OFFSET_AMD + 0x906)  // MI50/Radeon VII, minimum for dp4a
 #define GGML_CUDA_CC_CDNA1      (GGML_CUDA_CC_OFFSET_AMD + 0x908)  // MI100, minimum for MFMA, acc registers
-#define GGML_CUDA_CC_CDNA2      (GGML_CUDA_CC_OFFSET_AMD + 0x910)  // MI210, minimum acc register renameing
+#define GGML_CUDA_CC_CDNA2      (GGML_CUDA_CC_OFFSET_AMD + 0x90a)  // MI210 (gfx90a), minimum acc register renaming
 #define GGML_CUDA_CC_CDNA3      (GGML_CUDA_CC_OFFSET_AMD + 0x942)  // MI300
+#define GGML_CUDA_CC_CDNA4      (GGML_CUDA_CC_OFFSET_AMD + 0x950)  // MI350X/MI355X
 
 // RDNA removes MFMA, dp4a, xnack, acc registers, wave size is 32
 #define GGML_CUDA_CC_RDNA1      (GGML_CUDA_CC_OFFSET_AMD + 0x1010) // RX 5000
 #define GGML_CUDA_CC_RDNA2      (GGML_CUDA_CC_OFFSET_AMD + 0x1030) // RX 6000, minimum for dp4a
 #define GGML_CUDA_CC_RDNA3      (GGML_CUDA_CC_OFFSET_AMD + 0x1100) // RX 7000, minimum for WMMA
+#define GGML_CUDA_CC_RDNA3_5    (GGML_CUDA_CC_OFFSET_AMD + 0x1150) // AI 370, AI Max 395 laptops.
 #define GGML_CUDA_CC_RDNA4      (GGML_CUDA_CC_OFFSET_AMD + 0x1200) // RX 9000
 
-#define GGML_CUDA_CC_IS_AMD(cc)   (cc >= GGML_CUDA_CC_OFFSET_AMD)
-#define GGML_CUDA_CC_IS_RDNA(cc)  (cc >= GGML_CUDA_CC_RDNA1)
-#define GGML_CUDA_CC_IS_RDNA1(cc) (cc >= GGML_CUDA_CC_RDNA1 && cc < GGML_CUDA_CC_RDNA2)
-#define GGML_CUDA_CC_IS_RDNA2(cc) (cc >= GGML_CUDA_CC_RDNA2 && cc < GGML_CUDA_CC_RDNA3)
-#define GGML_CUDA_CC_IS_RDNA3(cc) (cc >= GGML_CUDA_CC_RDNA3 && cc < GGML_CUDA_CC_RDNA4)
-#define GGML_CUDA_CC_IS_RDNA4(cc) (cc >= GGML_CUDA_CC_RDNA4)
-#define GGML_CUDA_CC_IS_GCN(cc)   (cc > GGML_CUDA_CC_OFFSET_AMD && cc < GGML_CUDA_CC_CDNA1)
-#define GGML_CUDA_CC_IS_CDNA(cc)  (cc >= GGML_CUDA_CC_CDNA1 && cc < GGML_CUDA_CC_RDNA1)
-#define GGML_CUDA_CC_IS_CDNA1(cc) (cc >= GGML_CUDA_CC_CDNA1 && cc < GGML_CUDA_CC_CDNA2)
-#define GGML_CUDA_CC_IS_CDNA2(cc) (cc >= GGML_CUDA_CC_CDNA2 && cc < GGML_CUDA_CC_CDNA3)
-#define GGML_CUDA_CC_IS_CDNA3(cc) (cc >= GGML_CUDA_CC_CDNA3 && cc < GGML_CUDA_CC_RDNA1)
+#define GGML_CUDA_CC_IS_AMD(cc)     (cc >= GGML_CUDA_CC_OFFSET_AMD)
+#define GGML_CUDA_CC_IS_RDNA(cc)    (cc >= GGML_CUDA_CC_RDNA1)
+#define GGML_CUDA_CC_IS_RDNA1(cc)   (cc >= GGML_CUDA_CC_RDNA1 && cc < GGML_CUDA_CC_RDNA2)
+#define GGML_CUDA_CC_IS_RDNA2(cc)   (cc >= GGML_CUDA_CC_RDNA2 && cc < GGML_CUDA_CC_RDNA3)
+#define GGML_CUDA_CC_IS_RDNA3_0(cc) (cc >= GGML_CUDA_CC_RDNA3 && cc < GGML_CUDA_CC_RDNA3_5)
+#define GGML_CUDA_CC_IS_RDNA3_5(cc) (cc >= GGML_CUDA_CC_RDNA3_5 && cc < GGML_CUDA_CC_RDNA4)
+#define GGML_CUDA_CC_IS_RDNA3(cc)   (GGML_CUDA_CC_IS_RDNA3_0(cc) || GGML_CUDA_CC_IS_RDNA3_5(cc))
+#define GGML_CUDA_CC_IS_RDNA4(cc)   (cc >= GGML_CUDA_CC_RDNA4)
+#define GGML_CUDA_CC_IS_GCN(cc)     (cc > GGML_CUDA_CC_OFFSET_AMD && cc < GGML_CUDA_CC_CDNA1)
+#define GGML_CUDA_CC_IS_CDNA(cc)    (cc >= GGML_CUDA_CC_CDNA1 && cc < GGML_CUDA_CC_RDNA1)
+#define GGML_CUDA_CC_IS_CDNA1(cc)   (cc >= GGML_CUDA_CC_CDNA1 && cc < GGML_CUDA_CC_CDNA2)
+#define GGML_CUDA_CC_IS_CDNA2(cc)   (cc >= GGML_CUDA_CC_CDNA2 && cc < GGML_CUDA_CC_CDNA3)
+#define GGML_CUDA_CC_IS_CDNA3(cc)   (cc >= GGML_CUDA_CC_CDNA3 && cc < GGML_CUDA_CC_CDNA4)
+#define GGML_CUDA_CC_IS_CDNA4(cc)   (cc >= GGML_CUDA_CC_CDNA4 && cc < GGML_CUDA_CC_RDNA1)
 
 // Moore Threads
 #define MUSART_HMASK 40300 // MUSA rc4.3, min. ver. for half2 -> uint mask comparisons
@@ -96,6 +110,27 @@
 #if !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA) && CUDART_VERSION >= 11070
 #    define GGML_CUDA_USE_CUB
 #endif  // !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA) && CUDART_VERSION >= 11070
+
+// PDL host-side support (cudaLaunchKernelEx) requires CUDART >= 11.8.
+// However, this has been bugged in CTK < 12.3 for MSVC builds, see
+// https://github.com/ggml-org/llama.cpp/pull/22522#discussion_r3302393293
+// __CUDA_ARCH__  is undefined in host passes; GPU arch check happens in device-side code.
+#if !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA) && \
+    (CUDART_VERSION >= 12030 || (!(defined(_MSC_VER) && !defined(__clang__)) && CUDART_VERSION >= 11080))
+#    define GGML_CUDA_USE_PDL
+#endif  // !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA) && (CUDART_VERSION >= 12030 || (!(defined(_MSC_VER) && !defined(__clang__)) && CUDART_VERSION >= 11080))
+
+static __device__ __forceinline__ void ggml_cuda_pdl_sync() {
+#if defined(GGML_CUDA_USE_PDL) && defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= GGML_CUDA_CC_HOPPER
+    cudaGridDependencySynchronize();
+#endif // defined(GGML_CUDA_USE_PDL) && defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= GGML_CUDA_CC_HOPPER
+}
+
+static __device__ __forceinline__ void ggml_cuda_pdl_lc() {
+#if defined(GGML_CUDA_USE_PDL) && defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= GGML_CUDA_CC_HOPPER
+    cudaTriggerProgrammaticLaunchCompletion();
+#endif // defined(GGML_CUDA_USE_PDL) && defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= GGML_CUDA_CC_HOPPER
+}
 
 #ifdef __CUDA_ARCH_LIST__
 constexpr bool ggml_cuda_has_arch_impl(int) {
@@ -155,6 +190,7 @@ void ggml_cuda_error(const char * stmt, const char * func, const char * file, in
 
 #define CUDA_CHECK(err) CUDA_CHECK_GEN(err, cudaSuccess, cudaGetErrorString)
 
+
 #if CUDART_VERSION >= 12000 || defined(GGML_USE_MUSA)
     static const char * cublas_get_error_str(const cublasStatus_t err) {
         return cublasGetStatusString(err);
@@ -177,6 +213,10 @@ void ggml_cuda_error(const char * stmt, const char * func, const char * file, in
 #endif // CUDART_VERSION >= 12000
 
 #define CUBLAS_CHECK(err) CUDA_CHECK_GEN(err, CUBLAS_STATUS_SUCCESS, cublas_get_error_str)
+
+#ifdef GGML_USE_NCCL
+#define NCCL_CHECK(err) CUDA_CHECK_GEN(err, ncclSuccess, ncclGetErrorString)
+#endif // GGML_USE_NCCL
 
 #if !defined(GGML_USE_HIP) && !defined(GGML_CUDA_NO_VMM)
 static const char * cu_get_error_str(CUresult err) {
@@ -226,7 +266,7 @@ static const char * cu_get_error_str(CUresult err) {
 #define AMD_MFMA_AVAILABLE
 #endif // defined(GGML_USE_HIP) && defined(CDNA) && !defined(GGML_HIP_NO_MMQ_MFMA)
 
-#if defined(GGML_USE_HIP) && defined(RDNA4)
+#if defined(GGML_USE_HIP) && (defined(RDNA4) || defined(RDNA3))
 #define AMD_WMMA_AVAILABLE
 #endif // defined(GGML_USE_HIP) && defined(RDNA4)
 
@@ -242,6 +282,10 @@ static const char * cu_get_error_str(CUresult err) {
 #if !defined(GGML_USE_HIP) && __CUDA_ARCH__ >= GGML_CUDA_CC_AMPERE
 #define AMPERE_MMA_AVAILABLE
 #endif // !defined(GGML_USE_HIP) && __CUDA_ARCH__ >= GGML_CUDA_CC_AMPERE
+
+#if !defined(GGML_USE_HIP) && __CUDA_ARCH__ >= GGML_CUDA_CC_BLACKWELL && __CUDA_ARCH__ < GGML_CUDA_CC_RUBIN
+#    define BLACKWELL_MMA_AVAILABLE
+#endif // !defined(GGML_USE_HIP) && __CUDA_ARCH__ >= GGML_CUDA_CC_BLACKWELL
 
 #if !defined(GGML_USE_HIP) && __CUDA_ARCH__ >= GGML_CUDA_CC_AMPERE
 #define CP_ASYNC_AVAILABLE
@@ -294,7 +338,7 @@ static bool amd_mfma_available(const int cc) {
 }
 
 static bool amd_wmma_available(const int cc) {
-    return GGML_CUDA_CC_IS_RDNA4(cc);
+    return (GGML_CUDA_CC_IS_RDNA4(cc) || GGML_CUDA_CC_IS_RDNA3(cc));
 }
 
 static bool volta_mma_available(const int cc) {
@@ -311,6 +355,11 @@ static bool ampere_mma_available(const int cc) {
 
 static bool cp_async_available(const int cc) {
     return GGML_CUDA_CC_IS_NVIDIA(cc) && ggml_cuda_highest_compiled_arch(cc) >= GGML_CUDA_CC_AMPERE;
+}
+
+static bool blackwell_mma_available(const int cc) {
+    return GGML_CUDA_CC_IS_NVIDIA(cc) && ggml_cuda_highest_compiled_arch(cc) >= GGML_CUDA_CC_BLACKWELL &&
+           ggml_cuda_highest_compiled_arch(cc) < GGML_CUDA_CC_RUBIN;
 }
 
 static constexpr __device__ int ggml_cuda_get_physical_warp_size() {
@@ -461,6 +510,133 @@ static __device__ __forceinline__ float warp_reduce_max(float x) {
         x = fmaxf(x, __shfl_xor_sync(0xffffffff, x, offset, width));
     }
     return x;
+}
+
+template<typename T, int width = WARP_SIZE>
+static __device__ __forceinline__ T warp_prefix_inclusive_sum(T x) {
+    const int lane_id = threadIdx.x % width;
+#pragma unroll
+    for (int offset = 1; offset < width; offset <<= 1) {
+        const T t = __shfl_up_sync(0xffffffff, x, offset, width);
+        if (lane_id >= offset) {
+            x += t;
+        }
+    }
+    return x;
+}
+
+template<int width = WARP_SIZE>
+static __device__ __forceinline__ float2 warp_prefix_inclusive_sum(float2 a) {
+    const int lane_id = threadIdx.x % width;
+#pragma unroll
+    for (int offset = 1; offset < width; offset <<= 1) {
+        const float t_x = __shfl_up_sync(0xffffffff, a.x, offset, width);
+        const float t_y = __shfl_up_sync(0xffffffff, a.y, offset, width);
+        if (lane_id >= offset) {
+            a.x += t_x;
+            a.y += t_y;
+        }
+    }
+    return a;
+}
+
+template<int width = WARP_SIZE>
+static __device__ __forceinline__ half2 warp_prefix_inclusive_sum(half2 a) {
+#ifdef FP16_AVAILABLE
+    const int lane_id = threadIdx.x % width;
+#pragma unroll
+    for (int offset = 1; offset < width; offset <<= 1) {
+        const half2 t = __shfl_up_sync(0xffffffff, a, offset, width);
+        if (lane_id >= offset) {
+            a = __hadd2(a, t);
+        }
+    }
+    return a;
+
+#else
+    NO_DEVICE_CODE;
+    return a;
+#endif // FP16_AVAILABLE
+}
+
+enum class block_reduce_method {
+    MAX,
+    SUM,
+};
+
+template<block_reduce_method method_t, typename T>
+struct block_reduce_policy;
+
+template <typename T, typename... Ts>
+inline constexpr bool is_any = (std::is_same_v<T, Ts> || ...);
+
+template<typename...>
+inline constexpr bool ggml_cuda_dependent_false_v = false;
+
+template <typename T> struct block_reduce_policy<block_reduce_method::SUM, T> {
+    static __device__ T reduce(T val) {
+        if constexpr(is_any<T, float, float2, half2, int>) {
+            return warp_reduce_sum(val);
+        } else {
+            static_assert(ggml_cuda_dependent_false_v<T>, "Unsupported type for block reduce sum");
+        }
+    }
+
+    static __device__ T sentinel() {
+        if constexpr (std::is_same_v<T, float>) {
+            return 0.0f;
+        } else if constexpr (std::is_same_v<T, float2>) {
+            return make_float2(0.0f, 0.0f);
+        } else if constexpr (std::is_same_v<T, half2>) {
+            return make_half2(0.0f, 0.0f);
+        } else if constexpr (std::is_same_v<T, int>) {
+            return 0;
+        } else {
+            static_assert(ggml_cuda_dependent_false_v<T>, "Unsupported type for block reduce sum");
+        }
+    }
+};
+
+template <typename T> struct block_reduce_policy<block_reduce_method::MAX, T> {
+    static __device__ T reduce(T val) {
+        if constexpr (is_any<T, float, half2>) {
+            return warp_reduce_max(val);
+        } else {
+            static_assert(ggml_cuda_dependent_false_v<T>, "Unsupported type for block reduce max");
+        }
+    }
+
+    static __device__ T sentinel() {
+        if constexpr (std::is_same_v<T, float>) {
+            return -INFINITY;
+        } else if constexpr (std::is_same_v<T, half2>) {
+            return make_half2(-INFINITY, -INFINITY);
+        } else {
+            static_assert(ggml_cuda_dependent_false_v<T>, "Unsupported type for block reduce max");
+        }
+    }
+};
+
+template <block_reduce_method reduce_method_t, const unsigned int block_size_template = 0, typename T>
+static __device__ T block_reduce(T val, T * shared_vals) {
+    val                           = block_reduce_policy<reduce_method_t, T>::reduce(val);
+    const unsigned int block_size = block_size_template == 0 ? blockDim.x : block_size_template;
+    if (block_size > WARP_SIZE) {
+        assert((block_size <= 1024) && (block_size % WARP_SIZE) == 0);
+        const int warp_id = threadIdx.x / WARP_SIZE;
+        const int lane_id = threadIdx.x % WARP_SIZE;
+        if (lane_id == 0) {
+            shared_vals[warp_id] = val;
+        }
+        __syncthreads();
+        val = block_reduce_policy<reduce_method_t, T>::sentinel();
+        if (lane_id < (static_cast<int>(block_size) / WARP_SIZE)) {
+            val = shared_vals[lane_id];
+        }
+        return block_reduce_policy<reduce_method_t, T>::reduce(val);
+    }
+
+    return val;
 }
 
 static __device__ __forceinline__ half ggml_cuda_hmax(const half a, const half b) {
@@ -651,6 +827,69 @@ static __device__ __forceinline__ float ggml_cuda_e8m0_to_fp32(uint8_t x) {
 #endif // CUDART_VERSION >= 12050
 }
 
+static __device__ __forceinline__ float ggml_cuda_ue4m3_to_fp32(uint8_t x) {
+#if defined(GGML_USE_HIP) && defined(CDNA3) && defined(FP8_AVAILABLE) && HIP_VERSION >= 60200000
+    // ROCm does not support fp8 in software on devices with fp8 hardware,
+    // but CDNA3 supports only e4m3_fnuz (no inf).
+    const uint32_t bits = x * (x != 0x7F && x != 0xFF); // Convert NaN to 0.0f to match CPU implementation.
+    const __hip_fp8_e4m3_fnuz xf = *reinterpret_cast<const __hip_fp8_e4m3_fnuz *>(&bits);
+    return static_cast<float>(xf) / 2;
+#else
+#if defined(FP8_AVAILABLE) && !defined(GGML_USE_HIP)
+    const uint32_t bits = x * (x != 0x7F && x != 0xFF); // Convert NaN to 0.0f to match CPU implementation.
+    const __nv_fp8_e4m3 xf = *reinterpret_cast<const __nv_fp8_e4m3 *>(&bits);
+    return static_cast<float>(xf) / 2;
+#else
+    if (x == 0 || (x == 0x7F && x != 0xFF)) { // Convert NaN to 0.0f
+        return 0.0f;
+    }
+    const int exp = (x >> 3) & 0xF;
+    const int man = x & 0x7;
+    float raw;
+    if (exp == 0) {
+        raw = ldexpf((float) man, -9);
+    } else {
+        raw = ldexpf(1.0f + (float) man / 8.0f, exp - 7);
+    }
+    return static_cast<float>(raw / 2);
+#endif // defined(FP8_AVAILABLE) && !defined(GGML_USE_HIP)
+#endif // defined(GGML_USE_HIP) && defined(CDNA3) && defined(FP8_AVAILABLE) && HIP_VERSION >= 60200000
+}
+
+static __device__ __forceinline__ uint8_t ggml_cuda_fp32_to_ue4m3(float x) {
+#if defined(BLACKWELL_MMA_AVAILABLE) // This is used for NVFP4 subblock scale quantizations only
+    if (!(x > 0.0f)) {
+        return 0;
+    }
+    const __nv_fp8_e4m3 xf(x);
+    return xf.__x;
+#else
+     NO_DEVICE_CODE; // Used only for NVFP4 Scales for Activations, only for Blackwell
+#endif // defined(BLACKWELL_MMA_AVAILABLE)
+}
+
+__device__ __forceinline__ uint8_t ggml_cuda_float_to_fp4_e2m1(float x, float e) {
+    const uint8_t sign_bit = (x < 0.0f) << 3;
+    float         ax       = fabsf(x) * e;
+
+    // Positive LUT
+    static constexpr float pos_lut[8] = { 0.0f, 0.5f, 1.0f, 1.5f, 2.0f, 3.0f, 4.0f, 6.0f };
+
+    int   best_i   = 0;
+    float best_err = fabsf(ax - pos_lut[0]);
+
+#pragma unroll
+    for (int i = 1; i < 8; ++i) {
+        const float err = fabsf(ax - pos_lut[i]);
+        if (err < best_err) {
+            best_err = err;
+            best_i   = i;
+        }
+    }
+
+    return static_cast<uint8_t>(best_i | sign_bit);
+}
+
 // See https://gmplib.org/~tege/divcnst-pldi94.pdf figure 4.1.
 // Precompute mp (m' in the paper) and L such that division
 // can be computed using a multiply (high 32b of 64b result)
@@ -720,6 +959,13 @@ struct ggml_cuda_type_traits<GGML_TYPE_F16> {
 };
 
 template<>
+struct ggml_cuda_type_traits<GGML_TYPE_Q1_0> {
+    static constexpr int qk = QK1_0;
+    static constexpr int qr = QR1_0;
+    static constexpr int qi = QI1_0;
+};
+
+template<>
 struct ggml_cuda_type_traits<GGML_TYPE_Q4_0> {
     static constexpr int qk = QK4_0;
     static constexpr int qr = QR4_0;
@@ -759,6 +1005,13 @@ struct ggml_cuda_type_traits<GGML_TYPE_MXFP4> {
     static constexpr int qk = QK_MXFP4;
     static constexpr int qr = QR_MXFP4;
     static constexpr int qi = QI_MXFP4;
+};
+
+template<>
+struct ggml_cuda_type_traits<GGML_TYPE_NVFP4> {
+    static constexpr int qk = QK_NVFP4;
+    static constexpr int qr = QR_NVFP4;
+    static constexpr int qi = QI_NVFP4;
 };
 
 template<>
@@ -865,15 +1118,16 @@ struct ggml_cuda_device_info {
     int device_count;
 
     struct cuda_device_info {
-        int     cc;                 // compute capability
-        int     nsm;                // number of streaming multiprocessors
-        size_t  smpb;               // max. shared memory per block
-        size_t  smpbo;              // max. shared memory per block (with opt-in)
-        bool    integrated;         // Device is integrated as opposed to discrete
-        bool    vmm;                // virtual memory support
-        size_t  vmm_granularity;    // granularity of virtual memory
+        int     cc;                             // compute capability
+        int     nsm;                            // number of streaming multiprocessors
+        size_t  smpb;                           // max. shared memory per block
+        size_t  smpbo;                          // max. shared memory per block (with opt-in)
+        bool    integrated;                     // Device is integrated as opposed to discrete
+        bool    vmm;                            // virtual memory support
+        size_t  vmm_granularity;                // granularity of virtual memory
         size_t  total_vram;
-        int     warp_size;          // Number of threads in a dispatch
+        int     warp_size;                      // Number of threads in a dispatch
+        bool    supports_cooperative_launch;    // whether cooperative launch is supported
     };
 
     cuda_device_info devices[GGML_CUDA_MAX_DEVICES] = {};
@@ -950,15 +1204,6 @@ struct ggml_tensor_extra_gpu {
 #define USE_CUDA_GRAPH
 #endif
 
-struct ggml_graph_node_properties {
-    void * node_address;
-    ggml_op node_op;
-    int64_t ne[GGML_MAX_DIMS];
-    size_t nb[GGML_MAX_DIMS];
-    void * src_address[GGML_MAX_SRC];
-    int32_t op_params[GGML_MAX_OP_PARAMS / sizeof(int32_t)];
-};
-
 struct ggml_cuda_graph {
 #ifdef USE_CUDA_GRAPH
     ~ggml_cuda_graph() {
@@ -973,12 +1218,22 @@ struct ggml_cuda_graph {
     cudaGraphExec_t instance = nullptr;
     size_t num_nodes = 0;
     std::vector<cudaGraphNode_t> nodes;
-    std::vector<cudaKernelNodeParams> params;
     bool disable_due_to_gpu_arch = false;
-    bool disable_due_to_too_many_updates = false;
-    bool disable_due_to_failed_graph_capture = false;
-    int number_consecutive_updates = 0;
-    std::vector<ggml_graph_node_properties> ggml_graph_properties;
+    bool warmup_complete = false;
+    uint64_t uid = 0;
+    int64_t last_used_time = 0;
+    struct node_properties {
+        ggml_tensor node;
+        void *   node_src_data_ptrs[GGML_MAX_SRC];
+        int64_t  node_src_ne[GGML_MAX_SRC][GGML_MAX_DIMS];
+        size_t   node_src_nb[GGML_MAX_SRC][GGML_MAX_DIMS];
+    };
+    std::vector<node_properties> node_props;
+
+    bool is_enabled() const {
+        static const bool disable_cuda_graphs_due_to_env = (getenv("GGML_CUDA_DISABLE_GRAPHS") != nullptr);
+        return !(disable_due_to_gpu_arch || disable_cuda_graphs_due_to_env);
+    }
 #endif
 };
 
@@ -988,6 +1243,10 @@ struct ggml_cuda_concurrent_event {
 
     int                                          n_streams = 0;
     std::unordered_map<const ggml_tensor *, int> stream_mapping;
+
+    // Original order of nodes in this concurrent region (before interleaving)
+    // Used to restore grouping for fusion within streams
+    std::vector<const ggml_tensor *> original_order;
 
     const ggml_tensor * join_node;
 
@@ -1011,6 +1270,7 @@ struct ggml_cuda_concurrent_event {
     , fork_event(other.fork_event)
     , n_streams(other.n_streams)
     , stream_mapping(std::move(other.stream_mapping))
+    , original_order(std::move(other.original_order))
     , join_node(other.join_node) {
         other.fork_event = nullptr;
     }
@@ -1121,11 +1381,9 @@ struct ggml_cuda_concurrent_event {
 };
 
 struct ggml_cuda_stream_context {
-    std::vector<const ggml_tensor *>                                    original_nodes;
     std::unordered_map<const ggml_tensor *, ggml_cuda_concurrent_event> concurrent_events;
 
     void reset() {
-        original_nodes.clear();
         concurrent_events.clear();
     }
 };
@@ -1138,9 +1396,59 @@ struct ggml_backend_cuda_context {
     cudaStream_t streams[GGML_CUDA_MAX_DEVICES][GGML_CUDA_MAX_STREAMS] = { { nullptr } };
     cublasHandle_t cublas_handles[GGML_CUDA_MAX_DEVICES] = {nullptr};
 
-    std::unique_ptr<ggml_cuda_graph> cuda_graph;
-
     int curr_stream_no = 0;
+
+#ifdef USE_CUDA_GRAPH
+    // Map from first_node_ptr to cuda_graph - allows multiple graphs per context
+    // when the computation is split across CPU/GPU (e.g., with --n-cpu-moe)
+    std::unordered_map<const void *, std::unique_ptr<ggml_cuda_graph>> cuda_graphs;
+
+    int64_t last_graph_eviction_sweep = 0;
+
+    ggml_cuda_graph * cuda_graph(const void * first_node_ptr) {
+        const int64_t time_now = ggml_time_us();
+
+        // sweep every 5s, evicting cuda graphs unused for >=10s
+        if (time_now - last_graph_eviction_sweep >= 5'000'000) {
+            last_graph_eviction_sweep = time_now;
+            for (auto it = cuda_graphs.begin(); it != cuda_graphs.end(); ) {
+                if (time_now - it->second->last_used_time >= 10'000'000) {
+                    it = cuda_graphs.erase(it);
+                } else {
+                    ++it;
+                }
+            }
+        }
+
+        auto it = cuda_graphs.find(first_node_ptr);
+        if (it == cuda_graphs.end()) {
+            it = cuda_graphs.emplace(first_node_ptr, std::make_unique<ggml_cuda_graph>()).first;
+        }
+        it->second->last_used_time = time_now;
+        return it->second.get();
+    }
+
+    // Check if any CUDA graph is enabled for this context (used by kernels that need to know
+    // if graphs are in use without having access to the specific graph key)
+    bool any_cuda_graph_enabled() const {
+        for (const auto & [key, graph] : cuda_graphs) {
+            if (graph && graph->is_enabled()) {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    // Check if any CUDA graph has an instance for this context
+    bool any_cuda_graph_has_instance() const {
+        for (const auto & [key, graph] : cuda_graphs) {
+            if (graph && graph->instance != nullptr) {
+                return true;
+            }
+        }
+        return false;
+    }
+#endif // USE_CUDA_GRAPH
 
     explicit ggml_backend_cuda_context(int device) :
         device(device),
@@ -1197,11 +1505,141 @@ struct ggml_cuda_mm_fusion_args_host {
     const ggml_tensor * x_bias = nullptr;
     const ggml_tensor * gate = nullptr;
     const ggml_tensor * gate_bias = nullptr;
+    const ggml_tensor * x_scale = nullptr;
+    const ggml_tensor * gate_scale = nullptr;
     ggml_glu_op glu_op;
 };
 struct ggml_cuda_mm_fusion_args_device {
     const void * x_bias = nullptr;
     const void * gate = nullptr;
     const void * gate_bias = nullptr;
+    const void * x_scale = nullptr;
+    const void * gate_scale = nullptr;
     ggml_glu_op glu_op;
 };
+
+struct ggml_cuda_kernel_launch_params {
+    dim3 block_nums;
+    dim3 block_dims;
+    size_t shmem;
+    cudaStream_t stream;
+
+    // size_t shmem
+    ggml_cuda_kernel_launch_params(const dim3& block_nums_, const dim3& block_dims_, const size_t shmem_, const cudaStream_t stream_)
+        : block_nums(block_nums_), block_dims(block_dims_), shmem(shmem_), stream(stream_) {}
+
+    // Some call sites pass ints instead of the required size_t. This 2nd constructor casts int->size_t to avoid these -Wnarrowing warnings.
+    ggml_cuda_kernel_launch_params(const dim3& block_nums_, const dim3& block_dims_, const int shmem_, const cudaStream_t stream_)
+        : block_nums(block_nums_), block_dims(block_dims_), shmem((size_t)shmem_), stream(stream_) {}
+};
+
+#if defined(GGML_CUDA_USE_PDL)
+struct ggml_cuda_pdl_config {
+    cudaLaunchAttribute attr;
+    cudaLaunchConfig_t  cfg;
+
+    ggml_cuda_pdl_config(const ggml_cuda_kernel_launch_params & params) {
+        attr.id = cudaLaunchAttributeProgrammaticStreamSerialization;
+        attr.val.programmaticStreamSerializationAllowed = 1;
+
+        cfg = {};
+        cfg.gridDim          = params.block_nums;
+        cfg.blockDim         = params.block_dims;
+        cfg.dynamicSmemBytes = params.shmem;
+        cfg.stream           = params.stream;
+        cfg.attrs            = &attr;
+        cfg.numAttrs         = 1;
+    }
+
+    // Delete due to &attr
+    ggml_cuda_pdl_config(const ggml_cuda_pdl_config&) = delete;
+    ggml_cuda_pdl_config& operator=(const ggml_cuda_pdl_config&) = delete;
+    ggml_cuda_pdl_config& operator=(ggml_cuda_pdl_config&&) = delete;
+
+};
+
+static bool ggml_cuda_kernel_can_use_pdl(const void * kernel) {
+    const int device = ggml_cuda_get_device();
+
+    struct cache_key {
+        int          device;
+        const void * kernel;
+
+        bool operator==(const cache_key & other) const { return device == other.device && kernel == other.kernel; }
+    };
+
+    struct cache_key_hash {
+        // MurmurHash3 mixing function for better hash distribution (vs. just std::hash which in some implementations simply returns the identity)
+        static size_t hash_mix(size_t x) {
+            std::uint64_t       y = x;
+            const std::uint64_t m = 0xe9846af9b1a615d;
+
+            y ^= y >> 32;
+            y *= m;
+            y ^= y >> 32;
+            y *= m;
+            y ^= y >> 28;
+
+            return static_cast<size_t>(y);
+        }
+
+        size_t operator()(const cache_key & key) const {
+            // Use a nonzero seed to avoid mapping all-zero keys to zero
+            size_t h = 42;
+            h        = hash_mix(h + key.device);
+            h        = hash_mix(h + reinterpret_cast<size_t>(key.kernel));
+            return h;
+        }
+    };
+
+    static std::mutex                                          cache_mutex;
+    static std::unordered_map<cache_key, bool, cache_key_hash> cache;
+
+    const cache_key             key = { device, kernel };
+    std::lock_guard<std::mutex> lock(cache_mutex);
+    const auto                  it = cache.find(key);
+    if (it != cache.end()) {
+        return it->second;
+    }
+
+    cudaFuncAttributes attr = {};
+    CUDA_CHECK(cudaFuncGetAttributes(&attr, kernel));
+
+    // PDL device-side primitives are emitted only for PTX versions >= 90.
+    // We have to guard on a loaded kernel's PTX version so a kernel forward-JIT'ed
+    // from pre-Hopper PTX to a Hopper-or-newer GPU does not opt into PDL.
+    const bool can_use_pdl = attr.ptxVersion >= 90;
+    cache.emplace(key, can_use_pdl);
+    return can_use_pdl;
+}
+
+#endif //defined(GGML_CUDA_USE_PDL)
+
+// PDL and __restrict__ need to be mutually exclusive, see https://github.com/ggml-org/llama.cpp/pull/24030
+# if (defined(GGML_CUDA_USE_PDL) && defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= GGML_CUDA_CC_HOPPER)
+# define GGML_CUDA_RESTRICT
+# else
+# define GGML_CUDA_RESTRICT __restrict__
+# endif // defined(GGML_CUDA_USE_PDL) && defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= GGML_CUDA_CC_HOPPER
+
+template<typename Kernel, typename... Args>
+static __inline__ void ggml_cuda_kernel_launch(Kernel kernel, const ggml_cuda_kernel_launch_params & launch_params, Args&&... args) {
+#if defined(GGML_CUDA_USE_PDL)
+
+    static const bool env_pdl_enabled = []() {
+        const char * env = getenv("GGML_CUDA_PDL");
+        return env == nullptr || std::atoi(env) != 0;
+    }();
+
+    if (env_pdl_enabled && ggml_cuda_kernel_can_use_pdl(reinterpret_cast<const void *>(kernel))) {
+        auto pdl_cfg = ggml_cuda_pdl_config(launch_params);
+
+        CUDA_CHECK(cudaLaunchKernelEx(&pdl_cfg.cfg, kernel, std::forward<Args>(args)... ));
+        return;
+    }
+#endif //defined(GGML_CUDA_USE_PDL)
+
+    kernel<<<launch_params.block_nums, launch_params.block_dims, launch_params.shmem, launch_params.stream>>>(std::forward<Args>(args)... );
+    CUDA_CHECK(cudaGetLastError());
+}
+

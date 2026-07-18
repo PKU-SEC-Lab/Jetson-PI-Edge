@@ -12,10 +12,6 @@ typedef enum pi_model_kind {
     PI_MODEL_PI05,
 } pi_model_kind;
 
-#ifdef __cplusplus
-inline thread_local pi_model_kind pi_model_thread_override = PI_MODEL_AUTO;
-#endif
-
 static inline char pi_model_ascii_lower(char c) {
     return (c >= 'A' && c <= 'Z') ? (char) (c - 'A' + 'a') : c;
 }
@@ -69,21 +65,8 @@ static inline pi_model_kind pi_model_kind_from_string(const char * value) {
 }
 
 static inline pi_model_kind pi_model_kind_from_env(void) {
-#ifdef __cplusplus
-    if (pi_model_thread_override != PI_MODEL_AUTO) {
-        return pi_model_thread_override;
-    }
-#endif
     return pi_model_kind_from_string(getenv("PI_MODEL"));
 }
-
-#ifdef __cplusplus
-static inline pi_model_kind pi_model_set_thread_override(pi_model_kind kind) {
-    const pi_model_kind previous = pi_model_thread_override;
-    pi_model_thread_override = kind;
-    return previous;
-}
-#endif
 
 static inline const char * pi_model_kind_name(pi_model_kind kind) {
     switch (kind) {

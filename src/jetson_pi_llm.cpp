@@ -1,4 +1,4 @@
-// jetson_pi_llm — generic GGUF LLM completion wrapped behind a narrow C
+// jetson_pi_llm - generic GGUF LLM completion wrapped behind a narrow C
 // handle. See include/jetson_pi_llm.h for the public contract.
 //
 // This translation unit keeps every llama.cpp/GGML symbol private to the
@@ -76,8 +76,8 @@ int32_t jetson_pi_llm_open(const jetson_pi_llm_config * config,
         return JETSON_PI_LLM_INVALID;
     }
     // The selected build must contain the requested GGML backend. Compiling a
-    // backend does not guarantee every model op is supported on it — verify
-    // each model×backend combination independently.
+    // backend does not guarantee every model op is supported on it - verify
+    // each model x backend combination independently.
     if (std::strcmp(config->backend, "cpu") != 0 &&
         std::strcmp(config->backend, "cuda") != 0 &&
         std::strcmp(config->backend, "vulkan") != 0 &&

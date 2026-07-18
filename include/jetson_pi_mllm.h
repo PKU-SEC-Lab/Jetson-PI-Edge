@@ -2,7 +2,7 @@
 #define JETSON_PI_MLLM_H
 
 //
-// jetson_pi_mllm — narrow multimodal LLM C API.
+// jetson_pi_mllm - narrow multimodal LLM C API.
 //
 // Wraps image encoding (mtmd) + text generation (llama.cpp sample loop) behind
 // one opaque handle so an embedding host (e.g. FlashRT) can drive a
@@ -98,7 +98,7 @@ int32_t jetson_pi_mllm_token_to_piece(jetson_pi_mllm * handle,
 //
 //   images_rgb    array of n_images RGB row-major buffers; each buffer is
 //                 image_height * image_width * 3 bytes (the engine does not
-//                 know per-image dimensions — all images must share the
+//                 know per-image dimensions - all images must share the
 //                 config's image dimensions, or pass n_images=0 for a
 //                 text-only completion). [Phase 4: all images share one
 //                 fixed WxH; per-image sizing is a later concern.]

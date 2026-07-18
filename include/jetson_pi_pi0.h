@@ -2,7 +2,7 @@
 #define JETSON_PI_PI0_H
 
 //
-// jetson_pi_pi0 — narrow Pi0 policy C API.
+// jetson_pi_pi0 - narrow Pi0 policy C API.
 //
 // Wraps the Pi0 whole-graph inference path (VIT -> encode -> diffusion decode
 // -> action chunk) behind one opaque handle so an embedding host (e.g. FlashRT)
@@ -24,7 +24,7 @@ extern "C" {
 #endif
 
 //
-// Thread safety: a single jetson_pi_pi0 handle is NOT thread-safe — the
+// Thread safety: a single jetson_pi_pi0 handle is NOT thread-safe - the
 // caller must serialize access to one handle. Different handles are
 // independent and may be used concurrently. jetson_pi_pi0_open,
 // jetson_pi_pi0_open_error, and jetson_pi_pi0_default... are thread-safe

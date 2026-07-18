@@ -64,26 +64,7 @@ def dump_metadata(reader: GGUFReader, args: argparse.Namespace) -> None:
     for n, tensor in enumerate(reader.tensors, 1):
         prettydims = ', '.join('{0:5}'.format(d) for d in list(tensor.shape) + [1] * (4 - len(tensor.shape)))
         print(f'  {n:5}: {tensor.n_elements:10} | {prettydims} | {tensor.tensor_type.name:7} | {tensor.name}')  # noqa: NP100
-        # Extra preview for selected embedding rows.
-        if tensor.name == "token_embd.weight":
-            print(f"\n    >> Extracting selected rows from {tensor.name}:")
-            try:
-                # Require at least 2 dimensions: vocab size by embedding width.
-                if len(tensor.shape) >= 2:
-                    # Read row 2 (index 1) and row 108 (index 107).
-                    row_2 = tensor.data[1]
-                    row_108 = tensor.data[107]
 
-                    print(f"    [row 2 preview]: {row_2[:5]} ... (length: {len(row_2)})")
-                    print(f"    [row 108 preview]: {row_108[:5]} ... (length: {len(row_108)})")
-                    
-                    # Uncomment to print a full row. Large tensors will produce a lot of output.
-                    # print(f"    [row 2 full data]: {row_2.tolist()}")
-                else:
-                    print(f"    warning: tensor shape {tensor.shape} cannot be indexed by row.")
-            except Exception as e:
-                print(f"    failed to extract rows: {e}")
-            print("")
 
 def dump_metadata_json(reader: GGUFReader, args: argparse.Namespace) -> None:
     import json

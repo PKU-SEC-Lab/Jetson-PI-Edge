@@ -40,6 +40,15 @@
 #include <fstream>
 #include <sstream>
 
+
+static bool mtmd_is_pi0_model(mtmd_context *) {
+    return true;
+}
+
+static void mtmd_pi0_clear_encode_cache(mtmd_context *) {}
+static int32_t mtmd_pi0_preencode_image_chunks(mtmd_context *, const mtmd_input_chunks *) { return 0; }
+static bool mtmd_pi0_apply_cached_chunk_embd(mtmd_context *, int32_t) { return false; }
+
 static void mtmd_pi0_accumulate_vit_perf(mtmd_context * ctx, mtmd_pi0_result * pi0_result) {
     mtmd_pi0_result_apply_vit_perf(ctx, pi0_result);
 }
@@ -209,19 +218,18 @@ struct decode_embd_batch {
         logits  .resize(n_tokens);
         seq_id_0.resize(1);
         seq_ids [n_tokens] = nullptr;
-        batch = {
-            /*n_tokens       =*/ n_tokens,
-            /*tokens         =*/ nullptr,
-            /*embd           =*/ embd,
-            /*embd2    =*/ nullptr,
-            /*embd3    =*/ nullptr,
-            /*img_token_num    =*/ 0,
-            /*single_img_token_num    =*/ 0,
-            /*pos            =*/ pos.data(),
-            /*n_seq_id       =*/ n_seq_id.data(),
-            /*seq_id         =*/ seq_ids.data(),
-            /*logits         =*/ logits.data(),
-        };
+        batch = {};
+        batch.n_tokens = n_tokens;
+        batch.token    = nullptr;
+        batch.embd     = embd;
+        batch.pos      = pos.data();
+        batch.n_seq_id = n_seq_id.data();
+        batch.seq_id   = seq_ids.data();
+        batch.logits   = logits.data();
+        batch.embd2    = nullptr;
+        batch.embd3    = nullptr;
+        batch.img_token_num = 0;
+        batch.single_img_token_num = 0;
     }
 
     void set_position_normal(llama_pos pos_0, llama_seq_id seq_id) {
@@ -293,19 +301,19 @@ struct decode_embd_batch {
             // normal
             pos_ptr = pos.data() + offset;
         }
-        return {
-            /*n_tokens       =*/ n_tokens,
-            /*tokens         =*/ nullptr,
-            /*embd           =*/ batch.embd     + offset * n_mmproj_embd,
-            /*embd2    =*/ nullptr,
-            /*embd3    =*/ nullptr,
-            /*img_token_num    =*/ 0,
-            /*single_img_token_num    =*/ 0,
-            /*pos            =*/ pos_ptr,
-            /*n_seq_id       =*/ batch.n_seq_id + offset,
-            /*seq_id         =*/ batch.seq_id   + offset,
-            /*logits         =*/ batch.logits   + offset,
-        };
+        llama_batch view = {};
+        view.n_tokens = n_tokens;
+        view.token    = nullptr;
+        view.embd     = batch.embd + offset * n_mmproj_embd;
+        view.pos      = pos_ptr;
+        view.n_seq_id = batch.n_seq_id + offset;
+        view.seq_id   = batch.seq_id + offset;
+        view.logits   = batch.logits + offset;
+        view.embd2    = nullptr;
+        view.embd3    = nullptr;
+        view.img_token_num = 0;
+        view.single_img_token_num = 0;
+        return view;
     }
 };
 
@@ -358,7 +366,7 @@ int32_t mtmd_helper_decode_image_chunk(
         batch_embd.set_position_normal(n_past, seq_id);
     }
 
-    if (mtmd_decode_use_non_causal(ctx)) {
+    if (mtmd_decode_use_non_causal(ctx, chunk)) {
         llama_set_causal_attn(lctx, false);
         // TODO @ngxson : need to make sure only one image is processed at a time, and n_ubatch must be enough to hold the image
     }
@@ -426,7 +434,7 @@ int32_t mtmd_helper_decode_image_chunk(
     n_past += mtmd_input_chunk_get_n_pos(chunk);
     *new_n_past = n_past;
 
-    if (mtmd_decode_use_non_causal(ctx)) {
+    if (mtmd_decode_use_non_causal(ctx, chunk)) {
         llama_set_causal_attn(lctx, true);
     }
     return 0;
@@ -612,6 +620,7 @@ int32_t mtmd_helper_eval_chunks_pi0(mtmd_context * ctx,
 
     llama_batch combined_batch = llama_batch_init_pi0(n_batch, 0, 1);
     combined_batch.n_tokens = 0;
+    std::vector<std::vector<float>> image_embd_storage;
 
 
     for (size_t ij = 0; ij < n_chunks; ij++) {
@@ -737,7 +746,9 @@ int32_t mtmd_helper_eval_chunks_pi0(mtmd_context * ctx,
                 mtmd_pi0_accumulate_vit_perf(ctx, pi0_result);
             }
 
-            printf("Vit took: %.2f ms\n", vit_ms);
+            if (pi_model_env_truthy(std::getenv("LLAMA_PI0_PERF"))) {
+                fprintf(stderr, "Vit took: %.2f ms\n", vit_ms);
+            }
 
             if (ret != 0) {
                 LOG_ERR("failed to encode %s slice\n", name);
@@ -804,7 +815,7 @@ int32_t mtmd_helper_eval_chunks_pi0(mtmd_context * ctx,
                 batch_embd.set_position_normal(n_past, seq_id);
             }
         
-            if (mtmd_decode_use_non_causal(ctx)) {
+            if (mtmd_decode_use_non_causal(ctx, chunk)) {
                 llama_set_causal_attn(lctx, false);
                 // TODO @ngxson : need to make sure only one image is processed at a time, and n_ubatch must be enough to hold the image
             }
@@ -832,16 +843,20 @@ int32_t mtmd_helper_eval_chunks_pi0(mtmd_context * ctx,
                 if (combined_batch.img_token_num>0){
                     img_num = combined_batch.img_token_num/ combined_batch.single_img_token_num;
                 }
+                image_embd_storage.emplace_back(
+                    batch_embd_view.embd,
+                    batch_embd_view.embd + (size_t) batch_embd_view.n_tokens * (size_t) n_mmproj_embd);
+                float * stored_embd = image_embd_storage.back().data();
                 if (img_num==1){
-                    combined_batch.embd     = batch_embd_view.embd; 
+                    combined_batch.embd = stored_embd;
                 }
                 else{
                     if (img_num==2){
-                        combined_batch.embd2     = batch_embd_view.embd; 
+                        combined_batch.embd2 = stored_embd;
                     }
                     else{
                         if (img_num==3){
-                            combined_batch.embd3     = batch_embd_view.embd; 
+                            combined_batch.embd3 = stored_embd;
                         }
                         else{
                             GGML_ABORT("Not supported more than 3 embd buffers");
@@ -869,7 +884,7 @@ int32_t mtmd_helper_eval_chunks_pi0(mtmd_context * ctx,
             n_past += mtmd_input_chunk_get_n_pos(chunk);
             *new_n_past = n_past;
         
-            if (mtmd_decode_use_non_causal(ctx)) {
+            if (mtmd_decode_use_non_causal(ctx, chunk)) {
                 llama_set_causal_attn(lctx, true);
             }
         
@@ -960,9 +975,11 @@ int32_t mtmd_helper_eval_chunks_pi0(mtmd_context * ctx,
         pi0_result->has_decode_ms = true;
         pi0_result->has_total_ms = true;
     }
-    printf("Encode took: %.2f ms\n", encode_ms);
-    printf("Decode took: %.2f ms\n", decode_ms);
-    printf("Total processing time: %.2f ms\n", total_ms);
+    if (pi_model_env_truthy(std::getenv("LLAMA_PI0_PERF"))) {
+        fprintf(stderr, "Encode took: %.2f ms\n", encode_ms);
+        fprintf(stderr, "Decode took: %.2f ms\n", decode_ms);
+        fprintf(stderr, "Total processing time: %.2f ms\n", total_ms);
+    }
 
 
     if (ret != 0) {
@@ -1125,7 +1142,7 @@ static bool decode_audio_from_buf(const unsigned char * buf_in, size_t len, int 
 mtmd_bitmap * mtmd_helper_bitmap_init_from_buf(mtmd_context * ctx, const unsigned char * buf, size_t len) {
     if (audio_helpers::is_audio_file((const char *)buf, len)) {
         std::vector<float> pcmf32;
-        int bitrate = mtmd_get_audio_bitrate(ctx);
+        int bitrate = mtmd_get_audio_sample_rate(ctx);
         if (bitrate < 0) {
             LOG_ERR("This model does not support audio input\n");
             return nullptr;

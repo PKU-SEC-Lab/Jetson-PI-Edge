@@ -2,7 +2,7 @@
 #define JETSON_PI_LLM_H
 
 //
-// jetson_pi_llm — narrow generic GGUF LLM C API.
+// jetson_pi_llm - narrow generic GGUF LLM C API.
 //
 // Wraps the standard llama.cpp generate loop (tokenize -> decode -> sample ->
 // detokenize) behind one opaque handle so an embedding host (e.g. FlashRT)
