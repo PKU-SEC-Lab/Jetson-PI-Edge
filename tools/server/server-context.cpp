@@ -1132,8 +1132,8 @@ json sliced_rows = json::array();
         const bool add_bos = foreground.chat_history.empty();
         const bool use_pi05_pi0_adapter = is_pi0 && server_pi_model_use_pi05_adapters();
         std::string formatted_chat;
-        if (use_pi05_pi0_adapter) {
-            // PI05/OpenPI expects the raw multimodal prefix, not a chat-template wrapper.
+        if (is_pi0) {
+            // PI policies expect the raw multimodal prefix, not a chat-template wrapper.
             formatted_chat = msg.content;
             foreground.chat_history.push_back(msg);
         } else {
@@ -1143,7 +1143,7 @@ json sliced_rows = json::array();
 
         mtmd_input_text text;
         text.text          = formatted_chat.c_str();
-        text.add_special   = use_pi05_pi0_adapter ? false : add_bos;
+        text.add_special   = is_pi0 ? false : add_bos;
         text.parse_special = true;
 
         mtmd::input_chunks chunks(mtmd_input_chunks_init());

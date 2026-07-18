@@ -615,10 +615,6 @@ int32_t mtmd_helper_eval_chunks_pi0(mtmd_context * ctx,
 
 
     for (size_t ij = 0; ij < n_chunks; ij++) {
-        if (n_chunks > 1 && ij == 0){
-            continue; // skip the first chunk
-        }
-        
         bool chunk_logits_last = (ij == n_chunks - 1) && logits_last;
         auto chunk = mtmd_input_chunks_get(chunks, ij);
 
@@ -665,9 +661,6 @@ int32_t mtmd_helper_eval_chunks_pi0(mtmd_context * ctx,
                 combined_batch.n_tokens++;
 
                 for (; i < n_tokens && text_batch.n_tokens < n_batch; i++) {
-                    if (i == n_tokens-3){
-                        break; // skip the last 3 tokens
-                    }
                     int32_t j = text_batch.n_tokens;
                     text_batch.token   [j]    = tokens[i];
                     text_batch.pos     [j]    = n_past++;
@@ -688,7 +681,7 @@ int32_t mtmd_helper_eval_chunks_pi0(mtmd_context * ctx,
                     combined_batch.n_tokens++;
 
                 }
-                bool is_last_token = (i == n_tokens-3);
+                bool is_last_token = (i == n_tokens);
                 if (chunk_logits_last && is_last_token) {
                     text_batch.logits[text_batch.n_tokens - 1] = true;
                     combined_batch.logits[combined_batch.n_tokens - 1] = true;
@@ -713,11 +706,15 @@ int32_t mtmd_helper_eval_chunks_pi0(mtmd_context * ctx,
                     llama_batch_free(text_batch);
                     return ret;
                 }
-                *new_n_past += text_batch.n_tokens;
-                if (i == n_tokens-3){
-                    break; // skip the last 3 tokens
-                }
             }
+
+            const int32_t combined_j = combined_batch.n_tokens;
+            combined_batch.token   [combined_j]    = 108;
+            combined_batch.pos     [combined_j]    = n_past++;
+            combined_batch.n_seq_id[combined_j]    = 1;
+            combined_batch.seq_id  [combined_j][0] = seq_id;
+            combined_batch.logits  [combined_j]    = chunk_logits_last;
+            combined_batch.n_tokens++;
     
         } else if (chunk_type == MTMD_INPUT_CHUNK_TYPE_IMAGE || chunk_type == MTMD_INPUT_CHUNK_TYPE_AUDIO) {
             const char * name = chunk_type == MTMD_INPUT_CHUNK_TYPE_IMAGE ? "image" : "audio";
