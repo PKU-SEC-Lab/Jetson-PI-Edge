@@ -368,35 +368,25 @@ int32_t jetson_pi_pi0_context(jetson_pi_pi0 * handle,
         bitmaps.push_back(bmp);
     }
 
-    // Tokenize like the foreground server's first Vicuna chat turn:
-    // common_chat_format_single() emits "USER: <content>\nASSISTANT:" for
-    // --chat-template vicuna, then mtmd_helper_eval_chunks_pi0 applies the
-    // PI_MODEL=pi0 legacy token adapter.
+    // Match the foreground Pi0 path: pass the raw multimodal prefix without
+    // chat-template wrappers or a special BOS token.
     const char * marker = mtmd_default_marker();
     const size_t marker_len = std::strlen(marker);
-    const char * user_prefix = "USER: ";
-    const char * assistant_suffix = "\nASSISTANT:";
-    const size_t user_prefix_len = std::strlen(user_prefix);
-    const size_t assistant_suffix_len = std::strlen(assistant_suffix);
     if (marker_len != 0 &&
         static_cast<size_t>(e->n_views) >
-            (std::numeric_limits<size_t>::max() - prompt_len - user_prefix_len - assistant_suffix_len) / marker_len) {
+            (std::numeric_limits<size_t>::max() - prompt_len) / marker_len) {
         free_bitmaps(bitmaps);
         return reject(e, JETSON_PI_PI0_INVALID,
                       "formatted Pi0 prompt size overflows size_t");
     }
     std::string formatted;
-    formatted.reserve(user_prefix_len + prompt_len +
-                      static_cast<size_t>(e->n_views) * marker_len +
-                      assistant_suffix_len);
-    formatted.append(user_prefix, user_prefix_len);
+    formatted.reserve(prompt_len + static_cast<size_t>(e->n_views) * marker_len);
     for (uint32_t i = 0; i < e->n_views; ++i) formatted += marker;
     formatted.append(prompt, prompt_len);
-    formatted.append(assistant_suffix, assistant_suffix_len);
 
     mtmd_input_text text;
     text.text          = formatted.c_str();
-    text.add_special   = true;   // first turn
+    text.add_special   = false;
     text.parse_special = true;
 
     std::vector<const mtmd_bitmap*> bmp_ptrs(bitmaps.begin(), bitmaps.end());
