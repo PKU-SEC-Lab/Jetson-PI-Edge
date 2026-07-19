@@ -148,7 +148,7 @@ PI_MODEL=auto \
   --port 8080
 ```
 
-Use `PI_MODEL=pi0` or `PI_MODEL=pi05` to force a model path. For reproducible numerical comparisons, set `PI0_ACTION_NOISE_BIN` to a fixed binary noise tensor.
+Use `PI_MODEL=pi0` or `PI_MODEL=pi05` to force a model path.
 
 ### 4. Run one inference round
 
@@ -223,8 +223,6 @@ def load_rgb224(path):
         image = image.resize((224, 224), Image.BILINEAR)
     return np.asarray(image, dtype=np.uint8)
 
-
-os.environ["PI0_ACTION_NOISE_BIN"] = "/path/to/pi0_noise_10x32.bin"
 
 model = flash_rt.load_model(
     "/path/to/pi_llm.gguf",
