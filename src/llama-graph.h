@@ -103,6 +103,7 @@ struct llama_cross {
     mutable bool                 pi0_decode_attn_mask_ready  = false;
 
     int32_t pi0_decode_unroll = 1;
+    int32_t pi0_decode_step = 0;
     bool    pi0_action_out_accumulated = false;
 
     mutable double pi0_perf_set_kv_ms       = 0;

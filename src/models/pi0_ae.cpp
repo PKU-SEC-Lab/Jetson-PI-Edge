@@ -14,6 +14,9 @@ llm_build_pi0_ae::llm_build_pi0_ae(const llama_model & model, const llm_graph_pa
 
     // Legacy Jetson-PI AE path for PI_MODEL=pi0
     if (pi_model_kind_is_pi0(pi_model_kind_from_env())) {
+        const int32_t n_unroll = cross && cross->pi0_decode_unroll >= 2
+            ? cross->pi0_decode_unroll
+            : 1;
         ggml_tensor * cur;
         ggml_tensor * inpL;
 
@@ -31,10 +34,9 @@ llm_build_pi0_ae::llm_build_pi0_ae(const llama_model & model, const llm_graph_pa
         
         state = build_lora_mm(model.state_proj, state);
         state = ggml_add(ctx0, state, model.state_proj_b);
-        ggml_tensor * time_expanded = build_inp_sinusoidal_embedding(0);
-
-        for (int step = 0; step < 1; ++step) {
-            GGML_UNUSED(step);
+        ggml_tensor * last_state = nullptr;
+        for (int32_t step = 0; step < n_unroll; ++step) {
+            ggml_tensor * time_expanded = build_inp_sinusoidal_embedding(step);
             cur = build_lora_mm(model.action_in, actions);
             cur = ggml_add(ctx0, cur, model.action_in_b);
             cur = ggml_concat(ctx0, cur, time_expanded, 0);
@@ -124,10 +126,19 @@ llm_build_pi0_ae::llm_build_pi0_ae(const llama_model & model, const llm_graph_pa
                 }
                 cur = ggml_scale(ctx0, cur, 1.0f / n_inference_steps);
             }
+
+            if (n_unroll >= 2) {
+                last_state = ggml_view_2d(ctx0, cur, hparams.action_dim, 1, cur->nb[1], 0);
+                ggml_tensor * action_velocity = ggml_view_2d(
+                    ctx0, cur, hparams.action_dim, action_steps, cur->nb[1], cur->nb[1]);
+                actions = ggml_sub(ctx0, actions, action_velocity);
+            }
         }
 
-        res->action = cur;
-        ggml_build_forward_expand(gf, cur);
+        res->action = n_unroll >= 2
+            ? ggml_cont(ctx0, ggml_concat(ctx0, last_state, actions, 1))
+            : cur;
+        ggml_build_forward_expand(gf, res->action);
         
         
         return;

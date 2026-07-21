@@ -401,7 +401,9 @@ void llm_graph_input_sinusoidal_embedding::set_input(const llama_ubatch * ubatch
         for (int64_t i = 0; i < half_dim; ++i) {
             const double fraction = (half_dim > 1) ? (double) i / (half_dim - 1) : 0.0f;
             const double period = min_period * std::pow(max_period / min_period, fraction);
-            scaling_factors[i] = (1.0f / period) * 2.0f * M_PI * cross->time_step;
+            const float effective_time = 1.0f -
+                float(cross->pi0_decode_step + time_step_offset) / float(hparams.inference_steps);
+            scaling_factors[i] = (1.0f / period) * 2.0f * M_PI * effective_time;
         }
 
         std::vector<double> time_data(embd_ae * action_num);

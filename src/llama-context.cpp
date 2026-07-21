@@ -109,7 +109,8 @@ bool llama_pi0_perf_enabled() {
 }
 
 int32_t llama_pi0_decode_unroll_steps(bool is_pi05, int32_t inference_steps) {
-    if (!is_pi05 || inference_steps < 2) {
+    GGML_UNUSED(is_pi05);
+    if (inference_steps < 2) {
         return 1;
     }
     const char * env = std::getenv("PI0_DECODE_UNROLL");
@@ -2183,10 +2184,16 @@ int llama_context::decode(const llama_batch & batch_inp) {
         cross.pi0_decode_attn_mask_ready = false;
 
         std::vector<float> action_data((size_t) total_action_elements);
-        for (int32_t step = 0; step < hparams.inference_steps; ++step) {
+        const int32_t unroll_cfg = llama_pi0_decode_unroll_steps(is_pi05, hparams.inference_steps);
+        for (int32_t step = 0; step < hparams.inference_steps; ) {
+            const int32_t steps_left = hparams.inference_steps - step;
+            const int32_t unroll = unroll_cfg >= 2 && steps_left >= 2
+                ? std::min(unroll_cfg, steps_left)
+                : 1;
             cross.time_step = float(1 - step / float(hparams.inference_steps));
             cross.time_step_index = step;
-            cross.pi0_decode_unroll = 1;
+            cross.pi0_decode_step = step;
+            cross.pi0_decode_unroll = unroll;
             cross.pi0_action_out_accumulated = false;
             cross.pi0_cross_kv_inputs_ready = false;
 
@@ -2231,8 +2238,12 @@ int llama_context::decode(const llama_batch & batch_inp) {
 
             GGML_ASSERT((int64_t) cross.action.size() == action_dim * action_num);
             if (is_pi05) {
-                for (int64_t j = 0; j < action_dim * action_num; ++j) {
-                    cross.action[j] = cross.action[j] + dt * action_data[j];
+                if (unroll >= 2) {
+                    std::copy(action_data.begin(), action_data.end(), cross.action.begin());
+                } else {
+                    for (int64_t j = 0; j < action_dim * action_num; ++j) {
+                        cross.action[j] = cross.action[j] + dt * action_data[j];
+                    }
                 }
                 if (pi05_debug_binary_enabled()) {
                     const std::string dump_name = "action_after_step_" + std::to_string(step);
@@ -2244,10 +2255,15 @@ int llama_context::decode(const llama_batch & batch_inp) {
                 }
             } else {
                 cross.pi0_state_result.assign(action_data.begin(), action_data.begin() + action_dim);
-                for (int64_t j = 0; j < action_dim * action_num; ++j) {
-                    cross.action[j] = cross.action[j] - action_data[action_dim + j];
+                if (unroll >= 2) {
+                    std::copy(action_data.begin() + action_dim, action_data.end(), cross.action.begin());
+                } else {
+                    for (int64_t j = 0; j < action_dim * action_num; ++j) {
+                        cross.action[j] = cross.action[j] - action_data[action_dim + j];
+                    }
                 }
             }
+            step += unroll;
         }
 
         cross.encoded_kv_gpu.clear();
@@ -2763,6 +2779,9 @@ void llama_context::output_reorder() {
 //
 
 uint32_t llama_context::graph_max_nodes(uint32_t n_tokens) const {
+    if (model.arch == LLM_ARCH_PI0) {
+        return std::max<uint32_t>(65536u, 32u * model.n_tensors());
+    }
     if (model.arch == LLM_ARCH_QWEN3NEXT ||
         model.arch == LLM_ARCH_KIMI_LINEAR ||
         model.arch == LLM_ARCH_QWEN35 ||
