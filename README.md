@@ -187,6 +187,72 @@ curl -X POST http://127.0.0.1:8080/foreground/infer \
 
 The response contains `action_final` together with model and server timing fields such as `encode_ms`, `decode_ms`, `total_ms`, and `timing_breakdown_ms`. See the [Foreground Server API](docs/foreground_server_usage.md) for endpoint semantics and all response fields.
 
+## Python Foreground API
+
+The Python foreground client can start `llama-server`, wait for the model to become ready, submit images and state through the persistent `/foreground/*` session, and return the action as a NumPy array.
+
+### Build llama-server
+
+```bash
+cmake -S . -B build-graph \
+  -DCMAKE_BUILD_TYPE=Release \
+  -DGGML_CUDA=ON \
+  -DCMAKE_CUDA_ARCHITECTURES=89 \
+  -DLLAMA_BUILD_SERVER=ON
+
+cmake --build build-graph --target llama-server -j8
+```
+
+Install NumPy and make the source-tree client importable:
+
+```bash
+python3 -m pip install numpy
+export PYTHONPATH="$PWD/python${PYTHONPATH:+:$PYTHONPATH}"
+```
+
+### Start and call the server from Python
+
+```python
+import numpy as np
+
+from jetson_pi_foreground import ManagedForegroundSession
+
+SERVER_PATH = "/path/to/Jetson-PI-Edge/build-graph/bin/llama-server"
+MODEL_PATH = "/path/to/pi0-model.gguf"
+MMPROJ_PATH = "/path/to/mmproj-model.gguf"
+IMAGE_PATH = "/path/to/test-224.jpg"
+
+state = np.asarray([
+    -1.8731, -1.0370, 1.9652, 7.0876,
+     0.2546, -9.1432, -0.0147, -0.5037,
+] + [0] * 24, dtype=np.float32)
+
+# This starts llama-server and waits for /health to report ready.
+session = ManagedForegroundSession(
+    server_path=SERVER_PATH,
+    model_path=MODEL_PATH,
+    mmproj_path=MMPROJ_PATH,
+    gpu=0,
+    port=8080,
+    timeout=300,
+)
+
+try:
+    action, metadata = session.predict(
+        image_paths=[IMAGE_PATH, IMAGE_PATH],
+        prompt="/do something",
+        state=state,
+        reset=True,
+    )
+    np.savetxt("action.txt", action, fmt="%.9g")
+    print("action shape:", action.shape)
+    print("total_ms:", metadata.get("total_ms"))
+finally:
+    session.close()
+```
+
+Keep the same `session` alive for repeated control steps so that the model and CUDA context are loaded only once. Use `reset=True` for the first step or when starting a new foreground session, and call `session.close()` when the managed server is no longer needed.
+
 ## FlashRT Support
 
 Jetson-PI can be loaded by [FlashRT](https://github.com/flashrt-project/FlashRT) through a C API provider. The provider reuses the same llama.cpp-based PI0/PI0.5 implementation and GGUF model path from this repository, while FlashRT supplies the Python-facing model API. The foreground HTTP server is not required for this integration.

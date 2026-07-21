@@ -103,6 +103,7 @@ option(LLAMA_BUILD_COMMON "llama: build common utils library" ${LLAMA_STANDALONE
 option(LLAMA_BUILD_TESTS    "llama: build tests"          ${LLAMA_STANDALONE})
 option(LLAMA_BUILD_TOOLS    "llama: build tools"          ${LLAMA_STANDALONE})
 option(JETSON_PI_BUILD_MTMD "Jetson-PI: build mtmd and narrow provider libraries without the full tools tree" OFF)
+option(JETSON_PI_BUILD_PYTHON "Jetson-PI: build the optional pybind11 NumPy inference module" OFF)
 option(LLAMA_BUILD_EXAMPLES "llama: build examples"       ${LLAMA_STANDALONE})
 option(LLAMA_BUILD_SERVER   "llama: build server example" ${LLAMA_STANDALONE})
 option(LLAMA_TOOLS_INSTALL  "llama: install tools"        ${LLAMA_TOOLS_INSTALL_DEFAULT})
@@ -112,6 +113,12 @@ option(LLAMA_CURL       "llama: use libcurl to download model from an URL" ON)
 option(LLAMA_HTTPLIB    "llama: if libcurl is disabled, use httplib to download model from an URL" ON)
 option(LLAMA_OPENSSL    "llama: use openssl to support HTTPS" OFF)
 option(LLAMA_LLGUIDANCE "llama-common: include LLGuidance library for structured output in common utils" OFF)
+
+if (JETSON_PI_BUILD_PYTHON)
+    set(LLAMA_BUILD_COMMON ON CACHE BOOL "llama: build common utils library" FORCE)
+    set(JETSON_PI_BUILD_MTMD ON CACHE BOOL "Jetson-PI: build mtmd and provider libraries" FORCE)
+    set(CMAKE_POSITION_INDEPENDENT_CODE ON)
+endif()
 
 # Required for relocatable CMake package
 include(${CMAKE_CURRENT_SOURCE_DIR}/cmake/build-info.cmake)
@@ -238,6 +245,10 @@ if (LLAMA_BUILD_COMMON AND LLAMA_BUILD_TOOLS)
     add_subdirectory(tools)
 elseif (LLAMA_BUILD_COMMON AND JETSON_PI_BUILD_MTMD)
     add_subdirectory(tools/mtmd)
+endif()
+
+if (JETSON_PI_BUILD_PYTHON)
+    add_subdirectory(python)
 endif()
 
 #
