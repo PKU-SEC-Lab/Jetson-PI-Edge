@@ -31,6 +31,7 @@
 
 ## News
 
+- **[2026/07] Python APIs are available.** Use the managed foreground NumPy client for persistent `llama-server` sessions or the optional pybind11 module for in-process PI0/PI0.5 action inference.
 - **[2026/07] FlashRT support is available.** Jetson-PI is exposed as a FlashRT-loadable provider through a C API, allowing [FlashRT](https://github.com/flashrt-project/FlashRT) to invoke the same PI0/PI0.5 model path directly from Python without starting the foreground HTTP server.
 - **[2026/07] Jetson-PI is open source.** We released the [Jetson-PI asynchronous control framework](https://github.com/PKU-SEC-Lab/Jetson-PI) and this [Jetson-PI-Edge inference engine](https://github.com/PKU-SEC-Lab/Jetson-PI-Edge).
 
