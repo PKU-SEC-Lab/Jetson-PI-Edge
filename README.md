@@ -14,7 +14,6 @@
     <a href="https://arxiv.org/abs/2607.12659"><img src="https://img.shields.io/badge/arXiv-2607.12659-b31b1b.svg" alt="arXiv" /></a>
     <a href="https://github.com/PKU-SEC-Lab/Jetson-PI"><img src="https://img.shields.io/badge/Jetson--PI-Algorithm-35b8a9.svg" alt="Jetson-PI algorithm" /></a>
     <a href="https://github.com/ggml-org/llama.cpp"><img src="https://img.shields.io/badge/Based_on-llama.cpp-3578c8.svg" alt="Based on llama.cpp" /></a>
-    <a href="https://github.com/flashrt-project/FlashRT"><img src="https://img.shields.io/badge/Support-FlashRT-f28c45.svg" alt="Support FlashRT" /></a>
   </p>
 
   <p>
@@ -31,7 +30,7 @@
 
 ## News
 
-- **[2026/07] FlashRT support is available.** Jetson-PI is exposed as a FlashRT-loadable provider through a C API, allowing [FlashRT](https://github.com/flashrt-project/FlashRT) to invoke the same PI0/PI0.5 model path directly from Python without starting the foreground HTTP server.
+- **[2026/07] Python foreground API is available.** A NumPy client can start and manage `llama-server`, reuse a persistent foreground session, and return PI0/PI0.5 action chunks directly to Python.
 - **[2026/07] Jetson-PI is open source.** We released the [Jetson-PI asynchronous control framework](https://github.com/PKU-SEC-Lab/Jetson-PI) and this [Jetson-PI-Edge inference engine](https://github.com/PKU-SEC-Lab/Jetson-PI-Edge).
 
 ## About
@@ -73,7 +72,6 @@ The project is built on [llama.cpp](https://github.com/ggml-org/llama.cpp). The 
 ### Interfaces and Deployment
 
 - ✅ **Foreground HTTP server** - persistent image, robot-state, and instruction endpoints with action and timing outputs.
-- ✅ **FlashRT provider** - expose the same PI0/PI0.5 GGUF runtime through a C API for the FlashRT Python model interface.
 
 ### Planned Model Support
 
@@ -187,74 +185,71 @@ curl -X POST http://127.0.0.1:8080/foreground/infer \
 
 The response contains `action_final` together with model and server timing fields such as `encode_ms`, `decode_ms`, `total_ms`, and `timing_breakdown_ms`. See the [Foreground Server API](docs/foreground_server_usage.md) for endpoint semantics and all response fields.
 
-## FlashRT Support
+## Python Foreground API
 
-Jetson-PI can be loaded by [FlashRT](https://github.com/flashrt-project/FlashRT) through a C API provider. The provider reuses the same llama.cpp-based PI0/PI0.5 implementation and GGUF model path from this repository, while FlashRT supplies the Python-facing model API. The foreground HTTP server is not required for this integration.
+The Python foreground client can start `llama-server`, wait for the model to become ready, submit images and state through the persistent `/foreground/*` session, and return the action as a NumPy array.
 
-After installing FlashRT, configure its C++ build with this repository as the Jetson-PI source tree:
+### Build llama-server
 
 ```bash
-cmake -S /path/to/FlashRT/cpp -B /path/to/FlashRT/cpp/build-jetson-pi \
+cmake -S . -B build-graph \
   -DCMAKE_BUILD_TYPE=Release \
-  -DFLASHRT_CPP_WITH_JETSON_PI=ON \
-  -DJETSON_PI_ROOT=/path/to/Jetson-PI-Edge \
   -DGGML_CUDA=ON \
-  -DGGML_CUDA_FA=ON \
-  -DCMAKE_CUDA_ARCHITECTURES=<target-sm>
+  -DCMAKE_CUDA_ARCHITECTURES=89 \
+  -DLLAMA_BUILD_SERVER=ON
 
-cmake --build /path/to/FlashRT/cpp/build-jetson-pi \
-  --target flashrt_cpp_llama_cpp_provider_c -j
+cmake --build build-graph --target llama-server -j8
 ```
 
-The build produces `libflashrt_cpp_llama_cpp_provider_c.so`. Load it from Python with `framework="jetson_pi"`:
+Install NumPy and make the source-tree client importable:
+
+```bash
+python3 -m pip install numpy
+export PYTHONPATH="$PWD/python${PYTHONPATH:+:$PYTHONPATH}"
+```
+
+### Start and call the server from Python
 
 ```python
-import os
-
-import flash_rt
 import numpy as np
-from PIL import Image
 
+from jetson_pi_foreground import ManagedForegroundSession
 
-def load_rgb224(path):
-    image = Image.open(path).convert("RGB")
-    if image.size != (224, 224):
-        image = image.resize((224, 224), Image.BILINEAR)
-    return np.asarray(image, dtype=np.uint8)
-
-
-model = flash_rt.load_model(
-    "/path/to/pi_llm.gguf",
-    framework="jetson_pi",
-    config="pi0",
-    mmproj_path="/path/to/mmproj.gguf",
-    backend="cuda",
-    num_views=2,
-    action_steps=10,
-    action_dim=32,
-    # Usually produced at:
-    # <FlashRT repo>/cpp/<build-dir>/libflashrt_cpp_llama_cpp_provider_c.so
-    lib_path="/path/to/FlashRT/cpp/build-jetson-pi/libflashrt_cpp_llama_cpp_provider_c.so",
-)
-
-image = load_rgb224("/path/to/image.png")
-images = [image, image]
+SERVER_PATH = "/path/to/Jetson-PI-Edge/build-graph/bin/llama-server"
+MODEL_PATH = "/path/to/pi0-model.gguf"
+MMPROJ_PATH = "/path/to/mmproj-model.gguf"
+IMAGE_PATH = "/path/to/test-224.jpg"
 
 state = np.asarray([
-    -1.8731, -1.0370, 1.9652, 7.0876, 0.2546, -9.1432, -0.0147, -0.5037,
-    0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
-    0, 0, 0, 0, 0, 0, 0, 0,
-], dtype=np.float32)
+    -1.8731, -1.0370, 1.9652, 7.0876,
+     0.2546, -9.1432, -0.0147, -0.5037,
+] + [0] * 24, dtype=np.float32)
 
-prompt = "do something"
-actions = model.predict(images=images, prompt=prompt, state=state)
+# This starts llama-server and waits for /health to report ready.
+session = ManagedForegroundSession(
+    server_path=SERVER_PATH,
+    model_path=MODEL_PATH,
+    mmproj_path=MMPROJ_PATH,
+    gpu=0,
+    port=8080,
+    timeout=300,
+)
 
-np.savetxt("actions_10x32.txt", np.asarray(actions, dtype=np.float32), fmt="%.9g")
+try:
+    action, metadata = session.predict(
+        image_paths=[IMAGE_PATH, IMAGE_PATH],
+        prompt="/do something",
+        state=state,
+        reset=True,
+    )
+    np.savetxt("action.txt", action, fmt="%.9g")
+    print("action shape:", action.shape)
+    print("total_ms:", metadata.get("total_ms"))
+finally:
+    session.close()
 ```
 
-See the [FlashRT repository](https://github.com/flashrt-project/FlashRT) for installation and its complete API. The standalone llama.cpp foreground server remains available independently and does not require FlashRT.
-
-
+Keep the same `session` alive for repeated control steps so that the model and CUDA context are loaded only once. Use `reset=True` for the first step or when starting a new foreground session, and call `session.close()` when the managed server is no longer needed. This client uses the HTTP server and does not require pybind11.
 
 ## Performance on Jetson Orin
 
@@ -304,4 +299,4 @@ If Jetson-PI or Jetson-PI-Edge helps your research, please cite our paper:
 
 ## Acknowledgments
 
-Jetson-PI-Edge builds on [llama.cpp](https://github.com/ggml-org/llama.cpp), [OpenPI](https://github.com/Physical-Intelligence/openpi), and the PI model family from [Physical Intelligence](https://www.physicalintelligence.company/). We also thank the [FlashRT](https://github.com/flashrt-project/FlashRT) project for its high-performance real-time VLA deployment path.
+Jetson-PI-Edge builds on [llama.cpp](https://github.com/ggml-org/llama.cpp), [OpenPI](https://github.com/Physical-Intelligence/openpi), and the PI model family from [Physical Intelligence](https://www.physicalintelligence.company/).
