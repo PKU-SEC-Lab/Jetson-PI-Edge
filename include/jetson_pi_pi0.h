@@ -108,9 +108,11 @@ int32_t jetson_pi_pi0_action(jetson_pi_pi0 * handle,
 //                   injects one marker per view. Need not be NUL-terminated.
 //   state           Either NULL with n_state == 0 for a zero state, or a
 //                   non-NULL pointer to 1..n finite float32 proprioception
-//                   values. PI0.5 accepts at most 8 values and serializes them
-//                   into the Task/State/Action prompt; NULL emits 8 zero-value
-//                   bins. Legacy Pi0 accepts at most action_dim values and
+//                   values. PI0.5 accepts at most 8 semantic values, or an
+//                   action_dim-wide provider tensor whose entries after the
+//                   first 8 are zero padding, and serializes the first 8 into
+//                   the Task/State/Action prompt; NULL emits 8 zero-value bins.
+//                   Legacy Pi0 accepts at most action_dim values and
 //                   zero-pads shorter input to action_dim. Pointer/count
 //                   mismatches and non-finite values are rejected.
 //   actions_out     caller buffer of action_capacity float32 slots. On OK,

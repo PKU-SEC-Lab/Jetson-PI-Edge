@@ -18,7 +18,8 @@ inline std::string format_pi05_openpi_prompt(const std::string & raw_text,
     out += raw_text;
     out += ", State: ";
 
-    for (size_t i = 0; i < n_state; ++i) {
+    const size_t n_prompt_state = n_state < 8 ? n_state : 8;
+    for (size_t i = 0; i < n_prompt_state; ++i) {
         const float x = state[i];
         int bin;
         if (x < -1.0f) {

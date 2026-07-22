@@ -334,21 +334,31 @@ int32_t jetson_pi_pi0_context(jetson_pi_pi0 * handle,
     // action). Legacy Pi0 consumes state via the cross.state tensor, which
     // requires exactly action_dim values (zero-padded when shorter).
     const bool is_pi05 = (e->model_kind == PI_MODEL_PI05);
-    const size_t state_dim = is_pi05 ? 8 : static_cast<size_t>(e->action_dim);
+    const size_t action_dim = static_cast<size_t>(e->action_dim);
     if ((!state && n_state != 0) || (state && n_state == 0)) {
         return reject(e, JETSON_PI_PI0_INVALID,
                       "state pointer and n_state are inconsistent");
     }
-    if (n_state > state_dim) {
+    const bool pi05_padded_state = is_pi05 && n_state == action_dim && n_state > 8;
+    if ((!is_pi05 && n_state > action_dim) ||
+        (is_pi05 && n_state > 8 && !pi05_padded_state)) {
         return reject(e, JETSON_PI_PI0_STATE_SIZE,
                       is_pi05
-                          ? "state has more values than the PI0.5 proprioception width (8)"
+                          ? "PI0.5 state must have at most 8 values or be an action_dim-wide zero-padded provider tensor"
                           : "state has more values than the model action_dim");
     }
     for (size_t i = 0; i < n_state; ++i) {
         if (!std::isfinite(state[i])) {
             return reject(e, JETSON_PI_PI0_INVALID,
                           "state values must be finite");
+        }
+    }
+    if (pi05_padded_state) {
+        for (size_t i = 8; i < n_state; ++i) {
+            if (state[i] != 0.0f) {
+                return reject(e, JETSON_PI_PI0_STATE_SIZE,
+                              "PI0.5 provider padding after the first 8 state values must be zero");
+            }
         }
     }
 
@@ -395,7 +405,8 @@ int32_t jetson_pi_pi0_context(jetson_pi_pi0 * handle,
     }
 
     // Match the foreground Pi0 path: pass the raw multimodal prefix without
-    // chat-template wrappers or a special BOS token.
+    // chat-template wrappers; the multimodal helper applies the model's
+    // explicit BOS/newline token contract after tokenization.
     const char * marker = mtmd_default_marker();
     const size_t marker_len = std::strlen(marker);
 

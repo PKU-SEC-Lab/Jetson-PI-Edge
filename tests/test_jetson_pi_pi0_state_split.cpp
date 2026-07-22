@@ -70,6 +70,11 @@ int main() {
               "pick", zero_state_for_prompt, 8) ==
               "Task: pick, State: 128 128 128 128 128 128 128 128;\nAction: ",
           "PI0.5 NULL-state representation is eight zero bins");
+    const float padded_state_for_prompt[10] = {0, 0, 0, 0, 0, 0, 0, 0, 0, 0};
+    CHECK(jetson_pi_pi0_detail::format_pi05_openpi_prompt(
+              "pick", padded_state_for_prompt, 10) ==
+              "Task: pick, State: 128 128 128 128 128 128 128 128;\nAction: ",
+          "PI0.5 formatter ignores provider padding after eight values");
 
     const char * model_env  = std::getenv("JETSONPI_PI0_MODEL");
     const char * mmproj_env = std::getenv("JETSONPI_PI0_MMPROJ");
@@ -187,6 +192,29 @@ int main() {
     CHECK(s == JETSON_PI_PI0_INVALID, "non-finite state is rejected");
 
     if (test_pi05) {
+        if (action_dim > 8) {
+            std::vector<float> provider_padded(action_dim, 0.0f);
+            std::vector<float> actions_padded(n_elems, 0.0f);
+            written = 0;
+            s = jetson_pi_pi0_infer(pi0, imgs, 2, prompt.data(), prompt.size(),
+                                    provider_padded.data(), provider_padded.size(),
+                                    actions_padded.data(), n_elems, &written);
+            CHECK(s == JETSON_PI_PI0_OK && written == n_elems,
+                  "PI0.5 accepts action_dim-wide zero-padded provider state");
+            float max_diff = 0.0f;
+            for (size_t i = 0; i < n_elems; ++i) {
+                max_diff = std::max(max_diff,
+                    std::fabs(actions_padded[i] - actions_zero[i]));
+            }
+            CHECK(max_diff <= 1e-5f,
+                  "PI0.5 provider padding matches explicit eight-value state");
+
+            provider_padded[8] = 1.0f;
+            s = jetson_pi_pi0_context(pi0, imgs, 2, prompt.data(), prompt.size(),
+                                      provider_padded.data(), provider_padded.size());
+            CHECK(s == JETSON_PI_PI0_STATE_SIZE,
+                  "PI0.5 rejects nonzero values in provider padding");
+        }
         struct Case { const char * name; float value; };
         const Case cases[] = {
             {"x<-1 (literal -1 token)", -2.0f},
