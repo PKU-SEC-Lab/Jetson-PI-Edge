@@ -48,7 +48,6 @@ struct Pi0Engine {
     pi_model_kind model_kind = PI_MODEL_AUTO;
 
     mtmd_pi0_context * pending_context = nullptr;
-    std::vector<float> action_cache;
 
     std::string last_error;
     std::atomic<long> refs{1};
@@ -104,9 +103,9 @@ std::string build_pi05_openpi_prompt(const std::string & raw_text,
     out += raw_text;
     out += ", State: ";
 
-    const size_t n_for_text = state ? std::min<size_t>(8, n_state) : 0;
+    const size_t n_for_text = state ? std::min<size_t>(8, n_state) : 8;
     for (size_t i = 0; i < n_for_text; ++i) {
-        const float x = state[i];
+        const float x = state ? state[i] : 0.0f;
         int bin;
         if (x < -1.0f) {
             bin = -1;  // literal -1 token, distinct from bin 0
@@ -362,11 +361,9 @@ int32_t jetson_pi_pi0_context(jetson_pi_pi0 * handle,
     PiModelKindScope model_kind_scope(e->model_kind);
     e->clear_error();
     // One-shot semantics: a new context() invalidates any prior pending
-    // context (and the cached action) so action() can never return a stale
-    // result from a previous tick.
+    // context so action() can never return a stale result from a previous tick.
     mtmd_helper_free_pi0_context(e->pending_context);
     e->pending_context = nullptr;
-    e->action_cache.clear();
     if (!images_rgb || n_images != e->n_views || !prompt || prompt_len == 0) {
         return reject(e, JETSON_PI_PI0_INVALID, "invalid context arguments");
     }
@@ -482,8 +479,7 @@ int32_t jetson_pi_pi0_context(jetson_pi_pi0 * handle,
     // context; the action-producing decode runs in action(). This is a real
     // compute boundary: prepare returns right after llama_encode and before
     // llama_decode, so context() holds the encoded state and action() finishes
-    // the forward pass. action_cache is intentionally NOT populated here —
-    // action() must consume pending_context.
+    // the forward pass.
     llama_pos new_n_past = 0;
     int32_t er = mtmd_helper_prepare_chunks_pi0_for_model(
         e->mtmd, e->lctx, chunks, e->model_kind,
@@ -524,9 +520,7 @@ int32_t jetson_pi_pi0_action(jetson_pi_pi0 * handle,
         return reject(e, JETSON_PI_PI0_BUFFER_TOO_SMALL,
                       "actions_out buffer too small");
     }
-    // context() now retains a pending prepared batch instead of caching the
-    // final action, so action() must consume that pending context. There is
-    // no action_cache fast path: a successful action() requires a preceding
+    // A successful action() requires a pending prepared batch from a preceding
     // successful context().
     if (!e->pending_context) {
         return reject(e, JETSON_PI_PI0_ACTION_NOT_READY,

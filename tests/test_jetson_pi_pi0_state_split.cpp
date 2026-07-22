@@ -43,8 +43,9 @@
 
 static int g_fail = 0;
 #define CHECK(cond, msg) do { \
-    if (!(cond)) { std::printf("FAIL: %s\n", (msg)); g_fail = 1; } \
-    else { std::printf("ok  : %s\n", (msg)); } \
+    const std::string check_msg = (msg); \
+    if (!(cond)) { std::printf("FAIL: %s\n", check_msg.c_str()); g_fail = 1; } \
+    else { std::printf("ok  : %s\n", check_msg.c_str()); } \
 } while (0)
 
 static std::string read_file(const std::string & path, bool * ok) {
@@ -128,6 +129,24 @@ int main() {
                     jetson_pi_pi0_last_error(pi0));
         jetson_pi_pi0_close(pi0);
         return 1;
+    }
+
+    // NULL follows the public C API contract and means the same zero state.
+    {
+        std::vector<float> actions_null(n_elems, 0.0f);
+        written = 0;
+        s = jetson_pi_pi0_infer(pi0, imgs, 2, prompt.data(), prompt.size(),
+                                nullptr, 0,
+                                actions_null.data(), n_elems, &written);
+        CHECK(s == JETSON_PI_PI0_OK && written == n_elems,
+              "infer with NULL state");
+        float max_diff = 0.0f;
+        for (size_t i = 0; i < n_elems; ++i) {
+            max_diff = std::max(
+                max_diff, std::fabs(actions_null[i] - actions_zero[i]));
+        }
+        CHECK(max_diff <= 1e-5f,
+              "NULL state matches explicit PI0.5 zero state");
     }
 
     // ---- TEST 1: state in prompt changes actions (boundary regions) ----

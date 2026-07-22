@@ -229,21 +229,17 @@ if (LLAMA_BUILD_COMMON AND (LLAMA_BUILD_TOOLS OR JETSON_PI_BUILD_MTMD))
         DESTINATION ${CMAKE_INSTALL_INCLUDEDIR}
     )
 
-    # The state/split test is registered only when Jetson-PI-Edge is the
-    # top-level project. When FlashRT pulls this tree via add_subdirectory
-    # (EXCLUDE_FROM_ALL), the test binary is not built there and registering
-    # it would leave a ctest entry that cannot run. FlashRT carries its own
-    # provider-side equivalent (test_llama_cpp_jetson_pi_state_parity).
+    # Register only when Jetson-PI-Edge is the top-level project. FlashRT
+    # carries its own provider-side equivalent when embedding this tree.
     if (BUILD_SHARED_LIBS AND CMAKE_SOURCE_DIR STREQUAL PROJECT_SOURCE_DIR)
-        enable_testing()
         add_executable(test_jetson_pi_pi0_state_split
             ../tests/test_jetson_pi_pi0_state_split.cpp)
         target_link_libraries(test_jetson_pi_pi0_state_split
             PRIVATE jetson_pi_pi0)
-        # stb_image is vendored under /vendor/stb; the test includes "stb/stb_image.h".
         target_include_directories(test_jetson_pi_pi0_state_split PRIVATE
             ${CMAKE_CURRENT_SOURCE_DIR}/../vendor)
         add_test(NAME jetson_pi_pi0_state_split
             COMMAND test_jetson_pi_pi0_state_split)
     endif()
+
 endif()

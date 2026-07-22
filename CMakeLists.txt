@@ -213,6 +213,10 @@ endif()
 # build the library
 #
 
+if (BUILD_SHARED_LIBS AND CMAKE_SOURCE_DIR STREQUAL PROJECT_SOURCE_DIR)
+    enable_testing()
+endif()
+
 add_subdirectory(src)
 
 #

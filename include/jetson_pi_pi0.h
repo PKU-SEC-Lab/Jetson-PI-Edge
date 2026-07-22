@@ -55,7 +55,7 @@ enum jetson_pi_pi0_status {
     JETSON_PI_PI0_BUFFER_TOO_SMALL = -4, /* actions_out too small            */
     JETSON_PI_PI0_ACTION_NOT_READY = -5, /* infer did not produce an action  */
     JETSON_PI_PI0_INFER_FAILED     = -6, /* tokenize / eval failed           */
-    JETSON_PI_PI0_STATE_SIZE       = -7, /* state n_values > action_dim      */
+    JETSON_PI_PI0_STATE_SIZE       = -7, /* state exceeds model-specific max */
 };
 
 // Load the Pi0 model + mmproj and create the inference context. On success
@@ -106,10 +106,11 @@ int32_t jetson_pi_pi0_action(jetson_pi_pi0 * handle,
 //                   dimensions. n_images must equal config.n_views.
 //   prompt          UTF-8 bytes. Must NOT contain media markers; the engine
 //                   injects one marker per view. Need not be NUL-terminated.
-//   state           n_state float32 proprioception values, or NULL to let the
-//                   model use a zero state (Pi0 native behavior). When
-//                   non-NULL and n_state < action_dim, the engine zero-pads
-//                   to action_dim; n_state > action_dim is rejected.
+//   state           n_state float32 proprioception values, or NULL for a zero
+//                   state. PI0.5 accepts at most 8 values and serializes them
+//                   into the Task/State/Action prompt; NULL emits 8 zero-value
+//                   bins. Legacy Pi0 accepts at most action_dim values and
+//                   zero-pads shorter input to action_dim.
 //   actions_out     caller buffer of action_capacity float32 slots. On OK,
 //                   *actions_written is set to action_steps * action_dim.
 //
