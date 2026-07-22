@@ -600,6 +600,48 @@ extern "C" int32_t mtmd_helper_eval_chunks_pi0_legacy(mtmd_context * ctx,
         return 0;
     }
 
+    if (n_batch <= 0) {
+        LOG_ERR("invalid legacy Pi0 combined batch capacity: %d\n", n_batch);
+        return -1;
+    }
+    const size_t combined_capacity = static_cast<size_t>(n_batch);
+    size_t combined_required = 0;
+    size_t embedding_chunks = 0;
+    for (size_t ij = 0; ij < n_chunks; ++ij) {
+        const auto chunk = mtmd_input_chunks_get(chunks, ij);
+        const auto chunk_type = mtmd_input_chunk_get_type(chunk);
+        size_t chunk_tokens = 0;
+        if (chunk_type == MTMD_INPUT_CHUNK_TYPE_TEXT) {
+            size_t n_text_tokens = 0;
+            mtmd_input_chunk_get_tokens_text(chunk, &n_text_tokens);
+            const size_t text_overhead = n_text_tokens > 0 ? 2u : 1u;
+            if (n_text_tokens > combined_capacity ||
+                text_overhead > combined_capacity - n_text_tokens) {
+                LOG_ERR("legacy Pi0 text exceeds combined batch capacity %zu\n",
+                        combined_capacity);
+                return -1;
+            }
+            chunk_tokens = n_text_tokens + text_overhead;
+        } else if (chunk_type == MTMD_INPUT_CHUNK_TYPE_IMAGE ||
+                   chunk_type == MTMD_INPUT_CHUNK_TYPE_AUDIO) {
+            ++embedding_chunks;
+            if (embedding_chunks > 3) {
+                LOG_ERR("legacy Pi0 supports at most three image/audio chunks\n");
+                return -1;
+            }
+            chunk_tokens = mtmd_input_chunk_get_n_tokens(chunk);
+        } else {
+            LOG_ERR("unsupported legacy Pi0 chunk type\n");
+            return -1;
+        }
+        if (chunk_tokens > combined_capacity - combined_required) {
+            LOG_ERR("legacy Pi0 combined prompt/image batch needs %zu+%zu tokens, capacity is %zu\n",
+                    combined_required, chunk_tokens, combined_capacity);
+            return -1;
+        }
+        combined_required += chunk_tokens;
+    }
+
     struct mtmd_pi0_encode_cache_guard {
         mtmd_context * ctx;
         ~mtmd_pi0_encode_cache_guard() { mtmd_pi0_clear_encode_cache(ctx); }
@@ -857,7 +899,10 @@ extern "C" int32_t mtmd_helper_eval_chunks_pi0_legacy(mtmd_context * ctx,
                                         sizeof(float) * n_tokens_batch * n_mmproj_embd);
                         }
                         else{
-                            GGML_ABORT("Not supported more than 3 embd buffers");
+                            LOG_ERR("legacy Pi0 supports at most three embedding buffers\n");
+                            llama_batch_free(text_batch);
+                            pi0_legacy_free_combined_batch(combined_batch);
+                            return -1;
                         }
                     }
                 }
@@ -902,7 +947,10 @@ extern "C" int32_t mtmd_helper_eval_chunks_pi0_legacy(mtmd_context * ctx,
             }
 
         } else {
-            GGML_ABORT("chunk type not supported");
+            LOG_ERR("unsupported legacy Pi0 chunk type\n");
+            llama_batch_free(text_batch);
+            pi0_legacy_free_combined_batch(combined_batch);
+            return -1;
         }
     
         llama_batch_free(text_batch);

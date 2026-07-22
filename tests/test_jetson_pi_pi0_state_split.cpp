@@ -53,6 +53,22 @@ static int g_fail = 0;
 } while (0)
 
 int main() {
+    CHECK((jetson_pi_pi0_capabilities() &
+           JETSON_PI_PI0_CAP_REAL_CONTEXT_ACTION) != 0,
+          "runtime reports real context/action capability");
+    jetson_pi_pi0_config invalid_views{};
+    invalid_views.struct_size = sizeof(invalid_views);
+    invalid_views.model_path = "/nonexistent/pi0.gguf";
+    invalid_views.mmproj_path = "/nonexistent/mmproj.gguf";
+    invalid_views.backend = "cpu";
+    invalid_views.n_views = 4;
+    invalid_views.image_height = 224;
+    invalid_views.image_width = 224;
+    jetson_pi_pi0 * invalid_handle = nullptr;
+    CHECK(jetson_pi_pi0_open(&invalid_views, &invalid_handle) ==
+              JETSON_PI_PI0_INVALID && invalid_handle == nullptr,
+          "open rejects more than three views before model loading");
+
     const float boundary_state[] = {
         -2.0f, -1.0f, -0.5f, 0.0f, 0.5f, 1.0f, 1.5f,
     };
@@ -155,6 +171,15 @@ int main() {
                 action_steps, action_dim, state_dim);
 
     const uint8_t * imgs[2] = { img, wrist };
+
+    std::string oversized_prompt;
+    oversized_prompt.reserve(3600);
+    for (int i = 0; i < 1800; ++i) oversized_prompt += " x";
+    s = jetson_pi_pi0_context(
+        pi0, imgs, 2, oversized_prompt.data(), oversized_prompt.size(),
+        nullptr, 0);
+    CHECK(s == JETSON_PI_PI0_INFER_FAILED,
+          "combined prompt/image batch overflow is rejected");
 
     // Baseline: an explicit full-width zero state.
     std::vector<float> zero_state(state_dim, 0.0f);

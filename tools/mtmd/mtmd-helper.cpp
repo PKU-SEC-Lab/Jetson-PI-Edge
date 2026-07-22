@@ -811,7 +811,62 @@ static int32_t mtmd_helper_eval_chunks_pi0_pi05(mtmd_context * ctx,
     GGML_UNUSED(pi0_text_model);
     const int pi0_n_embd = llama_model_n_embd_inp(pi0_text_model);
 
-    llama_batch combined_batch = llama_batch_init_pi0(n_batch, pi0_n_embd, 1);
+    if (n_batch <= 0) {
+        LOG_ERR("invalid PI0.5 combined batch capacity: %d\n", n_batch);
+        return -1;
+    }
+    const size_t combined_capacity = static_cast<size_t>(n_batch);
+    size_t combined_required = 0;
+    size_t embedding_chunks = 0;
+    bool preflight_prefix_text_appended = false;
+    std::vector<std::vector<llama_token>> prepared_text_tokens(n_chunks);
+    for (size_t ij = 0; ij < n_chunks; ++ij) {
+        const auto chunk = mtmd_input_chunks_get(chunks, ij);
+        const auto chunk_type = mtmd_input_chunk_get_type(chunk);
+        size_t chunk_tokens = 0;
+        if (chunk_type == MTMD_INPUT_CHUNK_TYPE_TEXT) {
+            if (use_pi05_adapter && preflight_prefix_text_appended) {
+                continue;
+            }
+            size_t n_tokens_raw = 0;
+            const llama_token * tokens_raw =
+                mtmd_input_chunk_get_tokens_text(chunk, &n_tokens_raw);
+            if (use_pi05_adapter && pi0_env_forced_prefix_text_enabled()) {
+                prepared_text_tokens[ij] =
+                    pi0_forced_prefix_text_tokens_from_env();
+                prepared_text_tokens[ij] = pi0_build_unwrapped_text_tokens(
+                    prepared_text_tokens[ij].data(),
+                    prepared_text_tokens[ij].size(), use_pi05_adapter);
+            } else {
+                prepared_text_tokens[ij] = pi0_build_unwrapped_text_tokens(
+                    tokens_raw, n_tokens_raw, use_pi05_adapter);
+            }
+            chunk_tokens = prepared_text_tokens[ij].size();
+            preflight_prefix_text_appended = true;
+        } else if (chunk_type == MTMD_INPUT_CHUNK_TYPE_IMAGE ||
+                   chunk_type == MTMD_INPUT_CHUNK_TYPE_AUDIO) {
+            ++embedding_chunks;
+            if (embedding_chunks > 3) {
+                LOG_ERR("PI0.5 supports at most three image/audio chunks\n");
+                return -1;
+            }
+            chunk_tokens = mtmd_input_chunk_get_n_tokens(chunk);
+        } else {
+            LOG_ERR("unsupported PI0.5 chunk type\n");
+            return -1;
+        }
+        if (chunk_tokens > combined_capacity - combined_required) {
+            LOG_ERR("PI0.5 combined prompt/image batch needs %zu+%zu tokens, capacity is %zu\n",
+                    combined_required, chunk_tokens, combined_capacity);
+            return -1;
+        }
+        combined_required += chunk_tokens;
+    }
+
+    mtmd_pi0_context combined_batch_owner;
+    combined_batch_owner.batch =
+        llama_batch_init_pi0(n_batch, pi0_n_embd, 1);
+    llama_batch & combined_batch = combined_batch_owner.batch;
     combined_batch.n_tokens = 0;
     bool pi0_prefix_text_appended = false;
 
@@ -955,21 +1010,10 @@ static int32_t mtmd_helper_eval_chunks_pi0_pi05(mtmd_context * ctx,
             pi0_log_prefix_token_ids("text_chunk_raw_from_prompt", tokens_raw, n_tokens_raw);
 
             const int32_t combined_n_before_text = combined_batch.n_tokens;
-            std::vector<llama_token> env_forced_tokens;
-            std::vector<llama_token> unwrapped_text_tokens;
-            const llama_token * text_tokens = tokens_raw;
-            size_t n_text_tokens = n_tokens_raw;
             pi_model_debug_dump_tokens("pi_model_mtmd_text_raw", tokens_raw, n_tokens_raw);
             const bool use_env_forced_text = use_pi05_adapter && pi0_env_forced_prefix_text_enabled();
-            if (use_env_forced_text) {
-                env_forced_tokens = pi0_forced_prefix_text_tokens_from_env();
-                text_tokens = env_forced_tokens.data();
-                n_text_tokens = env_forced_tokens.size();
-            }
-            unwrapped_text_tokens = pi0_build_unwrapped_text_tokens(
-                text_tokens, n_text_tokens, use_pi05_adapter);
-            text_tokens = unwrapped_text_tokens.data();
-            n_text_tokens = unwrapped_text_tokens.size();
+            const llama_token * text_tokens = prepared_text_tokens[ij].data();
+            const size_t n_text_tokens = prepared_text_tokens[ij].size();
             pi0_append_text_tokens(
                     combined_batch, n_past, seq_id, text_tokens, n_text_tokens, chunk_logits_last);
             pi0_prefix_text_appended = true;
@@ -1093,7 +1137,8 @@ static int32_t mtmd_helper_eval_chunks_pi0_pi05(mtmd_context * ctx,
                 } else if (chunk_type == MTMD_INPUT_CHUNK_TYPE_AUDIO) {
                     batch_embd.set_position_mrope_1d(n_past, seq_id);
                 } else {
-                    GGML_ABORT("invalid chunk type for M-RoPE");
+                    LOG_ERR("invalid PI0.5 chunk type for M-RoPE\n");
+                    return -1;
                 }
             } else {
                 batch_embd.set_position_normal(n_past, seq_id);
@@ -1139,7 +1184,8 @@ static int32_t mtmd_helper_eval_chunks_pi0_pi05(mtmd_context * ctx,
                             std::memcpy(combined_batch.embd3, batch_embd_view.embd, (size_t) n_tokens_batch * n_mmproj_embd * sizeof(float));
                         }
                         else{
-                            GGML_ABORT("Not supported more than 3 embd buffers");
+                            LOG_ERR("PI0.5 supports at most three embedding buffers\n");
+                            return -1;
                         }
                     }
                 }
@@ -1209,7 +1255,8 @@ static int32_t mtmd_helper_eval_chunks_pi0_pi05(mtmd_context * ctx,
             }
 
         } else {
-            GGML_ABORT("chunk type not supported");
+            LOG_ERR("unsupported PI0.5 chunk type\n");
+            return -1;
         }
     
         if (ret != 0) {
@@ -1281,10 +1328,10 @@ static int32_t mtmd_helper_eval_chunks_pi0_pi05(mtmd_context * ctx,
     if (out_context != nullptr) {
         mtmd_pi0_context * prepared = new (std::nothrow) mtmd_pi0_context();
         if (prepared == nullptr) {
-            llama_batch_free_pi0(combined_batch);
             return 1;
         }
         prepared->batch = combined_batch;
+        combined_batch = {};
         *out_context = prepared;
         return 0;
     }
@@ -1321,7 +1368,6 @@ static int32_t mtmd_helper_eval_chunks_pi0_pi05(mtmd_context * ctx,
             pi0_result->state_data = (float *) malloc(sizeof(float) * state_dim);
             if (pi0_result->state_data == nullptr) {
                 LOG_ERR("failed to allocate pi0 state buffer\n");
-                llama_batch_free_pi0(combined_batch);
                 return 1;
             }
 
@@ -1340,7 +1386,6 @@ static int32_t mtmd_helper_eval_chunks_pi0_pi05(mtmd_context * ctx,
             pi0_result->action_data = (float *) malloc(sizeof(float) * action_count);
             if (pi0_result->action_data == nullptr) {
                 LOG_ERR("failed to allocate pi0 action buffer\n");
-                llama_batch_free_pi0(combined_batch);
                 return 1;
             }
 
@@ -1354,7 +1399,6 @@ static int32_t mtmd_helper_eval_chunks_pi0_pi05(mtmd_context * ctx,
             pi0_result->action_final_data = (float *) malloc(sizeof(float) * action_count);
             if (pi0_result->action_final_data == nullptr) {
                 LOG_ERR("failed to allocate pi0 final action buffer\n");
-                llama_batch_free_pi0(combined_batch);
                 return 1;
             }
 
@@ -1365,6 +1409,7 @@ static int32_t mtmd_helper_eval_chunks_pi0_pi05(mtmd_context * ctx,
     const int64_t t_output_extract_done = ggml_time_us();
     const int64_t t_batch_free_start = ggml_time_us();
     llama_batch_free_pi0(combined_batch);
+    combined_batch = {};
     const int64_t t_batch_free_done = ggml_time_us();
 
     if (pi0_result) {
