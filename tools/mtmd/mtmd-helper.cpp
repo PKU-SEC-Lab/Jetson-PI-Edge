@@ -212,16 +212,22 @@ static bool pi0_env_forced_prefix_text_enabled() {
     return tokens_path != nullptr && tokens_path[0] != '\0';
 }
 
-static std::vector<llama_token> pi0_build_legacy_text_tokens(
+static std::vector<llama_token> pi0_build_unwrapped_text_tokens(
         const llama_token * tokens,
-        size_t n_tokens) {
+        size_t n_tokens,
+        bool use_pi05_adapter) {
     std::vector<llama_token> out;
-    out.reserve(n_tokens + 1);
+    out.reserve(n_tokens + 2);
+    // OpenPI tokenization starts both Pi0 and Pi0.5 prompts with BOS.
     out.push_back(2);
-
-    const size_t n_payload = n_tokens > 3 ? n_tokens - 3 : n_tokens;
-    if (tokens != nullptr && n_payload > 0) {
-        out.insert(out.end(), tokens, tokens + n_payload);
+    if (tokens != nullptr && n_tokens > 0) {
+        out.insert(out.end(), tokens, tokens + n_tokens);
+    }
+    if (!use_pi05_adapter) {
+        // Legacy Pi0 uses the raw task text followed by its answer-start LF.
+        // Pi0.5 already contains the internal "\nAction: " separator and
+        // must not receive another LF at the end.
+        out.push_back(108);
     }
 
     return out;
@@ -801,7 +807,6 @@ static int32_t mtmd_helper_eval_chunks_pi0_pi05(mtmd_context * ctx,
     }
     const llama_model * pi0_text_model = llama_get_model(lctx);
     const bool use_pi05_adapter = pi_model_use_pi05_adapters_by_default(pi_model) != 0;
-    const bool use_pi0_legacy_adapter = !use_pi05_adapter;
     GGML_UNUSED(pi0_text_model);
     const int pi0_n_embd = llama_model_n_embd_inp(pi0_text_model);
 
@@ -916,21 +921,6 @@ static int32_t mtmd_helper_eval_chunks_pi0_pi05(mtmd_context * ctx,
         llama_pos * new_n_past = &n_past;
         int32_t ret = 0;
         auto chunk_type = mtmd_input_chunk_get_type(chunk);
-        if (use_pi0_legacy_adapter && n_chunks > 1 && ij == 0) {
-            if (pi0_log_prefix_tokens_enabled()) {
-                fprintf(stderr,
-                        "[PI0_PREFIX] chunk[0]: skipped by PI_MODEL=pi0 legacy adapter\n");
-            }
-            pi0_combined_chunk_info skipped_info {};
-            skipped_info.src_idx        = ij;
-            skipped_info.type           = chunk_type;
-            skipped_info.combined_start = combined_batch.n_tokens;
-            skipped_info.combined_count = 0;
-            skipped_info.skipped        = true;
-            combined_chunk_infos.push_back(skipped_info);
-            continue;
-        }
-
 #if 0
         {
             std::ostringstream oss;
@@ -965,31 +955,20 @@ static int32_t mtmd_helper_eval_chunks_pi0_pi05(mtmd_context * ctx,
 
             const int32_t combined_n_before_text = combined_batch.n_tokens;
             std::vector<llama_token> env_forced_tokens;
-            std::vector<llama_token> text_tokens_with_bos;
-            std::vector<llama_token> legacy_text_tokens;
+            std::vector<llama_token> unwrapped_text_tokens;
             const llama_token * text_tokens = tokens_raw;
             size_t n_text_tokens = n_tokens_raw;
             pi_model_debug_dump_tokens("pi_model_mtmd_text_raw", tokens_raw, n_tokens_raw);
-            if (use_pi0_legacy_adapter) {
-                legacy_text_tokens = pi0_build_legacy_text_tokens(tokens_raw, n_tokens_raw);
-                text_tokens = legacy_text_tokens.data();
-                n_text_tokens = legacy_text_tokens.size();
-            } else if (n_text_tokens > 0 && text_tokens[0] != 2) {
-                text_tokens_with_bos.reserve(n_text_tokens + 1);
-                text_tokens_with_bos.push_back(2);
-                text_tokens_with_bos.insert(
-                    text_tokens_with_bos.end(),
-                    text_tokens,
-                    text_tokens + n_text_tokens);
-                text_tokens = text_tokens_with_bos.data();
-                n_text_tokens = text_tokens_with_bos.size();
-            }
             const bool use_env_forced_text = use_pi05_adapter && pi0_env_forced_prefix_text_enabled();
             if (use_env_forced_text) {
                 env_forced_tokens = pi0_forced_prefix_text_tokens_from_env();
                 text_tokens = env_forced_tokens.data();
                 n_text_tokens = env_forced_tokens.size();
             }
+            unwrapped_text_tokens = pi0_build_unwrapped_text_tokens(
+                text_tokens, n_text_tokens, use_pi05_adapter);
+            text_tokens = unwrapped_text_tokens.data();
+            n_text_tokens = unwrapped_text_tokens.size();
             pi0_append_text_tokens(
                     combined_batch, n_past, seq_id, text_tokens, n_text_tokens, chunk_logits_last);
             pi0_prefix_text_appended = true;

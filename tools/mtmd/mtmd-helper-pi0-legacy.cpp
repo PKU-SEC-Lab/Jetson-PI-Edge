@@ -641,24 +641,25 @@ int32_t mtmd_helper_eval_chunks_pi0(mtmd_context * ctx,
             size_t i = 0;
             while (i < n_tokens) { // split into batches
                 text_batch.n_tokens = 0; // clear the batch
-                
-                text_batch.token   [0]    = 2;
-                text_batch.pos     [0]    = n_past++;
 
-                text_batch.n_seq_id[0]    = 1;
-                text_batch.seq_id  [0][0] = seq_id;
-                text_batch.logits  [0]    = false;
+                // Add BOS once for the complete text chunk, not once per
+                // n_batch slice when a long prompt is split across batches.
+                if (i == 0) {
+                    text_batch.token   [0]    = 2;
+                    text_batch.pos     [0]    = n_past++;
+                    text_batch.n_seq_id[0]    = 1;
+                    text_batch.seq_id  [0][0] = seq_id;
+                    text_batch.logits  [0]    = false;
+                    text_batch.n_tokens++;
 
-                text_batch.n_tokens++;
-
-                int32_t combined_j = combined_batch.n_tokens;
-                combined_batch.token   [combined_j]    = 2;
-                combined_batch.pos     [combined_j]    = text_batch.pos[0];
-                combined_batch.n_seq_id[combined_j]    = 1;
-                combined_batch.seq_id  [combined_j][0] = seq_id;
-                combined_batch.logits  [combined_j]    = false;
-
-                combined_batch.n_tokens++;
+                    const int32_t combined_j = combined_batch.n_tokens;
+                    combined_batch.token   [combined_j]    = 2;
+                    combined_batch.pos     [combined_j]    = text_batch.pos[0];
+                    combined_batch.n_seq_id[combined_j]    = 1;
+                    combined_batch.seq_id  [combined_j][0] = seq_id;
+                    combined_batch.logits  [combined_j]    = false;
+                    combined_batch.n_tokens++;
+                }
 
                 for (; i < n_tokens && text_batch.n_tokens < n_batch; i++) {
                     int32_t j = text_batch.n_tokens;
