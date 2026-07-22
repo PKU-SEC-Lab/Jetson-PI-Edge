@@ -5746,7 +5746,6 @@ class PI0Model(TextModel):
     def set_gguf_parameters(self):
         hparams = dict(self.hparams)
 
-        hparams["pi05"] = True
         action_steps = int(hparams.get("n_action_steps", hparams.get("chunk_size", hparams.get("action_horizon", 50))))
         action_dim = int(hparams.get("max_action_dim", hparams.get("action_dim", 32)))
         inference_steps = int(hparams.get("num_inference_steps", 10))

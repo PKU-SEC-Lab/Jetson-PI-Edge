@@ -731,14 +731,15 @@ void mtmd_pi0_result_free(mtmd_pi0_result * result) {
 }
 
 extern "C" int32_t mtmd_helper_eval_chunks_pi0_legacy(mtmd_context * ctx,
-    struct llama_context * lctx,
-    const mtmd_input_chunks * chunks,
-    llama_pos n_past,
-    llama_seq_id seq_id,
-    int32_t n_batch,
-    bool logits_last,
-    llama_pos * old_n_past,
-    mtmd_pi0_result * pi0_result);
+                                                       struct llama_context * lctx,
+                                                       const mtmd_input_chunks * chunks,
+                                                       llama_pos n_past,
+                                                       llama_seq_id seq_id,
+                                                       int32_t n_batch,
+                                                       bool logits_last,
+                                                       llama_pos * old_n_past,
+                                                       mtmd_pi0_result * pi0_result,
+                                                       llama_batch * out_batch);
 
 struct mtmd_pi0_context {
     llama_batch batch{};
@@ -1395,10 +1396,35 @@ int32_t mtmd_helper_prepare_chunks_pi0_for_model(
         }
         return -1;
     }
+    if (out_context == nullptr) {
+        return -1;
+    }
+    *out_context = nullptr;
+    if (model_kind == PI_MODEL_PI0) {
+        llama_batch batch {};
+        const int32_t ret = mtmd_helper_eval_chunks_pi0_legacy(
+            ctx, lctx, chunks, n_past, seq_id, n_batch, logits_last,
+            new_n_past, nullptr, &batch);
+        if (ret != 0) {
+            return ret;
+        }
+        if (batch.token == nullptr) {
+            llama_batch_free_pi0(batch);
+            return -1;
+        }
+        mtmd_pi0_context * prepared = new (std::nothrow) mtmd_pi0_context();
+        if (prepared == nullptr) {
+            llama_batch_free_pi0(batch);
+            return -1;
+        }
+        prepared->batch = batch;
+        *out_context = prepared;
+        return 0;
+    }
     int32_t ret = mtmd_helper_eval_chunks_pi0_pi05(
         ctx, lctx, chunks, n_past, seq_id, n_batch, logits_last,
         new_n_past, nullptr, model_kind, out_context);
-    if (ret == 0 && (out_context == nullptr || *out_context == nullptr)) {
+    if (ret == 0 && *out_context == nullptr) {
         return -1;
     }
     return ret;
@@ -1452,7 +1478,8 @@ int32_t mtmd_helper_eval_chunks_pi0(mtmd_context * ctx,
     if (pi_model_kind_is_pi0(pi_model)) {
         pi05_debug_host_log_line("[mtmd] pi_model=pi0 dispatch=legacy_jetson_pi");
         return mtmd_helper_eval_chunks_pi0_legacy(
-            ctx, lctx, chunks, n_past, seq_id, n_batch, logits_last, old_n_past, pi0_result);
+            ctx, lctx, chunks, n_past, seq_id, n_batch, logits_last,
+            old_n_past, pi0_result, nullptr);
     }
 
     {

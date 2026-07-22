@@ -33,6 +33,11 @@ extern "C" {
 
 typedef struct jetson_pi_pi0 jetson_pi_pi0;
 
+// Feature contract consumed by embedding adapters at build time. Headers that
+// do not define this macro do not guarantee a real boundary for every detected
+// Pi0 model kind.
+#define JETSON_PI_PI0_HAS_REAL_CONTEXT_ACTION 1
+
 typedef struct jetson_pi_pi0_config {
     uint32_t struct_size;
 

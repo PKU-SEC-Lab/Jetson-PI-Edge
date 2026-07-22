@@ -7,7 +7,7 @@
 #define mtmd_helper_decode_image_chunk mtmd_helper_decode_image_chunk_pi0_legacy
 #define mtmd_helper_eval_chunk_single mtmd_helper_eval_chunk_single_pi0_legacy
 #define mtmd_pi0_result_free mtmd_pi0_result_free_pi0_legacy
-#define mtmd_helper_eval_chunks_pi0 mtmd_helper_eval_chunks_pi0_legacy
+#define mtmd_helper_eval_chunks_pi0 mtmd_helper_eval_chunks_pi0_legacy_header
 #define mtmd_helper_eval_chunks mtmd_helper_eval_chunks_pi0_legacy_eval_chunks
 #define mtmd_helper_bitmap_init_from_buf mtmd_helper_bitmap_init_from_buf_pi0_legacy
 #define mtmd_helper_bitmap_init_from_file mtmd_helper_bitmap_init_from_file_pi0_legacy
@@ -32,8 +32,11 @@
 #include "clip.h"
 #include "pi-model.h"
 
+#undef mtmd_helper_eval_chunks_pi0
+
 #include <algorithm>
 #include <cinttypes>
+#include <cstring>
 #include <vector>
 #include <chrono>
 #include <iostream>
@@ -86,11 +89,6 @@ static void pi0_legacy_debug_dump_floats(const char * name, const float * data, 
 }
 
 static void pi0_legacy_free_combined_batch(llama_batch & batch) {
-    // Legacy Jetson-PI points these at mtmd-owned VIT embedding buffers.
-    // Jetson-PI05's llama_batch_free_pi0 frees embedding pointers, so detach them here.
-    batch.embd = nullptr;
-    batch.embd2 = nullptr;
-    batch.embd3 = nullptr;
     llama_batch_free_pi0(batch);
 }
 
@@ -546,7 +544,7 @@ void mtmd_pi0_result_free(mtmd_pi0_result * result) {
     result->has_action_final = false;
 }
 
-int32_t mtmd_helper_eval_chunks_pi0(mtmd_context * ctx,
+extern "C" int32_t mtmd_helper_eval_chunks_pi0_legacy(mtmd_context * ctx,
     struct llama_context * lctx,
     const mtmd_input_chunks * chunks,
     llama_pos n_past,
@@ -554,7 +552,11 @@ int32_t mtmd_helper_eval_chunks_pi0(mtmd_context * ctx,
     int32_t n_batch,
     bool logits_last,
     llama_pos * old_n_past,
-    mtmd_pi0_result * pi0_result) {
+    mtmd_pi0_result * pi0_result,
+    llama_batch * out_batch) {
+    if (out_batch != nullptr) {
+        *out_batch = {};
+    }
     n_past = 0;
     if (pi0_result) {
         mtmd_pi0_result_free(pi0_result);
@@ -610,7 +612,8 @@ int32_t mtmd_helper_eval_chunks_pi0(mtmd_context * ctx,
         }
     }
 
-    llama_batch combined_batch = llama_batch_init_pi0(n_batch, 0, 1);
+    const int pi0_n_embd = llama_model_n_embd_inp(llama_get_model(lctx));
+    llama_batch combined_batch = llama_batch_init_pi0(n_batch, pi0_n_embd, 1);
     combined_batch.n_tokens = 0;
 
 
@@ -705,6 +708,7 @@ int32_t mtmd_helper_eval_chunks_pi0(mtmd_context * ctx,
                 if (ret != 0) {
                     LOG_ERR("failed to decode text\n");
                     llama_batch_free(text_batch);
+                    pi0_legacy_free_combined_batch(combined_batch);
                     return ret;
                 }
             }
@@ -743,6 +747,7 @@ int32_t mtmd_helper_eval_chunks_pi0(mtmd_context * ctx,
             if (ret != 0) {
                 LOG_ERR("failed to encode %s slice\n", name);
                 llama_batch_free(text_batch);
+                pi0_legacy_free_combined_batch(combined_batch);
                 return ret;
             }
 
@@ -773,6 +778,8 @@ int32_t mtmd_helper_eval_chunks_pi0(mtmd_context * ctx,
             auto chunk_type = mtmd_input_chunk_get_type(chunk);
             if (chunk_type == MTMD_INPUT_CHUNK_TYPE_TEXT) {
                 LOG_ERR("failed to decode chunk: input chunk not of image/audio type\n");
+                llama_batch_free(text_batch);
+                pi0_legacy_free_combined_batch(combined_batch);
                 return -1;
             }
 
@@ -791,6 +798,8 @@ int32_t mtmd_helper_eval_chunks_pi0(mtmd_context * ctx,
                     const auto image_tokens = mtmd_input_chunk_get_tokens_image(chunk);
                     if (!image_tokens) {
                         LOG_ERR("failed to decode chunk: image tokens are null\n");
+                        llama_batch_free(text_batch);
+                        pi0_legacy_free_combined_batch(combined_batch);
                         return -1;
                     }
                     const int nx = mtmd_image_tokens_get_nx(image_tokens);
@@ -834,15 +843,18 @@ int32_t mtmd_helper_eval_chunks_pi0(mtmd_context * ctx,
                     img_num = combined_batch.img_token_num/ combined_batch.single_img_token_num;
                 }
                 if (img_num==1){
-                    combined_batch.embd     = batch_embd_view.embd; 
+                    std::memcpy(combined_batch.embd, batch_embd_view.embd,
+                                sizeof(float) * n_tokens_batch * n_mmproj_embd);
                 }
                 else{
                     if (img_num==2){
-                        combined_batch.embd2     = batch_embd_view.embd; 
+                        std::memcpy(combined_batch.embd2, batch_embd_view.embd,
+                                    sizeof(float) * n_tokens_batch * n_mmproj_embd);
                     }
                     else{
                         if (img_num==3){
-                            combined_batch.embd3     = batch_embd_view.embd; 
+                            std::memcpy(combined_batch.embd3, batch_embd_view.embd,
+                                        sizeof(float) * n_tokens_batch * n_mmproj_embd);
                         }
                         else{
                             GGML_ABORT("Not supported more than 3 embd buffers");
@@ -885,6 +897,7 @@ int32_t mtmd_helper_eval_chunks_pi0(mtmd_context * ctx,
             if (ret != 0) {
                 LOG_ERR("failed to decode %s\n", name);
                 llama_batch_free(text_batch);
+                pi0_legacy_free_combined_batch(combined_batch);
                 return ret;
             }
 
@@ -910,6 +923,7 @@ int32_t mtmd_helper_eval_chunks_pi0(mtmd_context * ctx,
 
         if (ret != 0) {
             LOG_ERR("failed to eval chunk %zu\n", ij);
+            pi0_legacy_free_combined_batch(combined_batch);
             return ret;
         }
         *old_n_past = n_past;
@@ -940,11 +954,17 @@ int32_t mtmd_helper_eval_chunks_pi0(mtmd_context * ctx,
     auto t_encode_start = std::chrono::high_resolution_clock::now();
     if (llama_encode(lctx, combined_batch)) {
         LOG_ERR("%s : failed to eval\n", __func__);
+        pi0_legacy_free_combined_batch(combined_batch);
         return 1;
     }
     
     auto t_encode_end = std::chrono::high_resolution_clock::now();
     double encode_ms = std::chrono::duration<double, std::milli>(t_encode_end - t_encode_start).count();
+
+    if (out_batch != nullptr) {
+        *out_batch = combined_batch;
+        return 0;
+    }
 
     auto t_decode_start = std::chrono::high_resolution_clock::now();
     int32_t ret = llama_decode(lctx, combined_batch);
@@ -969,6 +989,7 @@ int32_t mtmd_helper_eval_chunks_pi0(mtmd_context * ctx,
     if (ret != 0) {
         LOG_ERR("failed to decode final\n");
         llama_set_causal_attn(lctx, true); // restore causal attn
+        pi0_legacy_free_combined_batch(combined_batch);
         return ret;
     }
 
@@ -1027,9 +1048,6 @@ int32_t mtmd_helper_eval_chunks_pi0(mtmd_context * ctx,
 
     return 0;
 }
-
-
-
 
 int32_t mtmd_helper_eval_chunks(mtmd_context * ctx,
                                 struct llama_context * lctx,

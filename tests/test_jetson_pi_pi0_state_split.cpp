@@ -29,6 +29,7 @@
 
 #include "jetson_pi_pi0.h"
 #include "jetson_pi_pi0_prompt.h"
+#include "pi-model-detect.h"
 
 #define STB_IMAGE_IMPLEMENTATION
 #include "stb/stb_image.h"
@@ -94,6 +95,17 @@ int main() {
     const bool test_pi05 = std::strcmp(model_kind_env, "pi05") == 0;
     if (!test_pi05 && std::strcmp(model_kind_env, "pi0") != 0) {
         std::printf("FAIL: JETSONPI_PI0_MODEL_KIND must be pi0 or pi05\n");
+        return 1;
+    }
+    const pi_model_kind expected_kind = test_pi05 ? PI_MODEL_PI05 : PI_MODEL_PI0;
+    const pi_model_detect_result detected =
+        pi_model_detect_gguf_pair(model_env, mmproj_env);
+    CHECK(detected.kind == expected_kind,
+          "detected GGUF kind matches JETSONPI_PI0_MODEL_KIND");
+    if (detected.kind != expected_kind) {
+        std::printf("    detected=%s expected=%s reason=%s\n",
+                    pi_model_kind_name(detected.kind),
+                    pi_model_kind_name(expected_kind), detected.reason.c_str());
         return 1;
     }
 
