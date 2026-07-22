@@ -1476,11 +1476,9 @@ bool llama_context::apply_adapter_cvec(
 }
 
 void llama_context::pi0_clear_cross_kv() {
-    pi0_enc_kv_gpu.ctx.reset();
-    pi0_enc_kv_gpu.buf.reset();
-    pi0_enc_kv_gpu.tensors.clear();
-    pi0_enc_kv_gpu.kv_tokens = 0;
-
+    // Decoder graphs may reference the persistent GPU tensors directly. Keep
+    // their storage alive here; pi0_refresh_encoded_kv_gpu resets the decoder
+    // graph before reallocating it when the next prefix length changes.
     cross.encoded_kv_gpu.clear();
     cross.pi0_use_gpu_kv             = false;
     cross.pi0_cross_kv_inputs_ready  = false;
