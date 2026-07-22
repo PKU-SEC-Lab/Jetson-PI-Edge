@@ -229,7 +229,12 @@ if (LLAMA_BUILD_COMMON AND (LLAMA_BUILD_TOOLS OR JETSON_PI_BUILD_MTMD))
         DESTINATION ${CMAKE_INSTALL_INCLUDEDIR}
     )
 
-    if (BUILD_SHARED_LIBS)
+    # The state/split test is registered only when Jetson-PI-Edge is the
+    # top-level project. When FlashRT pulls this tree via add_subdirectory
+    # (EXCLUDE_FROM_ALL), the test binary is not built there and registering
+    # it would leave a ctest entry that cannot run. FlashRT carries its own
+    # provider-side equivalent (test_llama_cpp_jetson_pi_state_parity).
+    if (BUILD_SHARED_LIBS AND CMAKE_SOURCE_DIR STREQUAL PROJECT_SOURCE_DIR)
         enable_testing()
         add_executable(test_jetson_pi_pi0_state_split
             ../tests/test_jetson_pi_pi0_state_split.cpp)
