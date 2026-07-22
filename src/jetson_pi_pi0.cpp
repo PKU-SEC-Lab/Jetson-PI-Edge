@@ -13,8 +13,10 @@
 #include "mtmd.h"
 #include "mtmd-helper.h"
 #include "pi-model-detect.h"
+#include "jetson_pi_pi0_prompt.h"
 
 #include <atomic>
+#include <cmath>
 #include <cstring>
 #include <limits>
 #include <new>
@@ -44,6 +46,7 @@ struct Pi0Engine {
     // Model-derived action chunk shape.
     uint32_t action_steps = 0;
     uint32_t action_dim   = 0;
+    pi_model_kind model_kind = PI_MODEL_AUTO;
     std::vector<float> action_cache;
 
     std::string last_error;
@@ -129,6 +132,7 @@ int32_t jetson_pi_pi0_open(const jetson_pi_pi0_config * config,
         delete e;
         return JETSON_PI_PI0_INVALID;
     }
+    e->model_kind = detected.kind;
     int32_t hw = static_cast<int32_t>(std::thread::hardware_concurrency());
     e->n_threads_eff = (e->n_threads_cfg > 0) ? e->n_threads_cfg
                                               : (hw > 0 ? hw : 1);
@@ -295,9 +299,33 @@ int32_t jetson_pi_pi0_context(jetson_pi_pi0 * handle,
     if (!images_rgb || n_images != e->n_views || !prompt || prompt_len == 0) {
         return reject(e, JETSON_PI_PI0_INVALID, "invalid context arguments");
     }
-    if (state && n_state > e->action_dim) {
+    const bool is_pi05 = e->model_kind == PI_MODEL_PI05;
+    const size_t action_dim = static_cast<size_t>(e->action_dim);
+    if ((!state && n_state != 0) || (state && n_state == 0)) {
+        return reject(e, JETSON_PI_PI0_INVALID,
+                      "state pointer and n_state are inconsistent");
+    }
+    const bool pi05_padded_state = is_pi05 && n_state == action_dim && n_state > 8;
+    if ((!is_pi05 && n_state > action_dim) ||
+        (is_pi05 && n_state > 8 && !pi05_padded_state)) {
         return reject(e, JETSON_PI_PI0_STATE_SIZE,
-                      "state has more values than the model action_dim");
+                      is_pi05
+                          ? "PI0.5 state must have at most 8 values or be an action_dim-wide zero-padded provider tensor"
+                          : "state has more values than the model action_dim");
+    }
+    for (size_t i = 0; i < n_state; ++i) {
+        if (!std::isfinite(state[i])) {
+            return reject(e, JETSON_PI_PI0_INVALID,
+                          "state values must be finite");
+        }
+    }
+    if (pi05_padded_state) {
+        for (size_t i = 8; i < n_state; ++i) {
+            if (state[i] != 0.0f) {
+                return reject(e, JETSON_PI_PI0_STATE_SIZE,
+                              "PI0.5 provider padding after the first 8 state values must be zero");
+            }
+        }
     }
 
     // Reset to a fresh first-turn tick: clear KV cache + position.
@@ -307,13 +335,15 @@ int32_t jetson_pi_pi0_context(jetson_pi_pi0 * handle,
     // state means "use a zero state for this tick" (Pi0 native behavior).
     // We must materialize zeros explicitly: llama_memory_clear does not touch
     // cross.state, so a previous tick's state would otherwise leak in.
-    if (state) {
-        std::vector<float> padded(e->action_dim, 0.0f);
-        std::memcpy(padded.data(), state, n_state * sizeof(float));
-        llama_set_pi0_state(e->lctx, padded.data(), padded.size());
-    } else {
-        std::vector<float> zeros(e->action_dim, 0.0f);
-        llama_set_pi0_state(e->lctx, zeros.data(), zeros.size());
+    if (!is_pi05) {
+        if (state) {
+            std::vector<float> padded(e->action_dim, 0.0f);
+            std::memcpy(padded.data(), state, n_state * sizeof(float));
+            llama_set_pi0_state(e->lctx, padded.data(), padded.size());
+        } else {
+            std::vector<float> zeros(e->action_dim, 0.0f);
+            llama_set_pi0_state(e->lctx, zeros.data(), zeros.size());
+        }
     }
 
     // Build bitmaps from raw RGB. mtmd_bitmap_init copies nx*ny*3 bytes.
@@ -339,19 +369,30 @@ int32_t jetson_pi_pi0_context(jetson_pi_pi0 * handle,
 
     // Match the foreground Pi0 path: pass the raw multimodal prefix without
     // chat-template wrappers or a special BOS token.
+    std::string prompt_text;
+    if (is_pi05) {
+        const float zero_state[8] = {};
+        const float * prompt_state = state ? state : zero_state;
+        const size_t prompt_state_size = state ? n_state : 8;
+        prompt_text = jetson_pi_pi0_detail::format_pi05_openpi_prompt(
+            std::string(prompt, prompt_len), prompt_state, prompt_state_size);
+    } else {
+        prompt_text.assign(prompt, prompt_len);
+    }
+
     const char * marker = mtmd_default_marker();
     const size_t marker_len = std::strlen(marker);
     if (marker_len != 0 &&
         static_cast<size_t>(e->n_views) >
-            (std::numeric_limits<size_t>::max() - prompt_len) / marker_len) {
+            (std::numeric_limits<size_t>::max() - prompt_text.size()) / marker_len) {
         free_bitmaps(bitmaps);
         return reject(e, JETSON_PI_PI0_INVALID,
                       "formatted Pi0 prompt size overflows size_t");
     }
     std::string formatted;
-    formatted.reserve(prompt_len + static_cast<size_t>(e->n_views) * marker_len);
+    formatted.reserve(prompt_text.size() + static_cast<size_t>(e->n_views) * marker_len);
     for (uint32_t i = 0; i < e->n_views; ++i) formatted += marker;
-    formatted.append(prompt, prompt_len);
+    formatted.append(prompt_text);
 
     mtmd_input_text text;
     text.text          = formatted.c_str();
