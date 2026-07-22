@@ -14,14 +14,15 @@
 #include "mtmd-helper.h"
 #include "pi-model-detect.h"
 
+#include <algorithm>
 #include <atomic>
+#include <cmath>
 #include <cstring>
 #include <limits>
 #include <new>
 #include <string>
 #include <thread>
 #include <vector>
-
 namespace {
 
 // One Pi0 policy engine: model + inference context + multimodal (VIT) context.
@@ -84,6 +85,45 @@ struct PiModelKindScope {
         pi_model_set_thread_override(previous);
     }
 };
+
+// PI0.5 consumes proprioceptive state as discretized text inside the
+// `Task: ..., State: ...;\nAction:` prompt (the policy's language input), NOT
+// as the legacy llama_set_pi0_state tensor (which the PI0.5 graph never
+// reads). This mirrors the foreground server's build_pi05_openpi_prompt()
+// exactly so the narrow C API and the server produce the same token stream.
+//
+// The caller is responsible for passing state already normalized into the
+// [-1, 1] range the openpi policy was trained on (matching the server, which
+// bins pi0_req.state directly without re-normalizing). At most the first 8
+// values are emitted (openpi proprioception cap); extras are ignored.
+std::string build_pi05_openpi_prompt(const std::string & raw_text,
+                                     const float * state, size_t n_state) {
+    std::string out;
+    out.reserve(raw_text.size() + 64);
+    out += "Task: ";
+    out += raw_text;
+    out += ", State: ";
+
+    const size_t n_for_text = state ? std::min<size_t>(8, n_state) : 0;
+    for (size_t i = 0; i < n_for_text; ++i) {
+        const float x = state[i];
+        int bin;
+        if (x < -1.0f) {
+            bin = -1;  // literal -1 token, distinct from bin 0
+        } else if (x >= 1.0f) {
+            bin = 255;
+        } else {
+            bin = static_cast<int>(std::floor((x + 1.0f) * 128.0f));
+            if (bin < 0) bin = 0;
+            if (bin > 255) bin = 255;
+        }
+        if (i > 0) out += ' ';
+        out += std::to_string(bin);
+    }
+
+    out += ";\nAction: ";
+    return out;
+}
 
 } // namespace
 
@@ -290,9 +330,10 @@ int32_t jetson_pi_pi0_infer(jetson_pi_pi0 * handle,
     if (actions_written) *actions_written = 0;
     if (!e) return JETSON_PI_PI0_INVALID;
     e->clear_error();
+    // infer() is context()+action(); clear any prior pending context first so
+    // this tick is independent (one-shot semantics, same as context()).
     mtmd_helper_free_pi0_context(e->pending_context);
     e->pending_context = nullptr;
-    e->action_cache.clear();
     if (!actions_out || !actions_written) {
         return reject(e, JETSON_PI_PI0_INVALID,
                       "invalid infer output arguments");
@@ -320,32 +361,49 @@ int32_t jetson_pi_pi0_context(jetson_pi_pi0 * handle,
     if (!e) return JETSON_PI_PI0_INVALID;
     PiModelKindScope model_kind_scope(e->model_kind);
     e->clear_error();
+    // One-shot semantics: a new context() invalidates any prior pending
+    // context (and the cached action) so action() can never return a stale
+    // result from a previous tick.
     mtmd_helper_free_pi0_context(e->pending_context);
     e->pending_context = nullptr;
     e->action_cache.clear();
     if (!images_rgb || n_images != e->n_views || !prompt || prompt_len == 0) {
         return reject(e, JETSON_PI_PI0_INVALID, "invalid context arguments");
     }
-    if (state && n_state > e->action_dim) {
+    // PI0.5 discretizes proprioception into the text prompt and never reads the
+    // legacy llama_set_pi0_state tensor, so its state is not bound to
+    // action_dim (openpi proprioception is 8 dims, which can exceed the 7-dim
+    // action). Legacy Pi0 consumes state via the cross.state tensor, which
+    // requires exactly action_dim values (zero-padded when shorter).
+    const bool is_pi05 = (e->model_kind == PI_MODEL_PI05);
+    const size_t state_dim = is_pi05 ? 8 : static_cast<size_t>(e->action_dim);
+    if (state && n_state > state_dim) {
         return reject(e, JETSON_PI_PI0_STATE_SIZE,
-                      "state has more values than the model action_dim");
+                      is_pi05
+                          ? "state has more values than the PI0.5 proprioception width (8)"
+                          : "state has more values than the model action_dim");
     }
 
     // Reset to a fresh first-turn tick: clear KV cache + position.
     llama_memory_clear(llama_get_memory(e->lctx), true);
 
-    // Apply proprioception state. Zero-pad to action_dim when shorter; NULL
-    // state means "use a zero state for this tick" (Pi0 native behavior).
-    // We must materialize zeros explicitly: llama_memory_clear does not touch
-    // cross.state, so a previous tick's state would otherwise leak in.
-    if (state) {
-        std::vector<float> padded(e->action_dim, 0.0f);
-        std::memcpy(padded.data(), state, n_state * sizeof(float));
-        llama_set_pi0_state(e->lctx, padded.data(), padded.size());
-    } else {
-        std::vector<float> zeros(e->action_dim, 0.0f);
-        llama_set_pi0_state(e->lctx, zeros.data(), zeros.size());
+    if (!is_pi05) {
+        // Legacy Pi0: proprioception is a continuous tensor consumed via
+        // state_proj. Zero-pad to action_dim when shorter; NULL state means
+        // "use a zero state for this tick" (Pi0 native behavior). We must
+        // materialize zeros explicitly: llama_memory_clear does not touch
+        // cross.state, so a previous tick's state would otherwise leak in.
+        if (state) {
+            std::vector<float> padded(e->action_dim, 0.0f);
+            std::memcpy(padded.data(), state, n_state * sizeof(float));
+            llama_set_pi0_state(e->lctx, padded.data(), padded.size());
+        } else {
+            std::vector<float> zeros(e->action_dim, 0.0f);
+            llama_set_pi0_state(e->lctx, zeros.data(), zeros.size());
+        }
     }
+    // PI0.5 does NOT call llama_set_pi0_state: its graph skips build_inp_state
+    // and consumes proprioception only as discretized text (built below).
 
     // Build bitmaps from raw RGB. mtmd_bitmap_init copies nx*ny*3 bytes.
     std::vector<mtmd_bitmap*> bitmaps;
@@ -372,17 +430,30 @@ int32_t jetson_pi_pi0_context(jetson_pi_pi0 * handle,
     // chat-template wrappers or a special BOS token.
     const char * marker = mtmd_default_marker();
     const size_t marker_len = std::strlen(marker);
+
+    // PI0.5 folds the discretized proprioception into the prompt text
+    // ("Task: <prompt>, State: <bins>;\nAction: "), matching the foreground
+    // server. Legacy Pi0 uses the raw prompt (state is a tensor, above).
+    std::string prompt_text;
+    if (is_pi05) {
+        prompt_text = build_pi05_openpi_prompt(
+            std::string(prompt, prompt_len), state, n_state);
+    } else {
+        prompt_text.assign(prompt, prompt_len);
+    }
+    const size_t pi_len = prompt_text.size();
+
     if (marker_len != 0 &&
         static_cast<size_t>(e->n_views) >
-            (std::numeric_limits<size_t>::max() - prompt_len) / marker_len) {
+            (std::numeric_limits<size_t>::max() - pi_len) / marker_len) {
         free_bitmaps(bitmaps);
         return reject(e, JETSON_PI_PI0_INVALID,
                       "formatted Pi0 prompt size overflows size_t");
     }
     std::string formatted;
-    formatted.reserve(prompt_len + static_cast<size_t>(e->n_views) * marker_len);
+    formatted.reserve(pi_len + static_cast<size_t>(e->n_views) * marker_len);
     for (uint32_t i = 0; i < e->n_views; ++i) formatted += marker;
-    formatted.append(prompt, prompt_len);
+    formatted.append(prompt_text);
 
     mtmd_input_text text;
     text.text          = formatted.c_str();
@@ -407,31 +478,25 @@ int32_t jetson_pi_pi0_context(jetson_pi_pi0 * handle,
                       "mtmd_tokenize failed");
     }
 
+    // Encode VIT + prompt (prefill) and retain the prepared batch as a pending
+    // context; the action-producing decode runs in action(). This is a real
+    // compute boundary: prepare returns right after llama_encode and before
+    // llama_decode, so context() holds the encoded state and action() finishes
+    // the forward pass. action_cache is intentionally NOT populated here —
+    // action() must consume pending_context.
     llama_pos new_n_past = 0;
-    mtmd_pi0_result pi0_result{};
-    int32_t er = mtmd_helper_eval_chunks_pi0(
-        e->mtmd, e->lctx, chunks,
+    int32_t er = mtmd_helper_prepare_chunks_pi0_for_model(
+        e->mtmd, e->lctx, chunks, e->model_kind,
         /*n_past=*/0, /*seq_id=*/0,
         /*n_batch=*/2048, /*logits_last=*/true, &new_n_past,
-        &pi0_result);
+        &e->pending_context);
     mtmd_input_chunks_free(chunks);
-    if (er != 0) {
-        mtmd_pi0_result_free(&pi0_result);
+    if (er != 0 || e->pending_context == nullptr) {
+        mtmd_helper_free_pi0_context(e->pending_context);
+        e->pending_context = nullptr;
         return reject(e, JETSON_PI_PI0_INFER_FAILED,
-                      "mtmd_helper_eval_chunks_pi0 failed");
+                      "mtmd_helper_prepare_chunks_pi0_for_model failed");
     }
-    const size_t need_elems = static_cast<size_t>(e->action_steps) *
-                              static_cast<size_t>(e->action_dim);
-    if (!pi0_result.has_action_final || pi0_result.action_final_data == nullptr ||
-        pi0_result.action_steps != static_cast<int32_t>(e->action_steps) ||
-        pi0_result.action_dim != static_cast<int32_t>(e->action_dim)) {
-        mtmd_pi0_result_free(&pi0_result);
-        return reject(e, JETSON_PI_PI0_ACTION_NOT_READY,
-                      "mtmd_helper_eval_chunks_pi0 did not produce final action");
-    }
-    e->action_cache.assign(pi0_result.action_final_data,
-                           pi0_result.action_final_data + need_elems);
-    mtmd_pi0_result_free(&pi0_result);
     return JETSON_PI_PI0_OK;
 }
 
@@ -459,12 +524,10 @@ int32_t jetson_pi_pi0_action(jetson_pi_pi0 * handle,
         return reject(e, JETSON_PI_PI0_BUFFER_TOO_SMALL,
                       "actions_out buffer too small");
     }
-    if (e->action_cache.size() == need_elems) {
-        std::memcpy(actions_out, e->action_cache.data(), need_elems * sizeof(float));
-        *actions_written = need_elems;
-        e->action_cache.clear();
-        return JETSON_PI_PI0_OK;
-    }
+    // context() now retains a pending prepared batch instead of caching the
+    // final action, so action() must consume that pending context. There is
+    // no action_cache fast path: a successful action() requires a preceding
+    // successful context().
     if (!e->pending_context) {
         return reject(e, JETSON_PI_PI0_ACTION_NOT_READY,
                       "Pi0 context not ready");
@@ -472,6 +535,10 @@ int32_t jetson_pi_pi0_action(jetson_pi_pi0 * handle,
     mtmd_pi0_context * context = e->pending_context;
     e->pending_context = nullptr;
     int32_t er = mtmd_helper_decode_pi0(e->lctx, context);
+    // mtmd_helper_decode_pi0 only restores causal_attn on failure; restore it
+    // unconditionally so a successful split decode does not leave a non-default
+    // attention mode that would corrupt a subsequent tick.
+    llama_set_causal_attn(e->lctx, true);
     mtmd_helper_free_pi0_context(context);
     if (er != 0) {
         return reject(e, JETSON_PI_PI0_INFER_FAILED,

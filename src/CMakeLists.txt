@@ -228,4 +228,17 @@ if (LLAMA_BUILD_COMMON AND (LLAMA_BUILD_TOOLS OR JETSON_PI_BUILD_MTMD))
         ${CMAKE_CURRENT_SOURCE_DIR}/../include/jetson_pi_mllm.h
         DESTINATION ${CMAKE_INSTALL_INCLUDEDIR}
     )
+
+    if (BUILD_SHARED_LIBS)
+        enable_testing()
+        add_executable(test_jetson_pi_pi0_state_split
+            ../tests/test_jetson_pi_pi0_state_split.cpp)
+        target_link_libraries(test_jetson_pi_pi0_state_split
+            PRIVATE jetson_pi_pi0)
+        # stb_image is vendored under /vendor/stb; the test includes "stb/stb_image.h".
+        target_include_directories(test_jetson_pi_pi0_state_split PRIVATE
+            ${CMAKE_CURRENT_SOURCE_DIR}/../vendor)
+        add_test(NAME jetson_pi_pi0_state_split
+            COMMAND test_jetson_pi_pi0_state_split)
+    endif()
 endif()
