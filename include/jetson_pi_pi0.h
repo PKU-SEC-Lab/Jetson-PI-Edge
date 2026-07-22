@@ -106,11 +106,13 @@ int32_t jetson_pi_pi0_action(jetson_pi_pi0 * handle,
 //                   dimensions. n_images must equal config.n_views.
 //   prompt          UTF-8 bytes. Must NOT contain media markers; the engine
 //                   injects one marker per view. Need not be NUL-terminated.
-//   state           n_state float32 proprioception values, or NULL for a zero
-//                   state. PI0.5 accepts at most 8 values and serializes them
+//   state           Either NULL with n_state == 0 for a zero state, or a
+//                   non-NULL pointer to 1..n finite float32 proprioception
+//                   values. PI0.5 accepts at most 8 values and serializes them
 //                   into the Task/State/Action prompt; NULL emits 8 zero-value
 //                   bins. Legacy Pi0 accepts at most action_dim values and
-//                   zero-pads shorter input to action_dim.
+//                   zero-pads shorter input to action_dim. Pointer/count
+//                   mismatches and non-finite values are rejected.
 //   actions_out     caller buffer of action_capacity float32 slots. On OK,
 //                   *actions_written is set to action_steps * action_dim.
 //

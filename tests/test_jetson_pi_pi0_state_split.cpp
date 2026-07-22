@@ -1,4 +1,4 @@
-// PI0.5 state-parity + context/action split test for the Jetson-PI narrow API.
+// State-parity + context/action split test for the Jetson-PI narrow API.
 //
 // Verifies the two corrections that FlashRT #148 depends on:
 //   1. PI0.5 proprioceptive state is serialized into the
@@ -12,15 +12,15 @@
 //      ACTION_NOT_READY; discard_context() between the two returns
 //      ACTION_NOT_READY; context() output equals infer() output.
 //
-// State is passed already normalized to [-1,1] (caller contract, matching the
-// foreground server which bins pi0_req.state directly). Boundary regions are
-// exercised explicitly because the openpi discretizer maps x<-1 to a literal
-// -1 token distinct from bin 0.
+// The deterministic prompt checks run without model weights. Real-model checks
+// require an explicit model kind and backend so validation never silently
+// changes execution mode.
 //
 // Env:
-//   JETSONPI_PI0_MODEL    PI0.5 policy GGUF
+//   JETSONPI_PI0_MODEL    Pi0 or PI0.5 policy GGUF
 //   JETSONPI_PI0_MMPROJ   VIT mmproj GGUF
 //   JETSONPI_PI0_BACKEND  "cpu" | "cuda" | "vulkan" | "opencl" | "sycl"
+//   JETSONPI_PI0_MODEL_KIND  "pi0" | "pi05"
 //   JETSONPI_PI0_IMG      224x224 RGB image (first view)
 //   JETSONPI_PI0_WRIST    224x224 RGB image (second view)
 //   JETSONPI_PI0_PROMPT   task text file
@@ -28,16 +28,19 @@
 // Skips (returns 0) when env vars are unset.
 
 #include "jetson_pi_pi0.h"
+#include "jetson_pi_pi0_prompt.h"
 
 #define STB_IMAGE_IMPLEMENTATION
 #include "stb/stb_image.h"
 
+#include <algorithm>
 #include <cmath>
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
 #include <fstream>
+#include <limits>
 #include <string>
 #include <vector>
 
@@ -48,27 +51,46 @@ static int g_fail = 0;
     else { std::printf("ok  : %s\n", check_msg.c_str()); } \
 } while (0)
 
-static std::string read_file(const std::string & path, bool * ok) {
-    std::ifstream f(path, std::ios::binary);
-    if (!f) { if (ok) *ok = false; return {}; }
-    std::string s((std::istreambuf_iterator<char>(f)),
-                  std::istreambuf_iterator<char>());
-    if (ok) *ok = true;
-    return s;
-}
-
 int main() {
+    const float boundary_state[] = {
+        -2.0f, -1.0f, -0.5f, 0.0f, 0.5f, 1.0f, 1.5f,
+    };
+    CHECK(jetson_pi_pi0_detail::format_pi05_openpi_prompt(
+              "pick", boundary_state,
+              sizeof(boundary_state) / sizeof(boundary_state[0])) ==
+              "Task: pick, State: -1 0 64 128 192 255 255;\nAction: ",
+          "PI0.5 prompt uses exact openpi boundary bins");
+    const float short_state[] = {0.0f};
+    CHECK(jetson_pi_pi0_detail::format_pi05_openpi_prompt(
+              "pick", short_state, 1) ==
+              "Task: pick, State: 128;\nAction: ",
+          "PI0.5 short state is not padded in the prompt");
+    const float zero_state_for_prompt[8] = {};
+    CHECK(jetson_pi_pi0_detail::format_pi05_openpi_prompt(
+              "pick", zero_state_for_prompt, 8) ==
+              "Task: pick, State: 128 128 128 128 128 128 128 128;\nAction: ",
+          "PI0.5 NULL-state representation is eight zero bins");
+
     const char * model_env  = std::getenv("JETSONPI_PI0_MODEL");
     const char * mmproj_env = std::getenv("JETSONPI_PI0_MMPROJ");
     const char * img_env    = std::getenv("JETSONPI_PI0_IMG");
     const char * wrist_env  = std::getenv("JETSONPI_PI0_WRIST");
     const char * prompt_env = std::getenv("JETSONPI_PI0_PROMPT");
     const char * backend_env = std::getenv("JETSONPI_PI0_BACKEND");
-    if (!model_env || !mmproj_env || !img_env || !wrist_env || !prompt_env) {
-        std::printf("SKIP - JETSONPI_PI0_MODEL/MMPROJ/IMG/WRIST/PROMPT not set\n");
-        return 0;
+    const char * model_kind_env = std::getenv("JETSONPI_PI0_MODEL_KIND");
+    if (!model_env || !mmproj_env || !img_env || !wrist_env || !prompt_env ||
+        !backend_env || !backend_env[0] || !model_kind_env ||
+        !model_kind_env[0]) {
+        std::printf("SKIP - real-model env requires MODEL/MMPROJ/BACKEND/"
+                    "MODEL_KIND/IMG/WRIST/PROMPT\n");
+        return g_fail;
     }
-    const std::string backend = backend_env ? backend_env : "cpu";
+    const std::string backend = backend_env;
+    const bool test_pi05 = std::strcmp(model_kind_env, "pi05") == 0;
+    if (!test_pi05 && std::strcmp(model_kind_env, "pi0") != 0) {
+        std::printf("FAIL: JETSONPI_PI0_MODEL_KIND must be pi0 or pi05\n");
+        return 1;
+    }
 
     int iw = 0, ih = 0, ic = 0;
     unsigned char * img = stbi_load(img_env, &iw, &ih, &ic, 3);
@@ -76,8 +98,10 @@ int main() {
     int ww = 0, wh = 0, wc = 0;
     unsigned char * wrist = stbi_load(wrist_env, &ww, &wh, &wc, 3);
     CHECK(wrist != nullptr && ww == 224 && wh == 224, "load wrist 224x224");
-    bool prompt_ok = false;
-    std::string prompt = read_file(prompt_env, &prompt_ok);
+    std::ifstream prompt_file(prompt_env, std::ios::binary);
+    std::string prompt((std::istreambuf_iterator<char>(prompt_file)),
+                       std::istreambuf_iterator<char>());
+    const bool prompt_ok = prompt_file.good() || prompt_file.eof();
     CHECK(prompt_ok && !prompt.empty(), "prompt non-empty");
     if (!prompt.empty() && prompt.back() == '\n') prompt.pop_back();
     if (!img || !wrist || !prompt_ok) {
@@ -109,14 +133,13 @@ int main() {
               JETSON_PI_PI0_OK && action_steps > 0 && action_dim > 0,
           "action_shape");
     const size_t n_elems = static_cast<size_t>(action_steps) * action_dim;
-    // PI0.5 proprioception width is 8 (openpi libero), independent of action_dim.
-    const size_t state_dim = 8;
+    const size_t state_dim = test_pi05 ? 8 : static_cast<size_t>(action_dim);
     std::printf("    action_steps=%u action_dim=%u state_dim=%zu\n",
                 action_steps, action_dim, state_dim);
 
     const uint8_t * imgs[2] = { img, wrist };
 
-    // Baseline: zero state (all bins in the -1..0 region).
+    // Baseline: an explicit full-width zero state.
     std::vector<float> zero_state(state_dim, 0.0f);
     std::vector<float> actions_zero(n_elems, 0.0f);
     size_t written = 0;
@@ -146,32 +169,80 @@ int main() {
                 max_diff, std::fabs(actions_null[i] - actions_zero[i]));
         }
         CHECK(max_diff <= 1e-5f,
-              "NULL state matches explicit PI0.5 zero state");
+              "NULL state matches explicit zero state");
     }
 
-    // ---- TEST 1: state in prompt changes actions (boundary regions) ----
-    struct Case { const char * name; float value; };
-    const Case cases[] = {
-        {"x<-1 (literal -1 token)", -2.0f},
-        {"x in (-1,0)",              -0.5f},
-        {"x in (0,1)",                0.5f},
-        {"x>=1 (bin 255)",            1.5f},
-    };
-    for (const Case & c : cases) {
-        std::vector<float> st(state_dim, c.value);
-        std::vector<float> a(n_elems, 0.0f);
+    float dummy_state = 0.0f;
+    s = jetson_pi_pi0_context(pi0, imgs, 2, prompt.data(), prompt.size(),
+                              &dummy_state, 0);
+    CHECK(s == JETSON_PI_PI0_INVALID,
+          "non-NULL state with zero count is rejected");
+    s = jetson_pi_pi0_context(pi0, imgs, 2, prompt.data(), prompt.size(),
+                              nullptr, 1);
+    CHECK(s == JETSON_PI_PI0_INVALID,
+          "NULL state with nonzero count is rejected");
+    const float nan_state = std::numeric_limits<float>::quiet_NaN();
+    s = jetson_pi_pi0_context(pi0, imgs, 2, prompt.data(), prompt.size(),
+                              &nan_state, 1);
+    CHECK(s == JETSON_PI_PI0_INVALID, "non-finite state is rejected");
+
+    if (test_pi05) {
+        struct Case { const char * name; float value; };
+        const Case cases[] = {
+            {"x<-1 (literal -1 token)", -2.0f},
+            {"x in (-1,0)",              -0.5f},
+            {"x in (0,1)",                0.5f},
+            {"x>=1 (bin 255)",            1.5f},
+        };
+        for (const Case & c : cases) {
+            std::vector<float> st(state_dim, c.value);
+            std::vector<float> a(n_elems, 0.0f);
+            written = 0;
+            s = jetson_pi_pi0_infer(pi0, imgs, 2, prompt.data(), prompt.size(),
+                                    st.data(), state_dim,
+                                    a.data(), n_elems, &written);
+            CHECK(s == JETSON_PI_PI0_OK, std::string("infer ") + c.name);
+            float max_diff = 0.0f;
+            for (size_t i = 0; i < n_elems; ++i) {
+                max_diff = std::max(
+                    max_diff, std::fabs(a[i] - actions_zero[i]));
+            }
+            std::printf("    %s: max abs diff vs zero-state = %.9g\n",
+                        c.name, max_diff);
+            CHECK(max_diff > 0.0f,
+                  std::string("state in prompt changes actions: ") + c.name);
+        }
+    } else {
+        std::vector<float> short_legacy = {0.25f};
+        std::vector<float> padded_legacy(state_dim, 0.0f);
+        padded_legacy[0] = short_legacy[0];
+        std::vector<float> actions_short(n_elems, 0.0f);
+        std::vector<float> actions_padded(n_elems, 0.0f);
         written = 0;
         s = jetson_pi_pi0_infer(pi0, imgs, 2, prompt.data(), prompt.size(),
-                                st.data(), state_dim,
-                                a.data(), n_elems, &written);
-        CHECK(s == JETSON_PI_PI0_OK, std::string("infer ") + c.name);
+                                short_legacy.data(), short_legacy.size(),
+                                actions_short.data(), n_elems, &written);
+        CHECK(s == JETSON_PI_PI0_OK && written == n_elems,
+              "legacy Pi0 accepts short state");
+        written = 0;
+        s = jetson_pi_pi0_infer(pi0, imgs, 2, prompt.data(), prompt.size(),
+                                padded_legacy.data(), padded_legacy.size(),
+                                actions_padded.data(), n_elems, &written);
+        CHECK(s == JETSON_PI_PI0_OK && written == n_elems,
+              "legacy Pi0 accepts action_dim state");
         float max_diff = 0.0f;
-        for (size_t i = 0; i < n_elems; ++i)
-            max_diff = std::max(max_diff, std::fabs(a[i] - actions_zero[i]));
-        std::printf("    %s: max abs diff vs zero-state = %.9g\n",
-                    c.name, max_diff);
-        CHECK(max_diff > 0.0f,
-              std::string("state in prompt changes actions: ") + c.name);
+        float max_state_effect = 0.0f;
+        for (size_t i = 0; i < n_elems; ++i) {
+            max_diff = std::max(
+                max_diff, std::fabs(actions_short[i] - actions_padded[i]));
+            max_state_effect = std::max(
+                max_state_effect,
+                std::fabs(actions_padded[i] - actions_zero[i]));
+        }
+        CHECK(max_diff <= 1e-5f,
+              "legacy short state matches explicit zero padding");
+        CHECK(max_state_effect > 0.0f,
+              "legacy tensor state changes actions");
     }
 
     // ---- TEST 2: context/action real split + one-shot semantics ----
@@ -224,21 +295,21 @@ int main() {
               "action consumes pending context exactly once");
     }
 
-    // ---- TEST 3: state size > 8 rejected for PI0.5 ----
+    // ---- TEST 3: state above the model-specific bound is rejected ----
     {
         std::vector<float> big(state_dim + 1, 0.0f);
         s = jetson_pi_pi0_infer(pi0, imgs, 2, prompt.data(), prompt.size(),
                                 big.data(), big.size(),
                                 actions_zero.data(), n_elems, &written);
         CHECK(s == JETSON_PI_PI0_STATE_SIZE,
-              "PI0.5 rejects state wider than proprioception (8)");
+              "state wider than the model-specific bound is rejected");
     }
 
     jetson_pi_pi0_close(pi0);
     if (img)   stbi_image_free(img);
     if (wrist) stbi_image_free(wrist);
 
-    std::printf(g_fail ? "\n== PI0.5 STATE+SPLIT FAILED ==\n"
-                       : "\n== PI0.5 STATE+SPLIT PASSED ==\n");
+    std::printf(g_fail ? "\n== PI0 STATE+SPLIT FAILED ==\n"
+                       : "\n== PI0 STATE+SPLIT PASSED ==\n");
     return g_fail;
 }

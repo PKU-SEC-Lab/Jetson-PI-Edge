@@ -231,12 +231,14 @@ if (LLAMA_BUILD_COMMON AND (LLAMA_BUILD_TOOLS OR JETSON_PI_BUILD_MTMD))
 
     # Register only when Jetson-PI-Edge is the top-level project. FlashRT
     # carries its own provider-side equivalent when embedding this tree.
-    if (BUILD_SHARED_LIBS AND CMAKE_SOURCE_DIR STREQUAL PROJECT_SOURCE_DIR)
+    if (LLAMA_BUILD_TESTS AND NOT CMAKE_JS_VERSION AND
+        CMAKE_SOURCE_DIR STREQUAL PROJECT_SOURCE_DIR)
         add_executable(test_jetson_pi_pi0_state_split
             ../tests/test_jetson_pi_pi0_state_split.cpp)
         target_link_libraries(test_jetson_pi_pi0_state_split
             PRIVATE jetson_pi_pi0)
         target_include_directories(test_jetson_pi_pi0_state_split PRIVATE
+            ${CMAKE_CURRENT_SOURCE_DIR}
             ${CMAKE_CURRENT_SOURCE_DIR}/../vendor)
         add_test(NAME jetson_pi_pi0_state_split
             COMMAND test_jetson_pi_pi0_state_split)

@@ -13,8 +13,8 @@
 #include "mtmd.h"
 #include "mtmd-helper.h"
 #include "pi-model-detect.h"
+#include "jetson_pi_pi0_prompt.h"
 
-#include <algorithm>
 #include <atomic>
 #include <cmath>
 #include <cstring>
@@ -84,45 +84,6 @@ struct PiModelKindScope {
         pi_model_set_thread_override(previous);
     }
 };
-
-// PI0.5 consumes proprioceptive state as discretized text inside the
-// `Task: ..., State: ...;\nAction:` prompt (the policy's language input), NOT
-// as the legacy llama_set_pi0_state tensor (which the PI0.5 graph never
-// reads). This mirrors the foreground server's build_pi05_openpi_prompt()
-// exactly so the narrow C API and the server produce the same token stream.
-//
-// The caller is responsible for passing state already normalized into the
-// [-1, 1] range the openpi policy was trained on (matching the server, which
-// bins pi0_req.state directly without re-normalizing). At most the first 8
-// values are emitted (openpi proprioception cap); extras are ignored.
-std::string build_pi05_openpi_prompt(const std::string & raw_text,
-                                     const float * state, size_t n_state) {
-    std::string out;
-    out.reserve(raw_text.size() + 64);
-    out += "Task: ";
-    out += raw_text;
-    out += ", State: ";
-
-    const size_t n_for_text = state ? std::min<size_t>(8, n_state) : 8;
-    for (size_t i = 0; i < n_for_text; ++i) {
-        const float x = state ? state[i] : 0.0f;
-        int bin;
-        if (x < -1.0f) {
-            bin = -1;  // literal -1 token, distinct from bin 0
-        } else if (x >= 1.0f) {
-            bin = 255;
-        } else {
-            bin = static_cast<int>(std::floor((x + 1.0f) * 128.0f));
-            if (bin < 0) bin = 0;
-            if (bin > 255) bin = 255;
-        }
-        if (i > 0) out += ' ';
-        out += std::to_string(bin);
-    }
-
-    out += ";\nAction: ";
-    return out;
-}
 
 } // namespace
 
@@ -374,11 +335,21 @@ int32_t jetson_pi_pi0_context(jetson_pi_pi0 * handle,
     // requires exactly action_dim values (zero-padded when shorter).
     const bool is_pi05 = (e->model_kind == PI_MODEL_PI05);
     const size_t state_dim = is_pi05 ? 8 : static_cast<size_t>(e->action_dim);
-    if (state && n_state > state_dim) {
+    if ((!state && n_state != 0) || (state && n_state == 0)) {
+        return reject(e, JETSON_PI_PI0_INVALID,
+                      "state pointer and n_state are inconsistent");
+    }
+    if (n_state > state_dim) {
         return reject(e, JETSON_PI_PI0_STATE_SIZE,
                       is_pi05
                           ? "state has more values than the PI0.5 proprioception width (8)"
                           : "state has more values than the model action_dim");
+    }
+    for (size_t i = 0; i < n_state; ++i) {
+        if (!std::isfinite(state[i])) {
+            return reject(e, JETSON_PI_PI0_INVALID,
+                          "state values must be finite");
+        }
     }
 
     // Reset to a fresh first-turn tick: clear KV cache + position.
@@ -433,8 +404,11 @@ int32_t jetson_pi_pi0_context(jetson_pi_pi0 * handle,
     // server. Legacy Pi0 uses the raw prompt (state is a tensor, above).
     std::string prompt_text;
     if (is_pi05) {
-        prompt_text = build_pi05_openpi_prompt(
-            std::string(prompt, prompt_len), state, n_state);
+        const float zero_state[8] = {};
+        const float * prompt_state = state ? state : zero_state;
+        const size_t prompt_state_size = state ? n_state : 8;
+        prompt_text = jetson_pi_pi0_detail::format_pi05_openpi_prompt(
+            std::string(prompt, prompt_len), prompt_state, prompt_state_size);
     } else {
         prompt_text.assign(prompt, prompt_len);
     }
