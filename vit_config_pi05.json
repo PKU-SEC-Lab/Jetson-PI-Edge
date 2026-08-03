@@ -24,7 +24,7 @@
     "patch_size": 14,
     "image_size": 224,
     "layer_norm_eps": 1e-6,
-    "hidden_act": "gelu_pytorch_tanh",
+    "hidden_act": "gelu",
     "projection_dim": 2048
   }
 }
