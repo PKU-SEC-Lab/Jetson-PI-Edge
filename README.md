@@ -32,7 +32,7 @@
 ## News
 
 - **[2026/07] Python foreground API is available.** A NumPy client can start and manage `llama-server`, reuse a persistent foreground session, and return PI0/PI0.5 action chunks directly to Python.
-- **[2026/08] Pre-converted GGUF checkpoints are available.** Ready-to-use PI0 and PI0.5 model and vision GGUF files are released on [Hugging Face](https://huggingface.co/diantoudefengshan/Jetson-PI-GGUF).
+- **[2026/07] Pre-converted GGUF checkpoints are available.** Ready-to-use PI0 and PI0.5 model and vision GGUF files are released on [Hugging Face](https://huggingface.co/diantoudefengshan/Jetson-PI-GGUF).
 - **[2026/07] Jetson-PI is open source.** We released the [Jetson-PI asynchronous control framework](https://github.com/PKU-SEC-Lab/Jetson-PI) and this [Jetson-PI-Edge inference engine](https://github.com/PKU-SEC-Lab/Jetson-PI-Edge).
 
 ## About
