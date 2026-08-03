@@ -89,6 +89,10 @@ struct PiModelKindScope {
 
 extern "C" {
 
+uint32_t jetson_pi_pi0_capabilities(void) {
+    return JETSON_PI_PI0_CAP_REAL_CONTEXT_ACTION;
+}
+
 int32_t jetson_pi_pi0_open(const jetson_pi_pi0_config * config,
                            jetson_pi_pi0 ** out) {
     g_open_error.clear();
@@ -102,7 +106,8 @@ int32_t jetson_pi_pi0_open(const jetson_pi_pi0_config * config,
         !config->model_path || !config->model_path[0] ||
         !config->mmproj_path || !config->mmproj_path[0] ||
         !config->backend || !config->backend[0] ||
-        !config->n_views || !config->image_height || !config->image_width ||
+        !config->n_views || config->n_views > 3 ||
+        !config->image_height || !config->image_width ||
         static_cast<size_t>(config->image_width) >
             std::numeric_limits<size_t>::max() /
             static_cast<size_t>(config->image_height) / 3u) {

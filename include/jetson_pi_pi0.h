@@ -33,6 +33,16 @@ extern "C" {
 
 typedef struct jetson_pi_pi0 jetson_pi_pi0;
 
+// Source and runtime feature contracts consumed by embedding adapters. A host
+// built with this header must also query the loaded DSO before publishing the
+// capability; the runtime query prevents a newer header from silently pairing
+// with an older libjetson_pi_pi0.so that has the same SONAME.
+#define JETSON_PI_PI0_HAS_REAL_CONTEXT_ACTION 1
+#define JETSON_PI_PI0_HAS_CAPABILITIES_API 1
+#define JETSON_PI_PI0_CAP_REAL_CONTEXT_ACTION UINT32_C(1)
+
+uint32_t jetson_pi_pi0_capabilities(void);
+
 typedef struct jetson_pi_pi0_config {
     uint32_t struct_size;
 
@@ -40,7 +50,7 @@ typedef struct jetson_pi_pi0_config {
     const char * mmproj_path;  /* VIT mmproj GGUF                              */
     const char * backend;      /* "cpu" | "cuda" | "vulkan" | "opencl" | "sycl" */
 
-    uint32_t n_views;          /* camera views per tick (images per infer)     */
+    uint32_t n_views;          /* camera views per tick, in [1, 3]             */
     uint32_t image_height;     /* pixels, e.g. 224                             */
     uint32_t image_width;      /* pixels, e.g. 224                             */
 
