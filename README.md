@@ -13,6 +13,7 @@
   <p>
     <a href="https://arxiv.org/abs/2607.12659"><img src="https://img.shields.io/badge/arXiv-2607.12659-b31b1b.svg" alt="arXiv" /></a>
     <a href="https://github.com/PKU-SEC-Lab/Jetson-PI"><img src="https://img.shields.io/badge/Jetson--PI-Algorithm-35b8a9.svg" alt="Jetson-PI algorithm" /></a>
+    <a href="https://huggingface.co/diantoudefengshan/Jetson-PI-GGUF"><img src="https://img.shields.io/badge/Model-GGUF-f5c542.svg" alt="GGUF checkpoints" /></a>
     <a href="https://github.com/ggml-org/llama.cpp"><img src="https://img.shields.io/badge/Based_on-llama.cpp-3578c8.svg" alt="Based on llama.cpp" /></a>
     <a href="https://github.com/flashrt-project/FlashRT"><img src="https://img.shields.io/badge/Support-FlashRT-f28c45.svg" alt="Support FlashRT" /></a>
   </p>
@@ -33,6 +34,7 @@
 
 - **[2026/07] Python APIs are available.** Use the managed foreground NumPy client for persistent `llama-server` sessions or the optional pybind11 module for in-process PI0/PI0.5 action inference.
 - **[2026/07] FlashRT support is available.** Jetson-PI is exposed as a FlashRT-loadable provider through a C API, allowing [FlashRT](https://github.com/flashrt-project/FlashRT) to invoke the same PI0/PI0.5 model path directly from Python without starting the foreground HTTP server.
+- **[2026/08] Pre-converted GGUF checkpoints are available.** Ready-to-use PI0 and PI0.5 model and vision GGUF files are released on [Hugging Face](https://huggingface.co/diantoudefengshan/Jetson-PI-GGUF).
 - **[2026/07] Jetson-PI is open source.** We released the [Jetson-PI asynchronous control framework](https://github.com/PKU-SEC-Lab/Jetson-PI) and this [Jetson-PI-Edge inference engine](https://github.com/PKU-SEC-Lab/Jetson-PI-Edge).
 
 ## About
