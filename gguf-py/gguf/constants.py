@@ -105,6 +105,11 @@ class Keys:
         CONTEXT_LENGTH                    = "{arch}.context_length"
         EMBEDDING_LENGTH                  = "{arch}.embedding_length"
         EMBEDDING_LENGTH_OUT              = "{arch}.embedding_length_out"
+        EMBEDDING_LENGTH_AE               = "{arch}.embedding_length_ae"
+        INFERENCE_STEPS                   = "{arch}.num_inference_steps"
+        ACTION_STEPS                      = "{arch}.n_action_steps"
+        ACTION_DIM                        = "{arch}.max_action_dim"
+        FEED_FORWARD_LENGTH_AE            = "{arch}.intermediate_size_ae"
         FEATURES_LENGTH                   = "{arch}.features_length"
         BLOCK_COUNT                       = "{arch}.block_count"
         LEADING_DENSE_BLOCK_COUNT         = "{arch}.leading_dense_block_count"
@@ -452,6 +457,7 @@ class MODEL_ARCH(IntEnum):
     MINICPM          = auto()
     MINICPM3         = auto()
     GEMMA            = auto()
+    PI0              = auto()
     GEMMA2           = auto()
     GEMMA3           = auto()
     GEMMA3N          = auto()
@@ -550,12 +556,23 @@ class VISION_PROJECTOR_TYPE(IntEnum):
     MERGER    = auto()
     GEMMA3N   = auto()
     GEMMA3    = auto()
+    PI0       = auto()
     QWEN3VL   = auto()
     STEP3VL   = auto()
     COGVLM    = auto()
 
 
 class MODEL_TENSOR(IntEnum):
+    ACTION_IN            = auto()
+    ACTION_OUT           = auto()
+    ACTION_TIME_IN       = auto()
+    ACTION_TIME_OUT      = auto()
+    STATE_PROJ           = auto()
+    TIME_MLP_IN          = auto()
+    TIME_MLP_OUT         = auto()
+    AE_OUTPUT_NORM_DENSE = auto()
+    ATTN_NORM_DENSE      = auto()
+    FFN_NORM_DENSE       = auto()
     TOKEN_EMBD           = auto()
     TOKEN_EMBD_NORM      = auto()
     MASKED_EMBD_CENTROIDS= auto()
@@ -1032,6 +1049,7 @@ MODEL_ARCH_NAMES: dict[MODEL_ARCH, str] = {
     MODEL_ARCH.MINICPM:          "minicpm",
     MODEL_ARCH.MINICPM3:         "minicpm3",
     MODEL_ARCH.GEMMA:            "gemma",
+    MODEL_ARCH.PI0:              "pi0",
     MODEL_ARCH.GEMMA2:           "gemma2",
     MODEL_ARCH.GEMMA3:           "gemma3",
     MODEL_ARCH.GEMMA3N:          "gemma3n",
@@ -1130,11 +1148,22 @@ VISION_PROJECTOR_TYPE_NAMES: dict[VISION_PROJECTOR_TYPE, str] = {
     VISION_PROJECTOR_TYPE.GLM_EDGE:  "adapter",
     VISION_PROJECTOR_TYPE.MERGER:    "qwen2vl_merger",
     VISION_PROJECTOR_TYPE.GEMMA3:    "gemma3",
+    VISION_PROJECTOR_TYPE.PI0:       "pi0",
     VISION_PROJECTOR_TYPE.QWEN3VL:   "qwen3vl_merger",
     VISION_PROJECTOR_TYPE.STEP3VL:   "step3vl",
 }
 
 TENSOR_NAMES: dict[MODEL_TENSOR, str] = {
+    MODEL_TENSOR.ACTION_IN:                 "action_in_proj",
+    MODEL_TENSOR.ACTION_OUT:                "action_out_proj",
+    MODEL_TENSOR.ACTION_TIME_IN:            "action_time_mlp_in",
+    MODEL_TENSOR.ACTION_TIME_OUT:           "action_time_mlp_out",
+    MODEL_TENSOR.STATE_PROJ:                "state_proj",
+    MODEL_TENSOR.TIME_MLP_IN:               "time_mlp_in",
+    MODEL_TENSOR.TIME_MLP_OUT:              "time_mlp_out",
+    MODEL_TENSOR.AE_OUTPUT_NORM_DENSE:      "ae_output_norm_dense",
+    MODEL_TENSOR.ATTN_NORM_DENSE:           "blk.{bid}.attn_norm_dense",
+    MODEL_TENSOR.FFN_NORM_DENSE:            "blk.{bid}.ffn_norm_dense",
     MODEL_TENSOR.TOKEN_EMBD:                "token_embd",
     MODEL_TENSOR.TOKEN_EMBD_NORM:           "token_embd_norm",
     MODEL_TENSOR.TOKEN_TYPES:               "token_types",
@@ -2557,6 +2586,29 @@ MODEL_TENSORS: dict[MODEL_ARCH, list[MODEL_TENSOR]] = {
         MODEL_TENSOR.FFN_DOWN,
         MODEL_TENSOR.FFN_UP,
         MODEL_TENSOR.FFN_NORM,
+    ],
+    MODEL_ARCH.PI0: [
+        MODEL_TENSOR.TOKEN_EMBD,
+        MODEL_TENSOR.OUTPUT_NORM,
+        MODEL_TENSOR.ATTN_NORM,
+        MODEL_TENSOR.ATTN_NORM_DENSE,
+        MODEL_TENSOR.ATTN_Q,
+        MODEL_TENSOR.ATTN_K,
+        MODEL_TENSOR.ATTN_V,
+        MODEL_TENSOR.ATTN_OUT,
+        MODEL_TENSOR.FFN_GATE,
+        MODEL_TENSOR.FFN_DOWN,
+        MODEL_TENSOR.FFN_UP,
+        MODEL_TENSOR.FFN_NORM,
+        MODEL_TENSOR.FFN_NORM_DENSE,
+        MODEL_TENSOR.ACTION_IN,
+        MODEL_TENSOR.ACTION_OUT,
+        MODEL_TENSOR.ACTION_TIME_IN,
+        MODEL_TENSOR.ACTION_TIME_OUT,
+        MODEL_TENSOR.STATE_PROJ,
+        MODEL_TENSOR.TIME_MLP_IN,
+        MODEL_TENSOR.TIME_MLP_OUT,
+        MODEL_TENSOR.AE_OUTPUT_NORM_DENSE,
     ],
     MODEL_ARCH.GEMMA2: [
         MODEL_TENSOR.TOKEN_EMBD,

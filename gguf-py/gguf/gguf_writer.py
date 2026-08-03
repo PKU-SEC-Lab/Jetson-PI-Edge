@@ -688,6 +688,18 @@ class GGUFWriter:
     def add_embedding_length_out(self, length: int) -> None:
         self.add_uint32(Keys.LLM.EMBEDDING_LENGTH_OUT.format(arch=self.arch), length)
 
+    def add_embedding_length_ae(self, length: int) -> None:
+        self.add_uint32(Keys.LLM.EMBEDDING_LENGTH_AE.format(arch=self.arch), length)
+
+    def add_inference_steps(self, length: int) -> None:
+        self.add_uint32(Keys.LLM.INFERENCE_STEPS.format(arch=self.arch), length)
+
+    def add_n_action_steps(self, length: int) -> None:
+        self.add_uint32(Keys.LLM.ACTION_STEPS.format(arch=self.arch), length)
+
+    def add_n_action_dim(self, length: int) -> None:
+        self.add_uint32(Keys.LLM.ACTION_DIM.format(arch=self.arch), length)
+
     def add_features_length(self, length: int) -> None:
         self.add_uint32(Keys.LLM.FEATURES_LENGTH.format(arch=self.arch), length)
 
@@ -723,6 +735,12 @@ class GGUFWriter:
             self.add_uint32(Keys.LLM.FEED_FORWARD_LENGTH.format(arch=self.arch), length)
         else:
             self.add_array(Keys.LLM.FEED_FORWARD_LENGTH.format(arch=self.arch), length)
+
+    def add_feed_forward_length_ae(self, length: int | Sequence[int]) -> None:
+        if isinstance(length, int):
+            self.add_uint32(Keys.LLM.FEED_FORWARD_LENGTH_AE.format(arch=self.arch), length)
+        else:
+            self.add_array(Keys.LLM.FEED_FORWARD_LENGTH_AE.format(arch=self.arch), length)
 
     def add_expert_feed_forward_length(self, length: int) -> None:
         self.add_uint32(Keys.LLM.EXPERT_FEED_FORWARD_LENGTH.format(arch=self.arch), length)
