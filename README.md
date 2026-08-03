@@ -134,7 +134,7 @@ The runtime expects two matching files:
 - a PI language/action model in GGUF format;
 - a SigLIP vision encoder/projector in GGUF format.
 
-Follow [Model Preparation](docs/model_conversion.md) to download, split, and convert a PI0 or PI0.5 checkpoint.
+Convert a PI0 or PI0.5 checkpoint by following [Model Preparation](https://github.com/PKU-SEC-Lab/Jetson-PI-Edge/blob/master/docs/model_conversion.md), or download the ready-to-use GGUF checkpoints directly from [Hugging Face](https://huggingface.co/diantoudefengshan/Jetson-PI-GGUF).
 
 ### 3. Start the foreground server
 
