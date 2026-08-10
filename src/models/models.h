@@ -587,6 +587,20 @@ struct llama_model_qwen3vlmoe : public llama_model_base {
     std::unique_ptr<llm_graph_context> build_arch_graph(const llm_graph_params & params) const override;
 };
 
+struct llama_model_gr00t_n1d7 : public llama_model_base {
+    llama_model_gr00t_n1d7(const struct llama_model_params & params) : llama_model_base(params) {}
+    void load_arch_hparams(llama_model_loader & ml) override;
+    void load_arch_tensors(llama_model_loader & ml) override;
+    std::unique_ptr<llm_graph_context> build_arch_graph(const llm_graph_params & params) const override;
+
+    struct action_graph : public llm_graph_context {
+        action_graph(const llama_model_gr00t_n1d7 & model, const llm_graph_params & params);
+    };
+
+    // Kept in deterministic load order; the action graph will replace this with typed views.
+    std::vector<ggml_tensor *> action_tensors;
+};
+
 
 struct llama_model_phi2 : public llama_model_base {
     llama_model_phi2(const struct llama_model_params & params) : llama_model_base(params) {}

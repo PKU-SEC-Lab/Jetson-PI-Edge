@@ -298,6 +298,7 @@ struct mtmd_context {
 
     // batching
     int32_t batch_max_tokens;
+    bool disable_temporal_merge = false;
 
     // TODO @ngxson : add timings
 
@@ -321,6 +322,11 @@ struct mtmd_context {
         }
 
         if (text_model) {
+            char architecture[64] = {};
+            if (llama_model_meta_val_str(text_model, "general.architecture",
+                        architecture, sizeof(architecture)) > 0) {
+                disable_temporal_merge = std::strcmp(architecture, "gr00t-n1d7") == 0;
+            }
             auto decoder_rope_type = llama_model_rope_type(text_model);
             switch (decoder_rope_type) {
                 case LLAMA_ROPE_TYPE_NONE:
@@ -934,6 +940,7 @@ struct mtmd_tokenizer {
         int n_merge_frames = 1;
         if (ctx->ctx_v) {
             n_merge_frames = clip_model_n_temporal_merge(ctx->ctx_v);
+            if (ctx->disable_temporal_merge) n_merge_frames = 1;
             GGML_ASSERT(n_merge_frames <= 2 && "we only support merging maximum 2 images for now; open an issue if this model supports merging more");
         }
 

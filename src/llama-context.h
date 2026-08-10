@@ -127,6 +127,14 @@ struct llama_context {
     const float * get_pi0_action() const;
     int32_t get_pi0_action_dim() const;
     int32_t get_pi0_action_steps() const;
+    const float * get_gr00t_action_input() const;
+    const float * get_gr00t_action() const;
+    int32_t get_gr00t_state_dim() const;
+    int32_t get_gr00t_action_dim() const;
+    int32_t get_gr00t_action_steps() const;
+    bool set_gr00t_embodiment(int32_t embodiment_id);
+    int generate_gr00t_action();
+    void set_gr00t_image_mask(std::vector<uint8_t> image_mask);
 
     void set_adapters_lora(llama_adapter_lora ** adapters, size_t n_adapters, float * scales);
 

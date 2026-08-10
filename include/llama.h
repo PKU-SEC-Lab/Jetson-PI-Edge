@@ -1059,6 +1059,24 @@ extern "C" {
     LLAMA_API int32_t llama_get_pi0_action_steps(struct llama_context * ctx);
     LLAMA_API void llama_set_pi0_state(struct llama_context * ctx, const float * state_array, size_t size);
 
+    // GR00T N1.7 action interface. The returned action is laid out as
+    // [action_steps, action_dim] and remains owned by the context.
+    LLAMA_API const float * llama_get_gr00t_action_input(struct llama_context * ctx);
+    LLAMA_API const float * llama_get_gr00t_action(struct llama_context * ctx);
+    LLAMA_API int32_t llama_get_gr00t_state_dim(struct llama_context * ctx);
+    LLAMA_API int32_t llama_get_gr00t_action_dim(struct llama_context * ctx);
+    LLAMA_API int32_t llama_get_gr00t_action_steps(struct llama_context * ctx);
+    LLAMA_API void llama_set_gr00t_state(struct llama_context * ctx, const float * state_array, size_t size);
+    LLAMA_API bool llama_set_gr00t_embodiment(struct llama_context * ctx, int32_t embodiment_id);
+    LLAMA_API int32_t llama_gr00t_generate_action(struct llama_context * ctx);
+    LLAMA_API int32_t llama_gr00t_decode_multimodal(
+            struct llama_context * ctx,
+            const llama_token * tokens,
+            const float * image_embd,
+            const uint8_t * image_mask,
+            const llama_pos * mrope_pos,
+            int32_t n_tokens);
+
     //
     // backend sampling API [EXPERIMENTAL]
     // note: use only if the llama_context was created with at least one llama_sampler_seq_config
