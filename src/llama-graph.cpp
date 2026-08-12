@@ -463,6 +463,55 @@ bool llm_graph_input_sinusoidal_embedding::can_reuse(const llm_graph_params & pa
     return cross == nullptr || cross->pi0_decode_unroll > 0;
 }
 
+void llm_graph_input_gr00t_dit_time::set_input(const llama_ubatch * ubatch) {
+    GGML_UNUSED(ubatch);
+    constexpr int64_t width = 256;
+    const int64_t offset = (int64_t) cross->time_step_index * width;
+    GGML_ASSERT(offset >= 0);
+    GGML_ASSERT((size_t) (offset + width) <= cross->gr00t_dit_time_embeddings.size());
+    ggml_backend_tensor_set(time, cross->gr00t_dit_time_embeddings.data() + offset,
+            0, width * ggml_element_size(time));
+}
+
+bool llm_graph_input_gr00t_dit_time::can_reuse(const llm_graph_params & params) {
+    GGML_UNUSED(params);
+    return time != nullptr && ggml_nelements(time) == 256;
+}
+
+void llm_graph_input_gr00t_vl_mask::set_input(const llama_ubatch * ubatch) {
+    GGML_UNUSED(ubatch);
+    const int64_t n_vl = mask->ne[0];
+    const int64_t n_sa = mask->ne[1];
+    std::vector<float> values((size_t) n_vl * (size_t) n_sa, 0.0f);
+    if (cross->gr00t_token_masks_valid) {
+        GGML_ASSERT((int64_t) cross->gr00t_image_mask.size() == n_vl);
+        for (int64_t q = 0; q < n_sa; ++q) {
+            for (int64_t k = 0; k < n_vl; ++k) {
+                const bool is_image = cross->gr00t_image_mask[(size_t) k] != 0;
+                if (is_image != attend_image) {
+                    values[(size_t) q * (size_t) n_vl + (size_t) k] = -INFINITY;
+                }
+            }
+        }
+    }
+    if (mask->type == GGML_TYPE_F16) {
+        std::vector<ggml_fp16_t> values_f16(values.size());
+        for (size_t i = 0; i < values.size(); ++i) {
+            values_f16[i] = ggml_fp32_to_fp16(values[i]);
+        }
+        ggml_backend_tensor_set(mask, values_f16.data(), 0, ggml_nbytes(mask));
+    } else {
+        GGML_ASSERT(mask->type == GGML_TYPE_F32);
+        ggml_backend_tensor_set(mask, values.data(), 0, ggml_nbytes(mask));
+    }
+}
+
+bool llm_graph_input_gr00t_vl_mask::can_reuse(const llm_graph_params & params) {
+    GGML_UNUSED(params);
+    return mask != nullptr && cross != nullptr &&
+        mask->ne[0] == cross->n_enc && mask->ne[1] == 1 + params.hparams.action_steps;
+}
+
 void llm_graph_input_pos_ae::set_input(const llama_ubatch * ubatch) {
     const bool use_legacy_pi0_pos = pi_model_kind_is_pi0(pi_model_kind_from_env());
     const int64_t prefix_offset = use_legacy_pi0_pos
@@ -3094,6 +3143,26 @@ ggml_tensor * llm_graph_context::build_inp_sinusoidal_embedding(int32_t time_ste
 
     res->add_input(std::move(inp));
 
+    return cur;
+}
+
+ggml_tensor * llm_graph_context::build_inp_gr00t_dit_time() const {
+    auto inp = std::make_unique<llm_graph_input_gr00t_dit_time>(cross);
+    auto & cur = inp->time;
+    cur = ggml_new_tensor_2d(ctx0, GGML_TYPE_F32, 256, 1);
+    ggml_set_input(cur);
+    res->add_input(std::move(inp));
+    return cur;
+}
+
+ggml_tensor * llm_graph_context::build_inp_gr00t_vl_mask(bool attend_image) const {
+    auto inp = std::make_unique<llm_graph_input_gr00t_vl_mask>(cross, attend_image);
+    auto & cur = inp->mask;
+    cur = ggml_new_tensor_4d(ctx0,
+            cparams.flash_attn ? GGML_TYPE_F16 : GGML_TYPE_F32,
+            cross->n_enc, 1 + hparams.action_steps, 1, 1);
+    ggml_set_input(cur);
+    res->add_input(std::move(inp));
     return cur;
 }
 

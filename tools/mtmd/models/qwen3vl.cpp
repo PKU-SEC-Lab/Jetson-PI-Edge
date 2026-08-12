@@ -37,7 +37,21 @@ ggml_cgraph * clip_graph_qwen3vl::build() {
     }
 
     // calculate absolute position embedding and apply
-    ggml_tensor * learned_pos_embd = resize_position_embeddings();
+    // Qwen3-VL uses an endpoint-aligned linspace followed by an explicit
+    // four-corner bilinear gather. This is not equivalent to ggml_interpolate's
+    // coordinate convention, especially for rectangular grids.
+    ggml_tensor * learned_pos_embd = nullptr;
+    for (int corner = 0; corner < 4; ++corner) {
+        ggml_tensor * indices = ggml_new_tensor_1d(ctx0, GGML_TYPE_I32, n_patches);
+        ggml_tensor * weights = ggml_new_tensor_2d(ctx0, GGML_TYPE_F32, 1, n_patches);
+        ggml_set_name(indices, ("qwen3_pos_idx_" + std::to_string(corner)).c_str());
+        ggml_set_name(weights, ("qwen3_pos_weight_" + std::to_string(corner)).c_str());
+        ggml_set_input(indices);
+        ggml_set_input(weights);
+        ggml_tensor * part = ggml_get_rows(ctx0, model.position_embeddings, indices);
+        part = ggml_mul(ctx0, part, weights);
+        learned_pos_embd = learned_pos_embd ? ggml_add(ctx0, learned_pos_embd, part) : part;
+    }
     learned_pos_embd = ggml_cont_4d(
         ctx0, learned_pos_embd,
         n_embd * 2, n_patches_x / 2, n_patches_y, batch_size);

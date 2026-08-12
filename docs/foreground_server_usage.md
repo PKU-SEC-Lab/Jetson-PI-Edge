@@ -1,6 +1,9 @@
 # Foreground Server Usage
 
-The foreground server exposes a persistent HTTP session for PI0 and PI0.5 robot action inference. Inputs are submitted in stages: images first, then robot state, then instruction text. The final `/foreground/infer` request consumes the pending inputs and returns action tensors plus timing information.
+The foreground server exposes a persistent HTTP session for PI0, PI0.5, and
+GR00T N1.7 robot action inference. Inputs are submitted in stages: images first,
+then robot state, then instruction text. The final `/foreground/infer` request
+consumes the pending inputs and returns action tensors plus timing information.
 
 ## Session Model
 
@@ -10,9 +13,12 @@ The server keeps a foreground session with:
 - `pending_bitmaps`: images waiting to be consumed.
 - `history_size`: foreground conversation history length.
 - `n_past`: current context position.
-- `state_flag`: whether a PI state vector has been loaded.
+- `state_flag`: whether a robot state vector has been loaded.
 
-After a successful `/foreground/infer` call, pending images and pending text are consumed. The foreground history and `n_past` remain until `/foreground/reset` is called.
+After a successful PI `/foreground/infer` call, pending images and pending text
+are consumed while foreground history and `n_past` remain until reset. GR00T
+also consumes the pending images and text, but starts each policy tick from a
+fresh model context and does not retain conversation history.
 
 ## Start The Server
 
@@ -28,6 +34,18 @@ PI0_ACTION_NOISE_BIN=/path/to/noise.bin \
 ```
 
 `PI_MODEL=auto` reads GGUF metadata and PI tensor names. Use `PI_MODEL=pi0` or `PI_MODEL=pi05` when you want to force a specific branch.
+
+For GR00T, pass the `gr00t-n1d7` main GGUF and its matching mmproj without
+setting `PI_MODEL`. The server detects GR00T from `general.architecture`:
+
+```bash
+./build/bin/llama-server \
+  -m /path/to/gr00t-n1d7.gguf \
+  --mmproj /path/to/mmproj-gr00t-n1d7.gguf \
+  -ngl 99 \
+  --host 0.0.0.0 \
+  --port 8080
+```
 
 ## Minimal End-To-End Example
 
@@ -57,6 +75,17 @@ curl -X PUT http://127.0.0.1:8080/foreground/state \
   -d '{"state":"1.8731,-1.0370,1.9652,7.0876,0.2546,-9.1432,-0.0147,-0.5037,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0"}'
 ```
 
+For GR00T, submit a JSON number array and the checkpoint embodiment ID instead:
+
+```bash
+curl -X PUT http://127.0.0.1:8080/foreground/state \
+  -H 'Content-Type: application/json' \
+  -d '{"state":[0.0,0.0,0.0],"embodiment_id":24}'
+```
+
+Short GR00T state arrays are zero-padded to the state width stored in the main
+GGUF. Arrays wider than that value are rejected.
+
 Run inference:
 
 ```bash
@@ -84,7 +113,8 @@ Typical fields:
 - `history_size`
 - `n_past`
 - `state_flag`
-- `pi_model`
+- `model_family`
+- `embodiment_id` for GR00T
 
 ### `POST /foreground/image`
 
@@ -112,7 +142,18 @@ Request:
 }
 ```
 
-The state string is parsed as comma-separated floats and passed into the PI context with `llama_set_pi0_state`.
+For PI0 and PI0.5, `state` is a non-empty comma-separated string. It is parsed
+as floats and passed into the PI context with `llama_set_pi0_state`.
+
+For GR00T, `state` is a JSON number array and `embodiment_id` is a required
+non-negative integer within the embodiment range stored in the model metadata:
+
+```json
+{
+  "state": [0.0, 0.0, 0.0],
+  "embodiment_id": 24
+}
+```
 
 ### `POST /foreground/infer`
 
@@ -126,7 +167,8 @@ Request:
 }
 ```
 
-For non-PI paths, `n_predict` may also be supplied. For PI action models, the response is action-oriented and does not depend on token generation length.
+For non-action paths, `n_predict` may also be supplied. PI and GR00T responses
+are action-oriented and do not depend on token generation length.
 
 ### `POST /foreground/reset`
 
@@ -137,7 +179,7 @@ Clears the foreground session:
 - foreground history
 - context position
 - `state_flag`
-- cached PI result buffers
+- cached PI or GR00T result buffers
 
 ## PI Response Fields
 
@@ -149,13 +191,32 @@ Clears the foreground session:
 - `n_past`: context position after inference.
 - `history_size`: foreground history length.
 - `state`: state vector used or returned by the PI path.
-- `action`: flattened internal action buffer.
-- `action_final`: final flattened action output.
+- `action`: internal action rows shaped `[action_steps, action_dim]`.
+- `action_final`: final action rows shaped `[action_steps, action_dim]`.
+- `action_final_raw`: final normalized action rows before optional PI0.5
+  quantile unnormalization.
 - `encode_ms`: encode latency.
 - `decode_ms`: action expert latency.
 - `total_ms`: model-side total latency.
 - `batch_build_ms`, `output_extract_ms`, `batch_free_ms`: lower-level runtime timing fields.
 - `timing_breakdown_ms`: HTTP handler and evaluation timing details.
+
+## GR00T Response Fields
+
+For GR00T, `POST /foreground/infer` returns:
+
+- `model_family`: `gr00t-n1d7`.
+- `is_action_model`: `true`.
+- `action_normalized`: `true`; the output remains in checkpoint-normalized space.
+- `action_final`: action rows shaped `[action_steps, action_dim]`.
+- `action_final_raw`: the same normalized action rows.
+- `action_steps` and `action_dim`: the action shape read from the model.
+- `state`: the padded state vector used for inference.
+- `embodiment_id`: the selected checkpoint embodiment.
+- `n_images`: number of images consumed in the policy tick.
+- `n_past`: multimodal prefix position after evaluation.
+- `timing_breakdown_ms`: preprocessing, tokenization, model, Action Head, and
+  HTTP handler timing details.
 
 ## Operational Notes
 
@@ -163,5 +224,8 @@ Clears the foreground session:
 - Pending images are consumed after a successful inference request.
 - Submit new images before each new foreground inference round.
 - PI0 and PI0.5 support up to three foreground images in the current action path.
+- GR00T requires at least one RGB image; upload order must match the
+  checkpoint's camera/time convention.
+- GR00T requires both state and `embodiment_id` before inference.
 - `state_flag` remains set until `/foreground/reset`.
 - If auto detection is not desired, set `PI_MODEL=pi0` or `PI_MODEL=pi05` explicitly.

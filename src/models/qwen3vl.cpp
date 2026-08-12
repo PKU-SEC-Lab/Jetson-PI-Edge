@@ -52,6 +52,7 @@ std::unique_ptr<llm_graph_context> llama_model_qwen3vl::build_arch_graph(const l
 }
 
 llama_model_qwen3vl::graph::graph(const llama_model & model, const llm_graph_params & params) : llm_graph_context(params) {
+    const bool return_full_hidden_states = model.arch == LLM_ARCH_GR00T_N1D7;
     const size_t n_deepstack_layers = hparams.n_deepstack_layers;
 
     const int64_t n_embd      = hparams.n_embd;
@@ -73,7 +74,10 @@ llama_model_qwen3vl::graph::graph(const llama_model & model, const llm_graph_par
 
     auto * inp_attn = build_attn_inp_kv();
 
-    ggml_tensor * inp_out_ids = build_inp_out_ids();
+    // GR00T cross-attention consumes every vision/language token.  The normal
+    // generation graph may gather only requested logit positions at the last
+    // layer, which would irreversibly discard most of this sequence.
+    ggml_tensor * inp_out_ids = return_full_hidden_states ? nullptr : build_inp_out_ids();
 
     for (int il = 0; il < n_layer; ++il) {
         ggml_tensor * inpSA = inpL;
@@ -154,6 +158,7 @@ llama_model_qwen3vl::graph::graph(const llama_model & model, const llm_graph_par
         inpL = cur;
     }
 
+    ggml_tensor * gr00t_hidden_states = return_full_hidden_states ? inpL : nullptr;
     cur = inpL;
 
     cur = build_norm(cur,
@@ -161,7 +166,19 @@ llama_model_qwen3vl::graph::graph(const llama_model & model, const llm_graph_par
             LLM_NORM_RMS, -1);
 
     cb(cur, "result_norm", -1);
-    res->t_embd = cur;
+    // Hugging Face's outputs.hidden_states[-1], consumed by GR00T, is the
+    // final decoder-block output before the language model's terminal RMSNorm.
+    // Keep the normalized value for logits but expose the exact pre-norm node
+    // to the Action Head. Materialize it as F32 for the host-side cross buffer.
+    if (return_full_hidden_states) {
+        if (gr00t_hidden_states->type != GGML_TYPE_F32) {
+            gr00t_hidden_states = ggml_cast(ctx0, gr00t_hidden_states, GGML_TYPE_F32);
+        }
+        cb(gr00t_hidden_states, "result_gr00t_hidden", -1);
+        res->t_embd = gr00t_hidden_states;
+    } else {
+        res->t_embd = cur;
+    }
 
     // lm_head
     cur = build_lora_mm(model.output, cur, model.output_s);

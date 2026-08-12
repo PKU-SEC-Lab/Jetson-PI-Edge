@@ -1306,6 +1306,119 @@ int32_t llama_context::get_pi0_action_steps() const {
     return model.hparams.action_steps;
 }
 
+const float * llama_context::get_gr00t_action_input() const {
+    if (model.arch != LLM_ARCH_GR00T_N1D7 || cross.pi0_action_input.empty()) {
+        return nullptr;
+    }
+    return cross.pi0_action_input.data();
+}
+
+const float * llama_context::get_gr00t_action() const {
+    if (model.arch != LLM_ARCH_GR00T_N1D7 || cross.action.empty()) {
+        return nullptr;
+    }
+    return cross.action.data();
+}
+
+int32_t llama_context::get_gr00t_state_dim() const {
+    return model.arch == LLM_ARCH_GR00T_N1D7 ? model.hparams.gr00t_state_dim : 0;
+}
+
+int32_t llama_context::get_gr00t_action_dim() const {
+    return model.arch == LLM_ARCH_GR00T_N1D7 ? model.hparams.action_dim : 0;
+}
+
+int32_t llama_context::get_gr00t_action_steps() const {
+    return model.arch == LLM_ARCH_GR00T_N1D7 ? model.hparams.action_steps : 0;
+}
+
+bool llama_context::set_gr00t_embodiment(int32_t embodiment_id) {
+    if (model.arch != LLM_ARCH_GR00T_N1D7 || embodiment_id < 0 ||
+            embodiment_id >= (int32_t) model.hparams.gr00t_embodiment_count) {
+        return false;
+    }
+    cross.gr00t_embodiment_id = embodiment_id;
+    return true;
+}
+
+void llama_context::set_gr00t_image_mask(std::vector<uint8_t> image_mask) {
+    if (model.arch != LLM_ARCH_GR00T_N1D7) {
+        return;
+    }
+    cross.gr00t_image_mask = std::move(image_mask);
+    cross.gr00t_token_masks_valid = std::find(
+            cross.gr00t_image_mask.begin(), cross.gr00t_image_mask.end(), uint8_t(1)) !=
+        cross.gr00t_image_mask.end();
+}
+
+int llama_context::generate_gr00t_action() {
+    if (model.arch != LLM_ARCH_GR00T_N1D7 || cross.n_token <= 0) {
+        return -1;
+    }
+    if (cross.gr00t_action_generated) {
+        return 0;
+    }
+
+    const bool debug = []() {
+        const char * value = std::getenv("GR00T_DEBUG");
+        return value != nullptr && value[0] != '0';
+    }();
+    const int64_t action_num = model.hparams.action_steps;
+    const int64_t action_dim = model.hparams.action_dim;
+    const int64_t action_elements = action_num * action_dim;
+    if ((int64_t) cross.action.size() != action_elements || balloc->get_n_tokens() == 0) {
+        return -1;
+    }
+
+    if (debug) {
+        fprintf(stderr, "[GR00T] starting action decode: vl_tokens=%" PRId64 " embodiment=%d\n",
+                cross.n_token, cross.gr00t_embodiment_id);
+    }
+    const llama_ubatch ubatch = balloc->split_simple(balloc->get_n_tokens());
+    std::vector<float> velocity((size_t) action_elements);
+    const float dt = 1.0f / (float) model.hparams.inference_steps;
+
+    for (uint32_t step = 0; step < model.hparams.inference_steps; ++step) {
+        cross.time_step_index = (int32_t) step;
+        cross.time_step = float(step * model.hparams.gr00t_timestep_buckets /
+                model.hparams.inference_steps);
+        synchronize();
+
+        ggml_status status;
+        const auto * res = process_ubatch(ubatch, LLM_GRAPH_TYPE_DECODER, nullptr, status);
+        if (!res) {
+            return status == GGML_STATUS_ABORTED ? 2 :
+                status == GGML_STATUS_ALLOC_FAILED ? -2 : -3;
+        }
+        ggml_tensor * action = res->get_action();
+        if (action == nullptr || ggml_nelements(action) != action_elements) {
+            return -3;
+        }
+        pi0_fetch_action_to_host(sched.get(), action, velocity.data(), ggml_nbytes(action));
+        for (int64_t i = 0; i < action_elements; ++i) {
+            cross.action[(size_t) i] += dt * velocity[(size_t) i];
+        }
+
+        if (debug) {
+            float min_value = cross.action[0];
+            float max_value = cross.action[0];
+            double sum = 0.0;
+            int64_t non_finite = 0;
+            for (float value : cross.action) {
+                min_value = std::min(min_value, value);
+                max_value = std::max(max_value, value);
+                sum += value;
+                non_finite += std::isfinite(value) ? 0 : 1;
+            }
+            fprintf(stderr, "[GR00T] step %u/%u action min=%g max=%g mean=%g non_finite=%" PRId64 "\n",
+                    step + 1, model.hparams.inference_steps, min_value, max_value,
+                    sum / (double) action_elements, non_finite);
+        }
+    }
+    cross.gr00t_action_generated = true;
+    return 0;
+}
+
 bool llama_context::set_sampler(llama_seq_id seq_id, llama_sampler * sampler) {
     if (!sampler && sampling.samplers.count(seq_id) == 0) {
         return true;
@@ -1802,6 +1915,87 @@ int llama_context::encode(const llama_batch & batch_inp) {
         cross.pi0_state_result.clear();
         if (cross.state.empty()) {
             cross.state.assign(action_dim, 0.0f);
+        }
+    }
+
+    if (model.arch == LLM_ARCH_GR00T_N1D7 && t_embd != nullptr) {
+        if (const char * debug = std::getenv("GR00T_DEBUG"); debug && debug[0] != '0') {
+            fprintf(stderr, "[GR00T] captured backbone hidden states: [%" PRId64 ", %" PRId64 "]\n",
+                    t_embd->ne[0], t_embd->ne[1]);
+        }
+        // Preserve the complete normalized Qwen3-VL token sequence for the
+        // GR00T action-head cross-attention graph.  Unlike generation logits,
+        // this includes every image and language token in original order.
+        synchronize();
+        cross.n_embd = t_embd->ne[0];
+        cross.n_enc  = t_embd->ne[1];
+        cross.n_token = t_embd->ne[1];
+        cross.v_embd.resize((size_t) cross.n_embd * (size_t) cross.n_enc);
+        ggml_backend_tensor_get(t_embd, cross.v_embd.data(), 0, ggml_nbytes(t_embd));
+
+        // AlternateVLDiT alternates image-only and non-image-only cross
+        // attention.  Prefer the official Qwen3-VL image token ID; the Edge
+        // packed-image path instead exposes a leading image-token count.
+        cross.gr00t_image_mask.assign((size_t) cross.n_enc, 0);
+        cross.gr00t_token_masks_valid = false;
+        constexpr llama_token gr00t_image_token_id = 151655;
+        if (ubatch.token != nullptr && (int64_t) ubatch.n_tokens == cross.n_enc) {
+            for (int64_t i = 0; i < cross.n_enc; ++i) {
+                cross.gr00t_image_mask[(size_t) i] =
+                    ubatch.token[i] == gr00t_image_token_id ? 1 : 0;
+            }
+            cross.gr00t_token_masks_valid = std::find(
+                    cross.gr00t_image_mask.begin(),
+                    cross.gr00t_image_mask.end(), uint8_t(1)) !=
+                cross.gr00t_image_mask.end();
+        } else if (ubatch.img_token_num > 0 && ubatch.img_token_num <= (int32_t) cross.n_enc) {
+            std::fill_n(cross.gr00t_image_mask.begin(), ubatch.img_token_num, uint8_t(1));
+            cross.gr00t_token_masks_valid = true;
+        }
+        if (!cross.gr00t_token_masks_valid) {
+            LLAMA_LOG_WARN("%s: GR00T image token mask unavailable; cross-attention masks are disabled\n", __func__);
+        }
+
+        cross.action = create_normal_noise_cpp11(
+                (size_t) hparams.action_steps * (size_t) hparams.action_dim, 41);
+        cross.pi0_action_input = cross.action;
+        if (cross.state.empty()) {
+            cross.state.assign(hparams.gr00t_state_dim, 0.0f);
+        }
+
+        // Cache the exact discrete sinusoidal timestep inputs used by the
+        // official MultiEmbodimentActionEncoder: 0, 250, 500 and 750 for the
+        // four N1.7 denoising iterations.  Layout is [step, token, channel].
+        const int64_t width = hparams.n_embd_ae;
+        const int64_t half = width / 2;
+        const int64_t horizon = hparams.action_steps;
+        cross.ae_time_embeddings.resize(
+                (size_t) hparams.inference_steps * (size_t) horizon * (size_t) width);
+        cross.gr00t_dit_time_embeddings.resize(
+                (size_t) hparams.inference_steps * 256);
+        for (uint32_t step = 0; step < hparams.inference_steps; ++step) {
+            const float timestep = float(step * hparams.gr00t_timestep_buckets / hparams.inference_steps);
+            float * dst_step = cross.ae_time_embeddings.data() +
+                    (size_t) step * (size_t) horizon * (size_t) width;
+            for (int64_t token = 0; token < horizon; ++token) {
+                float * dst = dst_step + token * width;
+                for (int64_t i = 0; i < half; ++i) {
+                    const float freq = std::exp(-float(i) * std::log(10000.0f) / float(half));
+                    dst[i]        = std::sin(timestep * freq);
+                    dst[half + i] = std::cos(timestep * freq);
+                }
+            }
+
+            // diffusers Timesteps(256, flip_sin_to_cos=true,
+            // downscale_freq_shift=1): cosine half precedes sine half.
+            float * dit_dst = cross.gr00t_dit_time_embeddings.data() + (size_t) step * 256;
+            constexpr int64_t dit_half = 128;
+            for (int64_t i = 0; i < dit_half; ++i) {
+                const float exponent = -std::log(10000.0f) * float(i) / float(dit_half - 1);
+                const float value = timestep * std::exp(exponent);
+                dit_dst[i]            = std::cos(value);
+                dit_dst[dit_half + i] = std::sin(value);
+            }
         }
     }
 
@@ -2337,11 +2531,76 @@ int llama_context::decode(const llama_batch & batch_inp) {
         //}
 
         auto * t_logits  = res->get_logits();
-        auto * t_embd    = cparams.embeddings       ? res->get_embd()     : nullptr;
+        auto * t_embd    = (cparams.embeddings || model.arch == LLM_ARCH_GR00T_N1D7)
+            ? res->get_embd() : nullptr;
         auto * t_h_nextn = cparams.embeddings_nextn ? res->get_h_nextn()  : nullptr;
 
         if (t_embd && res->get_embd_pooled()) {
             t_embd = res->get_embd_pooled();
+        }
+
+        if (model.arch == LLM_ARCH_GR00T_N1D7 && t_embd != nullptr) {
+            synchronize();
+            cross.n_embd = t_embd->ne[0];
+            cross.n_enc = t_embd->ne[1];
+            cross.n_token = t_embd->ne[1];
+            cross.v_embd.resize((size_t) cross.n_embd * (size_t) cross.n_enc);
+            ggml_backend_tensor_get(t_embd, cross.v_embd.data(), 0, ggml_nbytes(t_embd));
+            cross.action = create_normal_noise_cpp11(
+                    (size_t) hparams.action_steps * (size_t) hparams.action_dim, 41);
+            cross.pi0_action_input = cross.action;
+            cross.gr00t_action_generated = false;
+            if (cross.state.empty()) {
+                cross.state.assign(hparams.gr00t_state_dim, 0.0f);
+            }
+            const bool keep_explicit_image_mask = ubatch.embd != nullptr &&
+                cross.gr00t_token_masks_valid &&
+                cross.gr00t_image_mask.size() == (size_t) cross.n_enc;
+            if (!keep_explicit_image_mask) {
+                cross.gr00t_image_mask.assign((size_t) cross.n_enc, 0);
+                cross.gr00t_token_masks_valid = false;
+            }
+            constexpr llama_token image_token_id = 151655;
+            if (!keep_explicit_image_mask && ubatch.token != nullptr && (int64_t) ubatch.n_tokens == cross.n_enc) {
+                for (int64_t i = 0; i < cross.n_enc; ++i) {
+                    cross.gr00t_image_mask[(size_t) i] = ubatch.token[i] == image_token_id;
+                }
+                cross.gr00t_token_masks_valid = std::find(cross.gr00t_image_mask.begin(),
+                        cross.gr00t_image_mask.end(), uint8_t(1)) != cross.gr00t_image_mask.end();
+            } else if (!keep_explicit_image_mask && ubatch.img_token_num > 0 && ubatch.img_token_num <= (int32_t) cross.n_enc) {
+                std::fill_n(cross.gr00t_image_mask.begin(), ubatch.img_token_num, uint8_t(1));
+                cross.gr00t_token_masks_valid = true;
+            }
+
+            const int64_t width = hparams.n_embd_ae;
+            const int64_t half = width / 2;
+            const int64_t horizon = hparams.action_steps;
+            cross.ae_time_embeddings.resize(
+                    (size_t) hparams.inference_steps * (size_t) horizon * (size_t) width);
+            cross.gr00t_dit_time_embeddings.resize((size_t) hparams.inference_steps * 256);
+            for (uint32_t step = 0; step < hparams.inference_steps; ++step) {
+                const float timestep = float(step * hparams.gr00t_timestep_buckets / hparams.inference_steps);
+                float * dst_step = cross.ae_time_embeddings.data() +
+                    (size_t) step * (size_t) horizon * (size_t) width;
+                for (int64_t token = 0; token < horizon; ++token) {
+                    float * dst = dst_step + token * width;
+                    for (int64_t i = 0; i < half; ++i) {
+                        const float freq = std::exp(-float(i) * std::log(10000.0f) / float(half));
+                        dst[i] = std::sin(timestep * freq);
+                        dst[half + i] = std::cos(timestep * freq);
+                    }
+                }
+                float * dit_dst = cross.gr00t_dit_time_embeddings.data() + (size_t) step * 256;
+                for (int64_t i = 0; i < 128; ++i) {
+                    const float value = timestep * std::exp(-std::log(10000.0f) * float(i) / 127.0f);
+                    dit_dst[i] = std::cos(value);
+                    dit_dst[128 + i] = std::sin(value);
+                }
+            }
+            if (const char * debug = std::getenv("GR00T_DEBUG"); debug && debug[0] != '0') {
+                fprintf(stderr, "[GR00T] captured decoder hidden states: [%" PRId64 ", %" PRId64 "]\n",
+                        cross.n_embd, cross.n_enc);
+            }
         }
 
         // extract logits
@@ -4195,6 +4454,119 @@ void llama_set_pi0_state(llama_context * ctx, const float * state_array, size_t 
         return;
     }
     ctx->set_state(std::vector<float>(state_array, state_array + size));
+}
+
+const float * llama_get_gr00t_action_input(llama_context * ctx) {
+    return ctx == nullptr ? nullptr : ctx->get_gr00t_action_input();
+}
+
+const float * llama_get_gr00t_action(llama_context * ctx) {
+    if (ctx == nullptr) {
+        return nullptr;
+    }
+    ctx->synchronize();
+    return ctx->get_gr00t_action();
+}
+
+int32_t llama_get_gr00t_state_dim(llama_context * ctx) {
+    return ctx == nullptr ? 0 : ctx->get_gr00t_state_dim();
+}
+
+int32_t llama_get_gr00t_action_dim(llama_context * ctx) {
+    return ctx == nullptr ? 0 : ctx->get_gr00t_action_dim();
+}
+
+int32_t llama_get_gr00t_action_steps(llama_context * ctx) {
+    return ctx == nullptr ? 0 : ctx->get_gr00t_action_steps();
+}
+
+void llama_set_gr00t_state(llama_context * ctx, const float * state_array, size_t size) {
+    if (ctx == nullptr || state_array == nullptr ||
+            size != (size_t) ctx->get_model().hparams.gr00t_state_dim) {
+        return;
+    }
+    ctx->set_state(std::vector<float>(state_array, state_array + size));
+}
+
+bool llama_set_gr00t_embodiment(llama_context * ctx, int32_t embodiment_id) {
+    return ctx != nullptr && ctx->set_gr00t_embodiment(embodiment_id);
+}
+
+int32_t llama_gr00t_generate_action(llama_context * ctx) {
+    return ctx == nullptr ? -1 : ctx->generate_gr00t_action();
+}
+
+int32_t llama_gr00t_decode_multimodal(
+        llama_context * ctx,
+        const llama_token * tokens,
+        const float * image_embd,
+        const uint8_t * image_mask,
+        const llama_pos * mrope_pos,
+        int32_t n_tokens) {
+    if (ctx == nullptr || tokens == nullptr || image_mask == nullptr ||
+            mrope_pos == nullptr || n_tokens <= 0) {
+        return -1;
+    }
+
+    const llama_model & model = ctx->get_model();
+    if (model.arch != LLM_ARCH_GR00T_N1D7 || model.tok_embd == nullptr) {
+        return -1;
+    }
+    const int64_t n_embd = model.hparams.n_embd;
+    const int64_t n_embd_inp = model.hparams.n_embd_inp();
+    const ggml_tensor * tok_embd = model.tok_embd;
+    const ggml_type_traits * traits = ggml_get_type_traits(tok_embd->type);
+    if (traits == nullptr || traits->to_float == nullptr || tok_embd->ne[0] != n_embd) {
+        return -1;
+    }
+
+    size_t n_images = 0;
+    for (int32_t i = 0; i < n_tokens; ++i) {
+        n_images += image_mask[i] != 0;
+        if (!image_mask[i] && (tokens[i] < 0 || tokens[i] >= tok_embd->ne[1])) {
+            return -1;
+        }
+    }
+    if (n_images != 0 && image_embd == nullptr) {
+        return -1;
+    }
+
+    llama_batch batch = llama_batch_init(n_tokens, (int32_t) n_embd_inp, 1);
+    if (batch.embd == nullptr) {
+        return -1;
+    }
+    batch.n_tokens = n_tokens;
+    std::free(batch.pos);
+    batch.pos = (llama_pos *) std::malloc((size_t) 4 * n_tokens * sizeof(llama_pos));
+    if (batch.pos == nullptr) {
+        llama_batch_free(batch);
+        return -1;
+    }
+    std::memcpy(batch.pos, mrope_pos, (size_t) 4 * n_tokens * sizeof(llama_pos));
+
+    const size_t row_bytes = ggml_row_size(tok_embd->type, n_embd);
+    std::vector<uint8_t> row(row_bytes);
+    size_t image_row = 0;
+    for (int32_t i = 0; i < n_tokens; ++i) {
+        float * dst = batch.embd + (size_t) i * n_embd_inp;
+        if (image_mask[i]) {
+            std::memcpy(dst, image_embd + image_row * n_embd_inp,
+                    (size_t) n_embd_inp * sizeof(float));
+            ++image_row;
+        } else {
+            ggml_backend_tensor_get(tok_embd, row.data(), (size_t) tokens[i] * row_bytes, row_bytes);
+            traits->to_float(row.data(), dst, n_embd);
+            std::fill(dst + n_embd, dst + n_embd_inp, 0.0f);
+        }
+        batch.n_seq_id[i] = 1;
+        batch.seq_id[i][0] = 0;
+        batch.logits[i] = i == n_tokens - 1;
+    }
+
+    ctx->set_gr00t_image_mask(std::vector<uint8_t>(image_mask, image_mask + n_tokens));
+    const int32_t result = llama_decode(ctx, batch);
+    llama_batch_free(batch);
+    return result;
 }
 
 void llama_set_embeddings_nextn(llama_context * ctx, bool value, bool masked) {

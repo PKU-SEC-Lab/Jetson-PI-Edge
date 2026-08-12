@@ -10,6 +10,7 @@
 #include "build-info.h"
 #include "common.h"
 #include "fit.h"
+#include "gr00t-input.h"
 #include "llama.h"
 #include "pi-model.h"
 #include "pi-model-detect.h"
@@ -46,6 +47,61 @@ using json = nlohmann::ordered_json;
 
 constexpr int HTTP_POLLING_SECONDS = 1;
 
+enum class foreground_policy_kind {
+    text,
+    pi0,
+    pi05,
+    gr00t_n1d7,
+};
+
+static const char * foreground_policy_kind_name(foreground_policy_kind kind) {
+    switch (kind) {
+        case foreground_policy_kind::pi0:        return "pi0";
+        case foreground_policy_kind::pi05:       return "pi05";
+        case foreground_policy_kind::gr00t_n1d7: return "gr00t-n1d7";
+        case foreground_policy_kind::text:       return "text";
+    }
+    return "text";
+}
+
+static foreground_policy_kind server_classify_foreground_policy(const std::string & architecture) {
+    if (architecture == "gr00t-n1d7") {
+        return foreground_policy_kind::gr00t_n1d7;
+    }
+
+    const pi_model_kind pi_model = pi_model_kind_from_env();
+    if (pi_model_kind_is_pi0(pi_model)) {
+        return foreground_policy_kind::pi0;
+    }
+    if (pi_model_kind_is_pi05(pi_model)) {
+        return foreground_policy_kind::pi05;
+    }
+    return foreground_policy_kind::text;
+}
+
+static foreground_policy_kind server_detect_foreground_policy(const llama_model * model) {
+    char architecture[64] = {};
+    if (model != nullptr) {
+        llama_model_meta_val_str(model, "general.architecture", architecture, sizeof(architecture));
+    }
+    return server_classify_foreground_policy(architecture);
+}
+
+static foreground_policy_kind server_detect_foreground_policy(const std::string & model_path) {
+    std::string architecture;
+    if (!model_path.empty()) {
+        const pi_model_detect_result detected = pi_model_detect_gguf_file(model_path);
+        architecture = detected.general_architecture;
+    }
+    return server_classify_foreground_policy(architecture);
+}
+
+static bool foreground_policy_uses_default_marker(foreground_policy_kind kind) {
+    return kind == foreground_policy_kind::pi0 ||
+           kind == foreground_policy_kind::pi05 ||
+           kind == foreground_policy_kind::gr00t_n1d7;
+}
+
 static uint32_t server_n_outputs_max(const common_params & params) {
     const uint32_t n_batch  = params.n_batch;
 
@@ -77,6 +133,12 @@ static bool server_resolve_pi_model_before_load(const common_params & params) {
     const pi_model_kind env_kind = pi_model_kind_from_env();
     if (env_kind == PI_MODEL_PI0 || env_kind == PI_MODEL_PI05) {
         SRV_INF("PI_MODEL=%s explicitly set; skipping GGUF auto-detection\n", pi_model_kind_name(env_kind));
+        return true;
+    }
+
+    const pi_model_detect_result model_file = pi_model_detect_gguf_file(params.model.path);
+    if (model_file.general_architecture == "gr00t-n1d7") {
+        SRV_INF("%s", "detected GR00T N1.7 model; PI_MODEL remains auto\n");
         return true;
     }
 
@@ -1184,12 +1246,17 @@ private:
 
     struct foreground_session {
         std::mutex mutex;
+        foreground_policy_kind policy_kind = foreground_policy_kind::text;
         mtmd::bitmaps bitmaps;
         std::vector<common_chat_msg> chat_history;
         llama_pos n_past = 0;
         std::string content;
         bool state_flag = false;
         std::vector<float> latest_state;
+        int32_t embodiment_id = -1;
+        std::vector<float> latest_gr00t_action;
+        int32_t gr00t_action_steps = 0;
+        int32_t gr00t_action_dim = 0;
         mtmd_pi0_result latest_pi0_result = {};
         common_sampler * smpl = nullptr;
         llama_batch batch = {};
@@ -1272,6 +1339,22 @@ private:
             sliced_rows.push_back(std::move(sliced));
         }
         return sliced_rows;
+    }
+
+    static json reshape_gr00t_action_rows(const std::vector<float> & action, int32_t steps, int32_t dim) {
+        json rows = json::array();
+        if (steps <= 0 || dim <= 0 || action.size() != (size_t) steps * dim) {
+            return rows;
+        }
+        for (int32_t step = 0; step < steps; ++step) {
+            json row = json::array();
+            const size_t offset = (size_t) step * dim;
+            for (int32_t i = 0; i < dim; ++i) {
+                row.push_back(action[offset + i]);
+            }
+            rows.push_back(std::move(row));
+        }
+        return rows;
     }
 
     bool foreground_check_antiprompt(const llama_tokens & generated_tokens) const {
@@ -1369,6 +1452,114 @@ private:
         return 0;
     }
 
+    int foreground_eval_gr00t(const std::string & instruction, json * timing = nullptr) {
+        const int64_t t_start = ggml_time_us();
+        const size_t image_count = foreground.bitmaps.entries.size();
+        foreground.latest_gr00t_action.clear();
+        foreground.gr00t_action_steps = 0;
+        foreground.gr00t_action_dim = 0;
+
+        std::vector<gr00t_input::processed_image> processed_images;
+        mtmd::bitmaps processed_bitmaps;
+        processed_images.reserve(image_count);
+        processed_bitmaps.entries.reserve(image_count);
+        std::string input_error;
+        for (const mtmd::bitmap & source : foreground.bitmaps.entries) {
+            if (!source.ptr || mtmd_bitmap_is_audio(source.ptr.get())) {
+                SRV_ERR("%s", "GR00T foreground input must contain RGB images only\n");
+                return 1;
+            }
+            gr00t_input::processed_image image;
+            if (!gr00t_input::preprocess_rgb(source.data(), (int) source.nx(), (int) source.ny(),
+                                             image, input_error)) {
+                SRV_ERR("GR00T image preprocessing failed: %s\n", input_error.c_str());
+                return 1;
+            }
+            processed_images.push_back(std::move(image));
+            const auto & processed = processed_images.back();
+            mtmd::bitmap bitmap((uint32_t) processed.width, (uint32_t) processed.height, processed.rgb.data());
+            if (!bitmap.ptr) {
+                SRV_ERR("%s", "failed to create preprocessed GR00T bitmap\n");
+                return 1;
+            }
+            processed_bitmaps.entries.push_back(std::move(bitmap));
+        }
+        const int64_t t_preprocess_done = ggml_time_us();
+
+        const std::string prompt = gr00t_input::build_prompt(
+                instruction.data(), instruction.size(), image_count, mtmd_default_marker());
+        mtmd_input_text text{prompt.c_str(), false, true};
+        mtmd::input_chunks chunks(mtmd_input_chunks_init());
+        if (!chunks.ptr) {
+            SRV_ERR("%s", "failed to allocate GR00T input chunks\n");
+            return 1;
+        }
+        auto bitmap_ptrs = processed_bitmaps.c_ptr();
+        const int64_t t_tokenize_start = ggml_time_us();
+        const int32_t tokenize_res = mtmd_tokenize(
+                mctx, chunks.ptr.get(), &text, bitmap_ptrs.data(), bitmap_ptrs.size());
+        const int64_t t_tokenize_done = ggml_time_us();
+        if (tokenize_res != 0) {
+            SRV_ERR("Unable to tokenize GR00T foreground prompt, res = %d\n", tokenize_res);
+            return 1;
+        }
+
+        llama_set_gr00t_state(ctx_tgt, foreground.latest_state.data(), foreground.latest_state.size());
+        if (!llama_set_gr00t_embodiment(ctx_tgt, foreground.embodiment_id)) {
+            SRV_ERR("%s", "stored GR00T embodiment is invalid\n");
+            return 1;
+        }
+        llama_memory_clear(llama_get_memory(ctx_tgt), true);
+        foreground.n_past = 0;
+
+        llama_pos new_n_past = 0;
+        const int64_t t_eval_start = ggml_time_us();
+        const int32_t eval_res = mtmd_helper_eval_chunks_gr00t(
+                mctx, ctx_tgt, chunks.ptr.get(), 0, &new_n_past);
+        const int64_t t_eval_done = ggml_time_us();
+        if (eval_res != 0) {
+            SRV_ERR("Unable to eval GR00T foreground prompt, res = %d\n", eval_res);
+            return 1;
+        }
+
+        const int64_t t_action_start = ggml_time_us();
+        if (llama_gr00t_generate_action(ctx_tgt) != 0) {
+            SRV_ERR("%s", "GR00T action graph execution failed\n");
+            return 1;
+        }
+        const float * action = llama_get_gr00t_action(ctx_tgt);
+        const int32_t action_steps = llama_get_gr00t_action_steps(ctx_tgt);
+        const int32_t action_dim = llama_get_gr00t_action_dim(ctx_tgt);
+        if (!action || action_steps <= 0 || action_dim <= 0) {
+            SRV_ERR("%s", "GR00T action output is unavailable\n");
+            return 1;
+        }
+        const size_t action_count = (size_t) action_steps * action_dim;
+        if (!std::all_of(action, action + action_count, [](float value) { return std::isfinite(value); })) {
+            SRV_ERR("%s", "GR00T action output contains non-finite values\n");
+            return 1;
+        }
+        foreground.latest_gr00t_action.assign(action, action + action_count);
+        foreground.gr00t_action_steps = action_steps;
+        foreground.gr00t_action_dim = action_dim;
+        foreground.n_past = new_n_past;
+        foreground.bitmaps.entries.clear();
+        foreground.content.clear();
+        foreground.chat_history.clear();
+        const int64_t t_action_done = ggml_time_us();
+
+        if (timing != nullptr) {
+            *timing = {
+                {"preprocess_ms", (t_preprocess_done - t_start) / 1000.0},
+                {"tokenize_ms",   (t_tokenize_done - t_tokenize_start) / 1000.0},
+                {"model_eval_ms", (t_eval_done - t_eval_start) / 1000.0},
+                {"action_ms",     (t_action_done - t_action_start) / 1000.0},
+                {"eval_total_ms", (t_action_done - t_start) / 1000.0},
+            };
+        }
+        return 0;
+    }
+
     int foreground_generate_response(int n_predict, std::string & generated_text) {
         llama_tokens generated_tokens;
         for (int i = 0; i < n_predict; ++i) {
@@ -1400,6 +1591,10 @@ private:
         foreground.content.clear();
         foreground.state_flag = false;
         foreground.latest_state.clear();
+        foreground.embodiment_id = -1;
+        foreground.latest_gr00t_action.clear();
+        foreground.gr00t_action_steps = 0;
+        foreground.gr00t_action_dim = 0;
         mtmd_pi0_result_free(&foreground.latest_pi0_result);
         if (foreground.smpl != nullptr) {
             common_sampler_reset(foreground.smpl);
@@ -1418,11 +1613,17 @@ private:
         }
         foreground.smpl = common_sampler_init(model_tgt, params_base.sampling);
         foreground.batch = llama_batch_init(1, 0, 1);
+        foreground.policy_kind = server_detect_foreground_policy(model_tgt);
+        SRV_INF("foreground policy detected as %s\n", foreground_policy_kind_name(foreground.policy_kind));
         foreground.chat_history.clear();
         foreground.bitmaps.entries.clear();
         foreground.content.clear();
         foreground.state_flag = false;
         foreground.latest_state.clear();
+        foreground.embodiment_id = -1;
+        foreground.latest_gr00t_action.clear();
+        foreground.gr00t_action_steps = 0;
+        foreground.gr00t_action_dim = 0;
         mtmd_pi0_result_free(&foreground.latest_pi0_result);
         foreground.n_past = 0;
         foreground.antiprompt_tokens.clear();
@@ -1448,10 +1649,17 @@ private:
 
         params_base = params;
         params_base.n_outputs_max = server_n_outputs_max(params_base);
+        foreground.policy_kind = server_detect_foreground_policy(params_base.model.path);
 
         const bool has_mmproj = !params.mmproj.path.empty();
         if (has_mmproj) {
             params_base.n_outputs_max = params_base.n_batch;
+        }
+        if (foreground.policy_kind == foreground_policy_kind::gr00t_n1d7) {
+            params_base.n_ubatch = std::max(params_base.n_ubatch, params_base.n_batch);
+            params_base.flash_attn_type = LLAMA_FLASH_ATTN_TYPE_DISABLED;
+            SRV_INF("GR00T N1.7: using n_ubatch=%u and disabling flash attention for action inference\n",
+                    params_base.n_ubatch);
         }
         const pi_model_kind pi_model = pi_model_kind_from_env();
         if (has_mmproj && (pi_model_kind_is_pi0(pi_model) || pi_model_kind_is_pi05(pi_model))) {
@@ -1496,7 +1704,9 @@ private:
             mparams.image_min_tokens = params_base.image_min_tokens;
             mparams.image_max_tokens = params_base.image_max_tokens;
             mparams.batch_max_tokens = params_base.mtmd_batch_max_tokens;
-            mparams.media_marker     = server_pi_model_is_pi() ? mtmd_default_marker() : get_media_marker();
+            mparams.media_marker     = foreground_policy_uses_default_marker(foreground.policy_kind)
+                    ? mtmd_default_marker()
+                    : get_media_marker();
             // progress callback
             mparams.progress_callback           = load_progress_callback;
             mparams.progress_callback_user_data = &load_progress_mmproj;
@@ -5455,7 +5665,9 @@ void server_routes::init_routes() {
             res->error(format_error_response("failed to load media", ERROR_TYPE_INVALID_REQUEST));
             return res;
         }
-        ctx_server.foreground.content += server_pi_model_is_pi() ? mtmd_default_marker() : mtmd_get_marker(ctx_server.mctx);
+        ctx_server.foreground.content += foreground_policy_uses_default_marker(ctx_server.foreground.policy_kind)
+                ? mtmd_default_marker()
+                : mtmd_get_marker(ctx_server.mctx);
         res->ok({{"loaded", true}, {"pending_text", ctx_server.foreground.content}, {"pending_bitmaps", ctx_server.foreground.bitmaps.entries.size()}});
         return res;
     };
@@ -5463,17 +5675,87 @@ void server_routes::init_routes() {
     this->put_foreground_state = [this](const server_http_req & req) {
         auto res = create_response();
         const json body = json::parse(req.body);
-        const std::string state = json_value(body, "state", std::string());
-        if (state.empty()) {
+        if (!body.contains("state")) {
             res->error(format_error_response("\"state\" is required", ERROR_TYPE_INVALID_REQUEST));
             return res;
         }
         std::lock_guard<std::mutex> lock(ctx_server.foreground.mutex);
-        const std::vector<float> state_array = server_context_impl::string_to_float_array(state);
-        llama_set_pi0_state(ctx_server.ctx_tgt, state_array.data(), state_array.size());
-        ctx_server.foreground.latest_state = state_array;
+
+        if (ctx_server.foreground.policy_kind == foreground_policy_kind::gr00t_n1d7) {
+            if (!body.at("state").is_array()) {
+                res->error(format_error_response("GR00T \"state\" must be a JSON number array", ERROR_TYPE_INVALID_REQUEST));
+                return res;
+            }
+            if (!body.contains("embodiment_id") || !body.at("embodiment_id").is_number_integer()) {
+                res->error(format_error_response("GR00T \"embodiment_id\" is required and must be an integer", ERROR_TYPE_INVALID_REQUEST));
+                return res;
+            }
+
+            std::vector<float> state_array;
+            state_array.reserve(body.at("state").size());
+            for (const auto & value : body.at("state")) {
+                if (!value.is_number()) {
+                    res->error(format_error_response("GR00T state values must be numbers", ERROR_TYPE_INVALID_REQUEST));
+                    return res;
+                }
+                state_array.push_back(value.get<float>());
+            }
+
+            const int32_t state_dim = llama_get_gr00t_state_dim(ctx_server.ctx_tgt);
+            std::vector<float> padded_state;
+            std::string state_error;
+            if (!gr00t_input::prepare_state(state_array.data(), state_array.size(),
+                                            state_dim > 0 ? (size_t) state_dim : 0,
+                                            padded_state, state_error)) {
+                res->error(format_error_response(state_error, ERROR_TYPE_INVALID_REQUEST));
+                return res;
+            }
+
+            const json & embodiment_value = body.at("embodiment_id");
+            int32_t embodiment_id = -1;
+            if (embodiment_value.is_number_unsigned()) {
+                const uint64_t value = embodiment_value.get<uint64_t>();
+                if (value > (uint64_t) std::numeric_limits<int32_t>::max()) {
+                    res->error(format_error_response("invalid GR00T embodiment_id", ERROR_TYPE_INVALID_REQUEST));
+                    return res;
+                }
+                embodiment_id = (int32_t) value;
+            } else {
+                const int64_t value = embodiment_value.get<int64_t>();
+                if (value < 0 || value > std::numeric_limits<int32_t>::max()) {
+                    res->error(format_error_response("invalid GR00T embodiment_id", ERROR_TYPE_INVALID_REQUEST));
+                    return res;
+                }
+                embodiment_id = (int32_t) value;
+            }
+            if (!llama_set_gr00t_embodiment(ctx_server.ctx_tgt, embodiment_id)) {
+                res->error(format_error_response("invalid GR00T embodiment_id", ERROR_TYPE_INVALID_REQUEST));
+                return res;
+            }
+            llama_set_gr00t_state(ctx_server.ctx_tgt, padded_state.data(), padded_state.size());
+            ctx_server.foreground.latest_state = std::move(padded_state);
+            ctx_server.foreground.embodiment_id = embodiment_id;
+        } else {
+            if (!body.at("state").is_string() || body.at("state").get_ref<const std::string &>().empty()) {
+                res->error(format_error_response("\"state\" must be a non-empty comma-separated string", ERROR_TYPE_INVALID_REQUEST));
+                return res;
+            }
+            const std::vector<float> state_array = server_context_impl::string_to_float_array(
+                    body.at("state").get_ref<const std::string &>());
+            llama_set_pi0_state(ctx_server.ctx_tgt, state_array.data(), state_array.size());
+            ctx_server.foreground.latest_state = state_array;
+        }
         ctx_server.foreground.state_flag = true;
-        res->ok({{"loaded", true}, {"state_flag", true}});
+        json response = {
+            {"loaded", true},
+            {"state_flag", true},
+            {"state_dim", ctx_server.foreground.latest_state.size()},
+            {"model_family", foreground_policy_kind_name(ctx_server.foreground.policy_kind)},
+        };
+        if (ctx_server.foreground.policy_kind == foreground_policy_kind::gr00t_n1d7) {
+            response["embodiment_id"] = ctx_server.foreground.embodiment_id;
+        }
+        res->ok(std::move(response));
         return res;
     };
 
@@ -5489,6 +5771,69 @@ void server_routes::init_routes() {
         const int n_predict = json_value(body, "n_predict", ctx_server.params_base.n_predict);
 
         std::lock_guard<std::mutex> lock(ctx_server.foreground.mutex);
+        if (ctx_server.foreground.policy_kind == foreground_policy_kind::gr00t_n1d7) {
+            if (raw_text.empty()) {
+                res->error(format_error_response("GR00T \"text\" instruction is required", ERROR_TYPE_INVALID_REQUEST));
+                return res;
+            }
+            if (!ctx_server.foreground.state_flag || ctx_server.foreground.latest_state.empty() ||
+                    ctx_server.foreground.embodiment_id < 0) {
+                res->error(format_error_response(
+                        "GR00T state and embodiment_id must be loaded before inference",
+                        ERROR_TYPE_INVALID_REQUEST));
+                return res;
+            }
+            if (ctx_server.foreground.bitmaps.entries.empty()) {
+                res->error(format_error_response(
+                        "at least one GR00T image must be loaded before inference",
+                        ERROR_TYPE_INVALID_REQUEST));
+                return res;
+            }
+            for (const mtmd::bitmap & bitmap : ctx_server.foreground.bitmaps.entries) {
+                if (!bitmap.ptr || mtmd_bitmap_is_audio(bitmap.ptr.get())) {
+                    res->error(format_error_response(
+                            "GR00T foreground inputs must be RGB images",
+                            ERROR_TYPE_INVALID_REQUEST));
+                    return res;
+                }
+            }
+
+            const size_t n_images = ctx_server.foreground.bitmaps.entries.size();
+            json eval_timing = json::object();
+            const int64_t t_eval_start = ggml_time_us();
+            if (ctx_server.foreground_eval_gr00t(raw_text, &eval_timing) != 0) {
+                res->error(format_error_response("failed to run GR00T action inference", ERROR_TYPE_SERVER));
+                return res;
+            }
+            const int64_t t_eval_done = ggml_time_us();
+            const json action_rows = server_context_impl::reshape_gr00t_action_rows(
+                    ctx_server.foreground.latest_gr00t_action,
+                    ctx_server.foreground.gr00t_action_steps,
+                    ctx_server.foreground.gr00t_action_dim);
+            res->ok({
+                {"content", ""},
+                {"model_family", "gr00t-n1d7"},
+                {"is_action_model", true},
+                {"is_pi0", false},
+                {"action_normalized", true},
+                {"action_final", action_rows},
+                {"action_final_raw", action_rows},
+                {"action_steps", ctx_server.foreground.gr00t_action_steps},
+                {"action_dim", ctx_server.foreground.gr00t_action_dim},
+                {"state", ctx_server.foreground.latest_state},
+                {"embodiment_id", ctx_server.foreground.embodiment_id},
+                {"n_images", n_images},
+                {"n_past", ctx_server.foreground.n_past},
+                {"history_size", 0},
+                {"timing_breakdown_ms", {
+                    {"eval_ms", (t_eval_done - t_eval_start) / 1000.0},
+                    {"generate_ms", 0.0},
+                    {"handler_total_ms", (ggml_time_us() - t_handler_start) / 1000.0},
+                    {"eval_detail", std::move(eval_timing)},
+                }},
+            });
+            return res;
+        }
         const bool is_pi0 = ctx_server.foreground.state_flag;
         const std::string text = is_pi0 && server_pi_model_is_pi05()
                 ? build_pi05_openpi_prompt(raw_text, ctx_server.foreground.latest_state)
@@ -5566,7 +5911,9 @@ void server_routes::init_routes() {
                  {"pending_bitmaps", ctx_server.foreground.bitmaps.entries.size()},
                  {"history_size", ctx_server.foreground.chat_history.size()},
                  {"n_past", ctx_server.foreground.n_past},
-                 {"state_flag", ctx_server.foreground.state_flag}});
+                 {"state_flag", ctx_server.foreground.state_flag},
+                 {"embodiment_id", ctx_server.foreground.embodiment_id},
+                 {"model_family", foreground_policy_kind_name(ctx_server.foreground.policy_kind)}});
         return res;
     };
 

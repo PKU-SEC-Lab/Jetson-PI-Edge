@@ -80,6 +80,14 @@ MTMD_API int32_t mtmd_helper_eval_chunks(mtmd_context * ctx,
                                          bool logits_last,
                                          llama_pos * new_n_past);
 
+// GR00T requires the complete interleaved prefix in one decoder call so its
+// Action Head receives hidden states for every vision and language token.
+MTMD_API int32_t mtmd_helper_eval_chunks_gr00t(mtmd_context * ctx,
+                                               struct llama_context * lctx,
+                                               const mtmd_input_chunks * chunks,
+                                               llama_pos n_past,
+                                               llama_pos * new_n_past);
+
 
 typedef struct mtmd_pi0_result {
     double vit_ms;

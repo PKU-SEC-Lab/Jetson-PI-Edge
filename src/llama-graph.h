@@ -80,6 +80,7 @@ struct llama_cross {
     int64_t pi0_rope_prefix_offset = 0;
     float time_step = 0.0f;
     int32_t time_step_index = 0;
+    int32_t gr00t_embodiment_id = 0;
 
     // embeddings data copied to host memory (tmp)
     std::vector<float> v_embd;
@@ -88,6 +89,10 @@ struct llama_cross {
     std::vector<float> action;
     std::vector<float> pi0_action_input;
     std::vector<float> ae_time_embeddings;
+    std::vector<float> gr00t_dit_time_embeddings;
+    std::vector<uint8_t> gr00t_image_mask;
+    bool gr00t_token_masks_valid = false;
+    bool gr00t_action_generated = false;
     std::vector<float> ae_time_cond;
     int64_t ae_time_cache_inference_steps = 0;
     int64_t ae_time_cache_action_steps = 0;
@@ -326,6 +331,32 @@ public:
     const llama_hparams hparams;
     const llama_cross * cross;
     const int32_t       time_step_offset = 0;
+};
+
+class llm_graph_input_gr00t_dit_time : public llm_graph_input_i {
+public:
+    llm_graph_input_gr00t_dit_time(const llama_cross * cross) : cross(cross) {}
+
+    void set_input(const llama_ubatch * ubatch) override;
+    bool can_reuse(const llm_graph_params & params) override;
+    bool is_static_input() const override { return false; }
+
+    ggml_tensor * time = nullptr; // F32 [256, 1]
+    const llama_cross * cross;
+};
+
+class llm_graph_input_gr00t_vl_mask : public llm_graph_input_i {
+public:
+    llm_graph_input_gr00t_vl_mask(const llama_cross * cross, bool attend_image)
+        : cross(cross), attend_image(attend_image) {}
+
+    void set_input(const llama_ubatch * ubatch) override;
+    bool can_reuse(const llm_graph_params & params) override;
+    bool is_static_input() const override { return false; }
+
+    ggml_tensor * mask = nullptr; // F32 [vl_tokens, state_action_tokens]
+    const llama_cross * cross;
+    const bool attend_image;
 };
 
 
@@ -1384,6 +1415,8 @@ struct llm_graph_context {
     ggml_tensor * build_inp_time() const;
     ggml_tensor * build_inp_ae_time_cond() const;
     ggml_tensor * build_inp_sinusoidal_embedding(int32_t time_step_offset = 0) const;
+    ggml_tensor * build_inp_gr00t_dit_time() const;
+    ggml_tensor * build_inp_gr00t_vl_mask(bool attend_image) const;
     ggml_tensor * build_inp_pos_ae(int64_t action_steps) const;
     ggml_tensor * build_inp_rope_freq_factors_pi0() const;
     ggml_tensor * build_inp_pos() const;

@@ -38,6 +38,7 @@ static const std::map<llm_arch, const char *> LLM_ARCH_NAMES = {
     { LLM_ARCH_QWEN3NEXT,        "qwen3next"        },
     { LLM_ARCH_QWEN3VL,          "qwen3vl"          },
     { LLM_ARCH_QWEN3VLMOE,       "qwen3vlmoe"       },
+    { LLM_ARCH_GR00T_N1D7,       "gr00t-n1d7"       },
     { LLM_ARCH_QWEN35,           "qwen35"           },
     { LLM_ARCH_QWEN35MOE,        "qwen35moe"        },
     { LLM_ARCH_PHI2,             "phi2"             },
@@ -386,6 +387,34 @@ static const std::map<llm_tensor, const char *> LLM_TENSOR_NAMES = {
     { LLM_TENSOR_TIME_MLP_IN,                          "time_mlp_in" },
     { LLM_TENSOR_TIME_MLP_OUT,                         "time_mlp_out" },
     { LLM_TENSOR_AE_OUTPUT_NORM_DENSE,                 "output_norm_dense" },
+    { LLM_TENSOR_GR00T_VLLN,          "gr00t.action_head.vlln" },
+    { LLM_TENSOR_GR00T_VL_ATTN_Q,     "gr00t.action_head.vl_self_attention.transformer_blocks.@.attn1.to_q" },
+    { LLM_TENSOR_GR00T_VL_ATTN_K,     "gr00t.action_head.vl_self_attention.transformer_blocks.@.attn1.to_k" },
+    { LLM_TENSOR_GR00T_VL_ATTN_V,     "gr00t.action_head.vl_self_attention.transformer_blocks.@.attn1.to_v" },
+    { LLM_TENSOR_GR00T_VL_ATTN_OUT,   "gr00t.action_head.vl_self_attention.transformer_blocks.@.attn1.to_out.0" },
+    { LLM_TENSOR_GR00T_VL_NORM1,      "gr00t.action_head.vl_self_attention.transformer_blocks.@.norm1" },
+    { LLM_TENSOR_GR00T_VL_NORM3,      "gr00t.action_head.vl_self_attention.transformer_blocks.@.norm3" },
+    { LLM_TENSOR_GR00T_VL_FFN_IN,     "gr00t.action_head.vl_self_attention.transformer_blocks.@.ff.net.0.proj" },
+    { LLM_TENSOR_GR00T_VL_FFN_OUT,    "gr00t.action_head.vl_self_attention.transformer_blocks.@.ff.net.2" },
+    { LLM_TENSOR_GR00T_STATE_1,       "gr00t.action_head.state_encoder.layer1" },
+    { LLM_TENSOR_GR00T_STATE_2,       "gr00t.action_head.state_encoder.layer2" },
+    { LLM_TENSOR_GR00T_ACTION_1,      "gr00t.action_head.action_encoder.W1" },
+    { LLM_TENSOR_GR00T_ACTION_2,      "gr00t.action_head.action_encoder.W2" },
+    { LLM_TENSOR_GR00T_ACTION_3,      "gr00t.action_head.action_encoder.W3" },
+    { LLM_TENSOR_GR00T_POSITION,      "gr00t.action_head.position_embedding" },
+    { LLM_TENSOR_GR00T_TIME_1,        "gr00t.action_head.model.timestep_encoder.timestep_embedder.linear_1" },
+    { LLM_TENSOR_GR00T_TIME_2,        "gr00t.action_head.model.timestep_encoder.timestep_embedder.linear_2" },
+    { LLM_TENSOR_GR00T_DIT_Q,         "gr00t.action_head.model.transformer_blocks.@.attn1.to_q" },
+    { LLM_TENSOR_GR00T_DIT_K,         "gr00t.action_head.model.transformer_blocks.@.attn1.to_k" },
+    { LLM_TENSOR_GR00T_DIT_V,         "gr00t.action_head.model.transformer_blocks.@.attn1.to_v" },
+    { LLM_TENSOR_GR00T_DIT_OUT,       "gr00t.action_head.model.transformer_blocks.@.attn1.to_out.0" },
+    { LLM_TENSOR_GR00T_DIT_NORM,      "gr00t.action_head.model.transformer_blocks.@.norm1.linear" },
+    { LLM_TENSOR_GR00T_DIT_FFN_IN,    "gr00t.action_head.model.transformer_blocks.@.ff.net.0.proj" },
+    { LLM_TENSOR_GR00T_DIT_FFN_OUT,   "gr00t.action_head.model.transformer_blocks.@.ff.net.2" },
+    { LLM_TENSOR_GR00T_PROJ_OUT_1,    "gr00t.action_head.model.proj_out_1" },
+    { LLM_TENSOR_GR00T_PROJ_OUT_2,    "gr00t.action_head.model.proj_out_2" },
+    { LLM_TENSOR_GR00T_DECODER_1,     "gr00t.action_head.action_decoder.layer1" },
+    { LLM_TENSOR_GR00T_DECODER_2,     "gr00t.action_head.action_decoder.layer2" },
     { LLM_TENSOR_ATTN_NORM_DENSE,                      "blk.%d.attn_norm_dense" },
     { LLM_TENSOR_FFN_NORM_DENSE,                       "blk.%d.ffn_norm_dense" },
     { LLM_TENSOR_OUTPUT,                                 "output" },
@@ -641,6 +670,34 @@ static const std::map<llm_tensor, llm_tensor_info> LLM_TENSOR_INFOS = {
     {LLM_TENSOR_TIME_MLP_IN,                {LLM_TENSOR_LAYER_INPUT,     GGML_OP_MUL_MAT}},
     {LLM_TENSOR_TIME_MLP_OUT,               {LLM_TENSOR_LAYER_INPUT,     GGML_OP_MUL_MAT}},
     {LLM_TENSOR_AE_OUTPUT_NORM_DENSE,       {LLM_TENSOR_LAYER_OUTPUT,    GGML_OP_MUL_MAT}},
+    {LLM_TENSOR_GR00T_VLLN,                 {LLM_TENSOR_LAYER_OUTPUT,    GGML_OP_MUL}},
+    {LLM_TENSOR_GR00T_VL_ATTN_Q,            {LLM_TENSOR_LAYER_REPEATING, GGML_OP_MUL_MAT}},
+    {LLM_TENSOR_GR00T_VL_ATTN_K,            {LLM_TENSOR_LAYER_REPEATING, GGML_OP_MUL_MAT}},
+    {LLM_TENSOR_GR00T_VL_ATTN_V,            {LLM_TENSOR_LAYER_REPEATING, GGML_OP_MUL_MAT}},
+    {LLM_TENSOR_GR00T_VL_ATTN_OUT,          {LLM_TENSOR_LAYER_REPEATING, GGML_OP_MUL_MAT}},
+    {LLM_TENSOR_GR00T_VL_NORM1,             {LLM_TENSOR_LAYER_REPEATING, GGML_OP_MUL}},
+    {LLM_TENSOR_GR00T_VL_NORM3,             {LLM_TENSOR_LAYER_REPEATING, GGML_OP_MUL}},
+    {LLM_TENSOR_GR00T_VL_FFN_IN,            {LLM_TENSOR_LAYER_REPEATING, GGML_OP_MUL_MAT}},
+    {LLM_TENSOR_GR00T_VL_FFN_OUT,           {LLM_TENSOR_LAYER_REPEATING, GGML_OP_MUL_MAT}},
+    {LLM_TENSOR_GR00T_STATE_1,              {LLM_TENSOR_LAYER_INPUT,     GGML_OP_MUL_MAT}},
+    {LLM_TENSOR_GR00T_STATE_2,              {LLM_TENSOR_LAYER_INPUT,     GGML_OP_MUL_MAT}},
+    {LLM_TENSOR_GR00T_ACTION_1,             {LLM_TENSOR_LAYER_INPUT,     GGML_OP_MUL_MAT}},
+    {LLM_TENSOR_GR00T_ACTION_2,             {LLM_TENSOR_LAYER_INPUT,     GGML_OP_MUL_MAT}},
+    {LLM_TENSOR_GR00T_ACTION_3,             {LLM_TENSOR_LAYER_INPUT,     GGML_OP_MUL_MAT}},
+    {LLM_TENSOR_GR00T_POSITION,             {LLM_TENSOR_LAYER_INPUT,     GGML_OP_GET_ROWS}},
+    {LLM_TENSOR_GR00T_TIME_1,               {LLM_TENSOR_LAYER_INPUT,     GGML_OP_MUL_MAT}},
+    {LLM_TENSOR_GR00T_TIME_2,               {LLM_TENSOR_LAYER_INPUT,     GGML_OP_MUL_MAT}},
+    {LLM_TENSOR_GR00T_DIT_Q,                {LLM_TENSOR_LAYER_REPEATING, GGML_OP_MUL_MAT}},
+    {LLM_TENSOR_GR00T_DIT_K,                {LLM_TENSOR_LAYER_REPEATING, GGML_OP_MUL_MAT}},
+    {LLM_TENSOR_GR00T_DIT_V,                {LLM_TENSOR_LAYER_REPEATING, GGML_OP_MUL_MAT}},
+    {LLM_TENSOR_GR00T_DIT_OUT,              {LLM_TENSOR_LAYER_REPEATING, GGML_OP_MUL_MAT}},
+    {LLM_TENSOR_GR00T_DIT_NORM,             {LLM_TENSOR_LAYER_REPEATING, GGML_OP_MUL_MAT}},
+    {LLM_TENSOR_GR00T_DIT_FFN_IN,           {LLM_TENSOR_LAYER_REPEATING, GGML_OP_MUL_MAT}},
+    {LLM_TENSOR_GR00T_DIT_FFN_OUT,          {LLM_TENSOR_LAYER_REPEATING, GGML_OP_MUL_MAT}},
+    {LLM_TENSOR_GR00T_PROJ_OUT_1,           {LLM_TENSOR_LAYER_OUTPUT,    GGML_OP_MUL_MAT}},
+    {LLM_TENSOR_GR00T_PROJ_OUT_2,           {LLM_TENSOR_LAYER_OUTPUT,    GGML_OP_MUL_MAT}},
+    {LLM_TENSOR_GR00T_DECODER_1,            {LLM_TENSOR_LAYER_OUTPUT,    GGML_OP_MUL_MAT}},
+    {LLM_TENSOR_GR00T_DECODER_2,            {LLM_TENSOR_LAYER_OUTPUT,    GGML_OP_MUL_MAT}},
     {LLM_TENSOR_ATTN_NORM_DENSE,            {LLM_TENSOR_LAYER_REPEATING, GGML_OP_MUL_MAT}},
     {LLM_TENSOR_FFN_NORM_DENSE,             {LLM_TENSOR_LAYER_REPEATING, GGML_OP_MUL_MAT}},
     {LLM_TENSOR_POS_EMBD,                   {LLM_TENSOR_LAYER_INPUT,     GGML_OP_GET_ROWS}},
@@ -903,7 +960,13 @@ std::string LLM_TN_IMPL::str() const {
         GGML_ABORT("unknown tensor name for tensor id %d", static_cast<int>(tensor));
     }
 
-    std::string name = ::format(LLM_TENSOR_NAMES.at(tensor), bid, xid);
+    std::string pattern = LLM_TENSOR_NAMES.at(tensor);
+    // GR00T has 32 DiT blocks but only 16 backbone placement layers.  '@'
+    // names a logical sub-layer through xid while bid remains the device layer.
+    if (const auto pos = pattern.find('@'); pos != std::string::npos) {
+        pattern.replace(pos, 1, std::to_string(xid));
+    }
+    std::string name = ::format(pattern.c_str(), bid, xid);
     if (suffix != nullptr) {
         name += ".";
         name += suffix;

@@ -1481,7 +1481,9 @@ struct clip_model_loader {
                 case PROJECTOR_TYPE_QWEN3VL:
                     {
                         hparams.n_merge = 2; // default value for Qwen 2 and 2.5
-                        hparams.image_resize_algo = RESIZE_ALGO_BILINEAR;
+                        hparams.image_resize_algo = model.proj_type == PROJECTOR_TYPE_QWEN3VL
+                            ? RESIZE_ALGO_BICUBIC_PILLOW
+                            : RESIZE_ALGO_BILINEAR;
                         get_u32(KEY_SPATIAL_MERGE_SIZE, hparams.n_merge, false);
                         get_u32(KEY_WIN_ATTN_PATTERN, hparams.n_wa_pattern, model.proj_type == PROJECTOR_TYPE_QWEN25VL); // only 2.5 requires it
                         // ref: https://huggingface.co/Qwen/Qwen2.5-VL-7B-Instruct/blob/main/preprocessor_config.json
@@ -3848,6 +3850,40 @@ bool clip_image_batch_encode(clip_ctx * ctx, int n_threads, const clip_image_f32
                 }
 
                 set_input_i32("positions", positions);
+
+                if (ctx->proj_type() == PROJECTOR_TYPE_QWEN3VL) {
+                    constexpr int source_side = 48; // sqrt(2304 learned positions)
+                    std::array<std::vector<int32_t>, 4> idx;
+                    std::array<std::vector<float>, 4> weight;
+                    for (auto & values : idx) values.reserve(n_pos);
+                    for (auto & values : weight) values.reserve(n_pos);
+                    for (int y = 0; y < ph; ++y) {
+                        const float fy = ph == 1 ? 0.0f :
+                            (float) y * (source_side - 1) / (float) (ph - 1);
+                        const int y0 = (int) fy;
+                        const int y1 = std::min(y0 + 1, source_side - 1);
+                        const float dy = fy - y0;
+                        for (int x = 0; x < pw; ++x) {
+                            const float fx = pw == 1 ? 0.0f :
+                                (float) x * (source_side - 1) / (float) (pw - 1);
+                            const int x0 = (int) fx;
+                            const int x1 = std::min(x0 + 1, source_side - 1);
+                            const float dx = fx - x0;
+                            idx[0].push_back(y0 * source_side + x0);
+                            idx[1].push_back(y0 * source_side + x1);
+                            idx[2].push_back(y1 * source_side + x0);
+                            idx[3].push_back(y1 * source_side + x1);
+                            weight[0].push_back((1.0f - dy) * (1.0f - dx));
+                            weight[1].push_back((1.0f - dy) * dx);
+                            weight[2].push_back(dy * (1.0f - dx));
+                            weight[3].push_back(dy * dx);
+                        }
+                    }
+                    for (int corner = 0; corner < 4; ++corner) {
+                        set_input_i32(("qwen3_pos_idx_" + std::to_string(corner)).c_str(), idx[corner]);
+                        set_input_f32(("qwen3_pos_weight_" + std::to_string(corner)).c_str(), weight[corner]);
+                    }
+                }
             } break;
         case PROJECTOR_TYPE_STEP3VL:
             {

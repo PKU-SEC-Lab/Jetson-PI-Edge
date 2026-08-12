@@ -68,6 +68,14 @@ if (BUILD_SHARED_LIBS)
 endif()
 
 if (LLAMA_BUILD_COMMON AND (LLAMA_BUILD_TOOLS OR JETSON_PI_BUILD_MTMD))
+    add_library(jetson_pi_gr00t_input STATIC
+        gr00t-input.h
+        gr00t-input.cpp
+    )
+    target_include_directories(jetson_pi_gr00t_input PUBLIC ${CMAKE_CURRENT_SOURCE_DIR})
+    target_compile_features(jetson_pi_gr00t_input PUBLIC cxx_std_17)
+    set_target_properties(jetson_pi_gr00t_input PROPERTIES POSITION_INDEPENDENT_CODE ON)
+
     add_library(jetson_pi_pi0
         ../include/jetson_pi_pi0.h
         jetson_pi_pi0.cpp
@@ -80,8 +88,12 @@ if (LLAMA_BUILD_COMMON AND (LLAMA_BUILD_TOOLS OR JETSON_PI_BUILD_MTMD))
         ../include/jetson_pi_mllm.h
         jetson_pi_mllm.cpp
     )
+    add_library(jetson_pi_gr00t
+        ../include/jetson_pi_gr00t.h
+        jetson_pi_gr00t.cpp
+    )
 
-    foreach(target jetson_pi_pi0 jetson_pi_llm jetson_pi_mllm)
+    foreach(target jetson_pi_pi0 jetson_pi_llm jetson_pi_mllm jetson_pi_gr00t)
         set_target_properties(${target} PROPERTIES
             VERSION ${LLAMA_INSTALL_VERSION}
             SOVERSION 0
@@ -97,8 +109,9 @@ if (LLAMA_BUILD_COMMON AND (LLAMA_BUILD_TOOLS OR JETSON_PI_BUILD_MTMD))
     target_link_libraries(jetson_pi_pi0 PUBLIC mtmd llama ggml)
     target_link_libraries(jetson_pi_llm PUBLIC llama ggml)
     target_link_libraries(jetson_pi_mllm PUBLIC mtmd llama ggml)
+    target_link_libraries(jetson_pi_gr00t PUBLIC mtmd llama ggml PRIVATE jetson_pi_gr00t_input)
 
-    install(TARGETS jetson_pi_pi0 jetson_pi_llm jetson_pi_mllm
+    install(TARGETS jetson_pi_pi0 jetson_pi_llm jetson_pi_mllm jetson_pi_gr00t
         LIBRARY DESTINATION ${CMAKE_INSTALL_LIBDIR}
         ARCHIVE DESTINATION ${CMAKE_INSTALL_LIBDIR}
         RUNTIME DESTINATION ${CMAKE_INSTALL_BINDIR}
@@ -107,6 +120,7 @@ if (LLAMA_BUILD_COMMON AND (LLAMA_BUILD_TOOLS OR JETSON_PI_BUILD_MTMD))
         ${CMAKE_CURRENT_SOURCE_DIR}/../include/jetson_pi_pi0.h
         ${CMAKE_CURRENT_SOURCE_DIR}/../include/jetson_pi_llm.h
         ${CMAKE_CURRENT_SOURCE_DIR}/../include/jetson_pi_mllm.h
+        ${CMAKE_CURRENT_SOURCE_DIR}/../include/jetson_pi_gr00t.h
         DESTINATION ${CMAKE_INSTALL_INCLUDEDIR}
     )
 endif()

@@ -21,6 +21,7 @@
   <p>
     <a href="#real-world-demo">Demo</a> ·
     <a href="#quick-start">Quick Start</a> ·
+    <a href="#gr00t-n17-c-api-and-server">GR00T APIs</a> ·
     <a href="#performance-on-jetson-orin">Performance</a> ·
     <a href="docs/model_conversion.md">Model Conversion</a> ·
     <a href="docs/foreground_server_usage.md">Server API</a> ·
@@ -32,6 +33,7 @@
 
 ## News
 
+- **[2026/08] NVIDIA Isaac GR00T N1.7 inference is available.** Convert the official checkpoint to GGUF and run the complete Qwen3-VL backbone, Action Head, and four-step action flow through either `libjetson_pi_gr00t` or the foreground HTTP server.
 - **[2026/07] Python APIs are available.** Use the managed foreground NumPy client for persistent `llama-server` sessions or the optional pybind11 module for in-process PI0/PI0.5 action inference.
 - **[2026/07] Updated to the latest llama.cpp codebase.** Jetson-PI-Edge now tracks the latest llama.cpp architecture while retaining PI0/PI0.5 inference, foreground server, and FlashRT integration support.
 - **[2026/07] FlashRT support is available.** Jetson-PI is exposed as a FlashRT-loadable provider through a C API, allowing [FlashRT](https://github.com/flashrt-project/FlashRT) to invoke the same PI0/PI0.5 model path directly from Python without starting the foreground HTTP server.
@@ -46,7 +48,7 @@ Jetson-PI-Edge is the inference engine accompanying our paper:
 > Zebin Yang, Qi Wang, Yunhe Wang, Xiurui Guo, Bo Yu, Shaoshan Liu, Jiafeng Xu, Hao Dong, and Meng Li.<br>
 > arXiv:2607.12659, 2026.
 
-Deploying VLA policies on low-power onboard hardware is difficult because model latency directly limits control frequency and responsiveness. Jetson-PI combines foresight-aligned asynchronous correction with confidence-aware scheduling and system-level acceleration. This repository provides the llama.cpp-based execution layer: GGUF model loading, multimodal encoding, PI action-expert inference, graph reuse, and a persistent foreground server for robot control loops.
+Deploying VLA policies on low-power onboard hardware is difficult because model latency directly limits control frequency and responsiveness. Jetson-PI combines foresight-aligned asynchronous correction with confidence-aware scheduling and system-level acceleration. This repository provides the llama.cpp-based execution layer: GGUF model loading, multimodal encoding, PI and GR00T action inference, graph reuse, and robot-facing runtime interfaces.
 
 The project is built on [llama.cpp](https://github.com/ggml-org/llama.cpp). The asynchronous control algorithm lives in [PKU-SEC-Lab/Jetson-PI](https://github.com/PKU-SEC-Lab/Jetson-PI).
 
@@ -66,7 +68,8 @@ The project is built on [llama.cpp](https://github.com/ggml-org/llama.cpp). The 
 
 - ✅ **PI0** - PI-specific multimodal preprocessing, language backbone, action expert, and continuous action-chunk generation.
 - ✅ **PI0.5** - two-view prefix construction, PI0.5 prompt/state handling, and 10-step action generation.
-- ✅ **Automatic model dispatch** - detect PI0 and PI0.5 from GGUF metadata and model tensor names, with an explicit `PI_MODEL` override.
+- ✅ **NVIDIA Isaac GR00T N1.7** - Qwen3-VL multimodal backbone, complete GR00T Action Head, four-step flow matching, and `[40, 132]` action generation.
+- ✅ **Automatic model dispatch** - detect PI0, PI0.5, and GR00T N1.7 from GGUF metadata and model tensor names, with an explicit `PI_MODEL` override for PI models.
 
 ### Runtime Optimizations
 
@@ -76,14 +79,18 @@ The project is built on [llama.cpp](https://github.com/ggml-org/llama.cpp). The 
 
 ### Interfaces and Deployment
 
-- ✅ **Foreground HTTP server** - persistent image, robot-state, and instruction endpoints with action and timing outputs.
+- ✅ **Foreground HTTP server** - persistent PI0, PI0.5, and GR00T image, robot-state, and instruction endpoints with action and timing outputs.
 - ✅ **FlashRT provider** - expose the same PI0/PI0.5 GGUF runtime through a C API for the FlashRT Python model interface.
+- ✅ **GR00T C API** - accept raw multi-camera RGB, instruction, normalized state, and embodiment ID through `libjetson_pi_gr00t`.
+
+The foreground HTTP server supports PI0, PI0.5, and GR00T N1.7. The managed Python
+foreground client and FlashRT provider currently remain specific to PI0 and PI0.5;
+GR00T callers can use the HTTP endpoints directly or the standalone C API.
 
 ### Planned Model Support
 
 #### Vision-Language-Action Models
 
-- [ ] [NVIDIA Isaac GR00T N1.7](https://github.com/NVIDIA/Isaac-GR00T) - open reasoning VLA for generalist and humanoid robot control.
 - [ ] [LingBot-VLA 2.0](https://github.com/Robbyant/lingbot-vla-v2) - cross-embodiment VLA covering manipulators and humanoid robots.
 - [ ] [Qwen-RobotManip](https://qwen.ai/blog?id=qwen-robotmanip) - Qwen-based manipulation VLA with representation, motion, and behavior alignment.
 
@@ -99,9 +106,9 @@ flowchart LR
     CAM[Camera views] --> SESSION[Foreground session]
     STATE[Robot state] --> SESSION
     TEXT[Language instruction] --> SESSION
-    SESSION --> VIT[SigLIP / mmproj]
-    VIT --> VLM[PI language backbone]
-    VLM --> AE[Action expert]
+    SESSION --> VIT[SigLIP or Qwen3-VL mmproj]
+    VIT --> VLM[PI or GR00T backbone]
+    VLM --> AE[PI action expert or GR00T Action Head]
     AE --> ACTION[Action chunk]
     ACTION --> ROBOT[Robot controller]
 
@@ -190,6 +197,74 @@ curl -X POST http://127.0.0.1:8080/foreground/infer \
 ```
 
 The response contains `action_final` together with model and server timing fields such as `encode_ms`, `decode_ms`, `total_ms`, and `timing_breakdown_ms`. See the [Foreground Server API](docs/foreground_server_usage.md) for endpoint semantics and all response fields.
+
+## GR00T N1.7 C API and Server
+
+GR00T N1.7 is available through both a standalone product library and the existing
+foreground HTTP server. Build the runtime with CUDA support using:
+
+```bash
+cmake -S . -B build -DGGML_CUDA=ON -DCMAKE_BUILD_TYPE=Release
+cmake --build build --target jetson_pi_gr00t llama-server -j
+```
+
+Convert the official GR00T and Cosmos checkpoints into a matching main GGUF and mmproj
+GGUF by following the [GR00T validation and conversion guide](tools/gr00t-reference/README.md).
+Applications include `jetson_pi_gr00t.h`, link against `libjetson_pi_gr00t`, and use:
+
+```c
+jetson_pi_gr00t_config config = {
+    .struct_size   = sizeof(jetson_pi_gr00t_config),
+    .model_path    = "/path/to/gr00t-n1d7.gguf",
+    .mmproj_path   = "/path/to/mmproj-gr00t-n1d7.gguf",
+    .backend       = "cuda",
+    .n_images      = 4,
+    .image_height  = 180,
+    .image_width   = 320,
+    .n_threads     = 0,
+    .embodiment_id = 24,
+};
+
+jetson_pi_gr00t * engine = NULL;
+if (jetson_pi_gr00t_open(&config, &engine) != JETSON_PI_GR00T_OK) {
+    /* Handle jetson_pi_gr00t_open_error(). */
+}
+```
+
+Call `jetson_pi_gr00t_infer()` for one complete policy tick. It accepts RGB-interleaved
+raw images in the checkpoint's camera/time order, a UTF-8 instruction, and an already
+normalized state. The library performs GR00T image preprocessing, Qwen3-VL multimodal
+inference, the complete Action Head, and four flow-matching steps before returning the
+checkpoint's normalized `[40, 132]` action chunk. Query the exact output shape with
+`jetson_pi_gr00t_action_shape()`.
+
+To use Server mode, start `llama-server` with the GR00T main GGUF and matching mmproj.
+The server detects `gr00t-n1d7` from model metadata; do not set `PI_MODEL`:
+
+```bash
+./build/bin/llama-server \
+  -m /path/to/gr00t-n1d7.gguf \
+  --mmproj /path/to/mmproj-gr00t-n1d7.gguf \
+  -ngl 99 --host 0.0.0.0 --port 8080
+```
+
+Use the normal `/foreground/reset` and ordered `/foreground/image` calls, then submit
+the normalized state together with its GR00T embodiment ID:
+
+```bash
+curl -X PUT http://127.0.0.1:8080/foreground/state \
+  -H 'Content-Type: application/json' \
+  -d '{"state":[0.0,0.0,0.0],"embodiment_id":24}'
+
+curl -X POST http://127.0.0.1:8080/foreground/infer \
+  -H 'Content-Type: application/json' \
+  -d '{"text":"pick up the object and place it into the tray"}'
+```
+
+The server pads short state arrays to the width stored in GGUF metadata and returns the
+normalized action in `action_final` with `action_steps` and `action_dim`. Image upload
+order must match the checkpoint's camera/time convention. The managed Python foreground
+client and FlashRT provider do not yet dispatch GR00T models.
 
 ## Python Foreground API
 
@@ -354,6 +429,7 @@ Latency is measured in milliseconds on NVIDIA Jetson Orin in MAXN mode. See the 
 | Document | Description |
 |---|---|
 | [Model Preparation](docs/model_conversion.md) | Download, split, and convert PI checkpoints to GGUF. |
+| [GR00T Validation and Conversion](tools/gr00t-reference/README.md) | Convert GR00T N1.7 to GGUF and run reference and regression utilities. |
 | [Foreground Server API](docs/foreground_server_usage.md) | Session lifecycle, endpoints, response fields, and operational notes. |
 | [ViT Optimization](latency_optimize_docs/pi0_vit_optimization.md) | Vision graph reuse and input-layout optimization. |
 | [Decode Graph Reuse](latency_optimize_docs/pi0_decode_graph_reuse.md) | Action-expert graph reuse implementation. |
@@ -374,4 +450,4 @@ If Jetson-PI or Jetson-PI-Edge helps your research, please cite our paper:
 
 ## Acknowledgments
 
-Jetson-PI-Edge builds on [llama.cpp](https://github.com/ggml-org/llama.cpp), [OpenPI](https://github.com/Physical-Intelligence/openpi), and the PI model family from [Physical Intelligence](https://www.physicalintelligence.company/). We also thank the [FlashRT](https://github.com/flashrt-project/FlashRT) project for its high-performance real-time VLA deployment path.
+Jetson-PI-Edge builds on [llama.cpp](https://github.com/ggml-org/llama.cpp), [OpenPI](https://github.com/Physical-Intelligence/openpi), the PI model family from [Physical Intelligence](https://www.physicalintelligence.company/), and [NVIDIA Isaac GR00T](https://github.com/NVIDIA/Isaac-GR00T). We also thank the [FlashRT](https://github.com/flashrt-project/FlashRT) project for its high-performance real-time VLA deployment path.

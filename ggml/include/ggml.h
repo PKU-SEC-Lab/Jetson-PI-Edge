@@ -226,7 +226,7 @@
 #define GGML_MAX_OP_PARAMS      64
 
 #ifndef GGML_MAX_NAME
-#   define GGML_MAX_NAME        64
+#   define GGML_MAX_NAME        128 // GR00T N1.7 preserves official action-head tensor paths
 #endif
 
 #define GGML_DEFAULT_N_THREADS  4

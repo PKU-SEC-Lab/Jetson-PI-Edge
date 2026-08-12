@@ -84,6 +84,14 @@ struct llama_hparams {
     uint32_t inference_steps  = 0;
     uint32_t action_steps     = 0;
     uint32_t action_dim       = 0;
+    uint32_t gr00t_state_dim       = 0;
+    uint32_t gr00t_timestep_buckets = 0;
+    uint32_t gr00t_embodiment_count = 0;
+    uint32_t gr00t_dit_blocks       = 0;
+    uint32_t gr00t_dit_heads        = 0;
+    uint32_t gr00t_dit_head_dim     = 0;
+    uint32_t gr00t_dit_output_dim   = 0;
+    uint32_t gr00t_vl_blocks        = 0;
 
     std::array<uint32_t, LLAMA_MAX_LAYERS> n_head_arr;
     std::array<uint32_t, LLAMA_MAX_LAYERS> n_head_kv_arr;

@@ -13,7 +13,9 @@
 #include "pi-model.h"
 
 #include <algorithm>
+#include <array>
 #include <cinttypes>
+#include <climits>
 #include <vector>
 
 //#define MTMD_AUDIO_DEBUG
@@ -479,6 +481,78 @@ int32_t mtmd_helper_eval_chunks(mtmd_context * ctx,
     }
 
     return 0;
+}
+
+int32_t mtmd_helper_eval_chunks_gr00t(
+        mtmd_context * ctx,
+        llama_context * lctx,
+        const mtmd_input_chunks * chunks,
+        llama_pos n_past,
+        llama_pos * new_n_past) {
+    if (ctx == nullptr || lctx == nullptr || chunks == nullptr || new_n_past == nullptr ||
+            !mtmd_decode_use_mrope(ctx)) {
+        return -1;
+    }
+
+    const size_t total_tokens = mtmd_helper_get_n_tokens(chunks);
+    const int32_t n_embd_inp = llama_model_n_embd_inp(llama_get_model(lctx));
+    if (total_tokens == 0 || total_tokens > (size_t) INT32_MAX || n_embd_inp <= 0) {
+        return -1;
+    }
+
+    std::vector<llama_token> tokens;
+    std::vector<uint8_t> image_mask;
+    std::vector<float> image_embd;
+    std::array<std::vector<llama_pos>, 4> pos;
+    tokens.reserve(total_tokens);
+    image_mask.reserve(total_tokens);
+    for (auto & section : pos) section.reserve(total_tokens);
+
+    constexpr llama_token image_token_id = 151655;
+    for (size_t ci = 0; ci < mtmd_input_chunks_size(chunks); ++ci) {
+        const mtmd_input_chunk * chunk = mtmd_input_chunks_get(chunks, ci);
+        const auto type = mtmd_input_chunk_get_type(chunk);
+        if (type == MTMD_INPUT_CHUNK_TYPE_TEXT) {
+            size_t count = 0;
+            const llama_token * text_tokens = mtmd_input_chunk_get_tokens_text(chunk, &count);
+            if (text_tokens == nullptr) return -1;
+            for (size_t i = 0; i < count; ++i) {
+                tokens.push_back(text_tokens[i]);
+                image_mask.push_back(0);
+                for (auto & section : pos) section.push_back(n_past);
+                ++n_past;
+            }
+        } else if (type == MTMD_INPUT_CHUNK_TYPE_IMAGE) {
+            if (mtmd_encode_chunk(ctx, chunk) != 0) return -1;
+            const size_t count = mtmd_input_chunk_get_n_tokens(chunk);
+            const mtmd_image_tokens * image_tokens = mtmd_input_chunk_get_tokens_image(chunk);
+            if (image_tokens == nullptr) return -1;
+            const float * encoded = mtmd_get_output_embd(ctx);
+            image_embd.insert(image_embd.end(), encoded, encoded + count * (size_t) n_embd_inp);
+            std::vector<mtmd_decoder_pos> image_pos(count);
+            mtmd_helper_image_get_decoder_pos(image_tokens, n_past, image_pos.data());
+            for (const mtmd_decoder_pos & p : image_pos) {
+                tokens.push_back(image_token_id);
+                image_mask.push_back(1);
+                pos[0].push_back((llama_pos) p.t);
+                pos[1].push_back((llama_pos) p.x);
+                pos[2].push_back((llama_pos) p.y);
+                pos[3].push_back((llama_pos) p.z);
+            }
+            n_past += mtmd_input_chunk_get_n_pos(chunk);
+        } else {
+            return -1;
+        }
+    }
+
+    std::vector<llama_pos> flat_pos;
+    flat_pos.reserve(4 * total_tokens);
+    for (const auto & section : pos) flat_pos.insert(flat_pos.end(), section.begin(), section.end());
+    const int32_t result = llama_gr00t_decode_multimodal(
+            lctx, tokens.data(), image_embd.data(), image_mask.data(), flat_pos.data(),
+            (int32_t) total_tokens);
+    if (result == 0) *new_n_past = n_past;
+    return result;
 }
 
 namespace audio_helpers {

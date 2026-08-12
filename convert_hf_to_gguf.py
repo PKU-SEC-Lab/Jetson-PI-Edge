@@ -1584,7 +1584,8 @@ class MmprojModel(ModelBase):
         # load preprocessor config
         self.preprocessor_config = {}
         if not self.is_mistral_format:
-            with open(self.dir_model / "preprocessor_config.json", "r", encoding="utf-8") as f:
+            preprocessor_dir = Path(self.global_config.get("_preprocessor_config_dir", self.dir_model))
+            with open(preprocessor_dir / "preprocessor_config.json", "r", encoding="utf-8") as f:
                 self.preprocessor_config = json.load(f)
 
     def get_vision_config(self) -> dict[str, Any] | None:
@@ -4411,6 +4412,123 @@ class Qwen3VLMoeTextModel(Qwen3MoeModel):
         if name.startswith("model.visual."):
             return []
 
+        return super().modify_tensors(data_torch, name, bid)
+
+
+def gr00t_n1d7_merged_hparams(hparams: dict[str, Any]) -> tuple[dict[str, Any], Path]:
+    """Merge the external Cosmos architecture config into a GR00T checkpoint config."""
+    cosmos_value = hparams.get("_gr00t_cosmos_dir")
+    if cosmos_value is None:
+        raise ValueError(
+            "GR00T N1.7 conversion requires --gr00t-cosmos pointing to the local "
+            "nvidia/Cosmos-Reason2-2B snapshot"
+        )
+    cosmos_dir = Path(cosmos_value)
+    config_path = cosmos_dir / "config.json"
+    if not config_path.is_file():
+        raise ValueError(f"Cosmos config not found: {config_path}")
+    with config_path.open("r", encoding="utf-8") as source:
+        cosmos_hparams = json.load(source)
+
+    merged = dict(hparams)
+    merged["text_config"] = dict(cosmos_hparams["text_config"])
+    merged["vision_config"] = dict(cosmos_hparams["vision_config"])
+    # The GR00T checkpoint physically contains only the selected prefix layers.
+    merged["text_config"]["num_hidden_layers"] = int(hparams["select_layer"])
+    merged["_preprocessor_config_dir"] = str(cosmos_dir)
+    return merged, cosmos_dir
+
+
+@ModelBase.register("Gr00tN1d7")
+class Gr00tN1d7TextModel(Qwen3VLTextModel):
+    model_arch = gguf.MODEL_ARCH.GR00T_N1D7
+
+    def __init__(self, *args, **kwargs):
+        original = dict(kwargs.get("hparams") or ModelBase.load_hparams(args[0], False))
+        merged, self.cosmos_dir = gr00t_n1d7_merged_hparams(original)
+        kwargs["hparams"] = merged
+        self.gr00t_hparams = original
+        super().__init__(*args, **kwargs)
+
+    def set_vocab(self):
+        # Tokenizer and chat template live in the gated Cosmos snapshot, not in the
+        # GR00T checkpoint. Tensor indexing has already happened, so temporarily
+        # switching this path affects vocabulary export only.
+        checkpoint_dir = self.dir_model
+        self.dir_model = self.cosmos_dir
+        try:
+            super().set_vocab()
+        finally:
+            self.dir_model = checkpoint_dir
+
+    def set_gguf_parameters(self):
+        super().set_gguf_parameters()
+        arch = gguf.MODEL_ARCH_NAMES[self.model_arch]
+        hparams = self.gr00t_hparams
+        diffusion = hparams["diffusion_model_cfg"]
+        self.gguf_writer.add_uint32(f"{arch}.state_dimension", int(hparams["max_state_dim"]))
+        self.gguf_writer.add_uint32(f"{arch}.action_dimension", int(hparams["max_action_dim"]))
+        self.gguf_writer.add_uint32(f"{arch}.action_horizon", int(hparams["action_horizon"]))
+        self.gguf_writer.add_uint32(
+            f"{arch}.inference_steps", int(hparams["num_inference_timesteps"])
+        )
+        self.gguf_writer.add_uint32(
+            f"{arch}.timestep_buckets", int(hparams["num_timestep_buckets"])
+        )
+        self.gguf_writer.add_uint32(
+            f"{arch}.embodiment_count", int(hparams["max_num_embodiments"])
+        )
+        self.gguf_writer.add_uint32(f"{arch}.backbone_layer_count", int(hparams["select_layer"]))
+        self.gguf_writer.add_uint32(f"{arch}.dit_block_count", int(diffusion["num_layers"]))
+        self.gguf_writer.add_uint32(
+            f"{arch}.dit_head_count", int(diffusion["num_attention_heads"])
+        )
+        self.gguf_writer.add_uint32(
+            f"{arch}.dit_head_dimension", int(diffusion["attention_head_dim"])
+        )
+        self.gguf_writer.add_uint32(f"{arch}.dit_output_dimension", int(diffusion["output_dim"]))
+        self.gguf_writer.add_uint32(
+            f"{arch}.vl_self_attention_block_count",
+            int(hparams["vl_self_attention_cfg"]["num_layers"]),
+        )
+        for filename, key in (
+            ("processor_config.json", "processor_config"),
+            ("statistics.json", "statistics"),
+            ("embodiment_id.json", "embodiment_ids"),
+        ):
+            value = (self.dir_model / filename).read_text(encoding="utf-8")
+            self.gguf_writer.add_string(f"{arch}.{key}", value)
+
+    def modify_tensors(
+        self, data_torch: Tensor, name: str, bid: int | None
+    ) -> Iterable[tuple[str, Tensor]]:
+        if name.startswith("action_head."):
+            # Preserve the reference hierarchy. Runtime lookup uses this stable,
+            # architecture-prefixed namespace and can validate every shape directly.
+            return [(f"gr00t.{name}", data_torch)]
+        if name == "backbone.model.lm_head.weight":
+            # GR00T consumes hidden states and never evaluates language logits.
+            return []
+        if name.startswith("backbone.model."):
+            name = name.removeprefix("backbone.model.")
+        return super().modify_tensors(data_torch, name, bid)
+
+
+@ModelBase.register("Gr00tN1d7")
+class Gr00tN1d7VisionModel(Qwen3VLVisionModel):
+    def __init__(self, *args, **kwargs):
+        original = dict(kwargs.get("hparams") or ModelBase.load_hparams(args[0], False))
+        merged, _cosmos_dir = gr00t_n1d7_merged_hparams(original)
+        kwargs["hparams"] = merged
+        super().__init__(*args, **kwargs)
+
+    def modify_tensors(
+        self, data_torch: Tensor, name: str, bid: int | None
+    ) -> Iterable[tuple[str, Tensor]]:
+        if name.startswith("action_head.") or name == "backbone.model.lm_head.weight":
+            return []
+        if name.startswith("backbone.model."):
+            name = name.removeprefix("backbone.model.")
         return super().modify_tensors(data_torch, name, bid)
 
 
@@ -10456,6 +10574,10 @@ def parse_args() -> argparse.Namespace:
         help="(Experimental) Export multimodal projector (mmproj) for vision models. This will only work on some vision models. A prefix 'mmproj-' will be added to the output file name.",
     )
     parser.add_argument(
+        "--gr00t-cosmos", type=Path,
+        help="local nvidia/Cosmos-Reason2-2B snapshot required by GR00T N1.7 conversion",
+    )
+    parser.add_argument(
         "--mistral-format", action="store_true",
         help="Whether the model is stored following the Mistral format.",
     )
@@ -10587,6 +10709,11 @@ def main() -> None:
         output_type = ftype_map[args.outtype]
         model_type = ModelType.MMPROJ if args.mmproj else ModelType.TEXT
         hparams = ModelBase.load_hparams(dir_model, is_mistral_format)
+        if args.gr00t_cosmos is not None:
+            if not args.gr00t_cosmos.is_dir():
+                parser_error = f"--gr00t-cosmos is not a directory: {args.gr00t_cosmos}"
+                raise ValueError(parser_error)
+            hparams["_gr00t_cosmos_dir"] = str(args.gr00t_cosmos.resolve())
         # import pdb;pdb.set_trace()
         # import pdb;pdb.set_trace()
         if not is_mistral_format:
@@ -10611,7 +10738,8 @@ def main() -> None:
                                      split_max_size=split_str_to_n_bytes(args.split_max_size), dry_run=args.dry_run,
                                      small_first_shard=args.no_tensor_first_split,
                                      remote_hf_model_id=hf_repo_id, disable_mistral_community_chat_template=disable_mistral_community_chat_template,
-                                     sentence_transformers_dense_modules=args.sentence_transformers_dense_modules
+                                     sentence_transformers_dense_modules=args.sentence_transformers_dense_modules,
+                                     hparams=hparams,
                                      )
 
         if args.vocab_only:
