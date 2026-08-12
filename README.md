@@ -37,7 +37,7 @@
 - **[2026/07] Python APIs are available.** Use the managed foreground NumPy client for persistent `llama-server` sessions or the optional pybind11 module for in-process PI0/PI0.5 action inference.
 - **[2026/07] Updated to the latest llama.cpp codebase.** Jetson-PI-Edge now tracks the latest llama.cpp architecture while retaining PI0/PI0.5 inference, foreground server, and FlashRT integration support.
 - **[2026/07] FlashRT support is available.** Jetson-PI is exposed as a FlashRT-loadable provider through a C API, allowing [FlashRT](https://github.com/flashrt-project/FlashRT) to invoke the same PI0/PI0.5 model path directly from Python without starting the foreground HTTP server.
-- **[2026/07] Pre-converted GGUF checkpoints are available.** Ready-to-use PI0 and PI0.5 model and vision GGUF files are released on [Hugging Face](https://huggingface.co/diantoudefengshan/Jetson-PI-GGUF).
+- **[2026/08] Pre-converted GGUF checkpoints are available.** Ready-to-use PI0, PI0.5, and GR00T N1.7 main-model and vision-projector GGUF files are released on [Hugging Face](https://huggingface.co/diantoudefengshan/Jetson-PI-GGUF).
 - **[2026/07] Jetson-PI is open source.** We released the [Jetson-PI asynchronous control framework](https://github.com/PKU-SEC-Lab/Jetson-PI) and this [Jetson-PI-Edge inference engine](https://github.com/PKU-SEC-Lab/Jetson-PI-Edge).
 
 ## About
@@ -208,8 +208,11 @@ cmake -S . -B build -DGGML_CUDA=ON -DCMAKE_BUILD_TYPE=Release
 cmake --build build --target jetson_pi_gr00t llama-server -j
 ```
 
-Convert the official GR00T and Cosmos checkpoints into a matching main GGUF and mmproj
-GGUF by following the [GR00T validation and conversion guide](tools/gr00t-reference/README.md).
+Download the ready-to-use BF16 [GR00T N1.7 main GGUF](https://huggingface.co/diantoudefengshan/Jetson-PI-GGUF/resolve/main/gr00t-n1d7/gr00t-n1d7-bf16.gguf)
+and matching [vision-projector GGUF](https://huggingface.co/diantoudefengshan/Jetson-PI-GGUF/resolve/main/gr00t-n1d7/mmproj-gr00t-n1d7-bf16.gguf),
+or convert the official GR00T and Cosmos checkpoints by following the
+[GR00T validation and conversion guide](tools/gr00t-reference/README.md). Always use
+the main model and mmproj from the same release directory.
 Applications include `jetson_pi_gr00t.h`, link against `libjetson_pi_gr00t`, and use:
 
 ```c
