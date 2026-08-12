@@ -1,4 +1,5 @@
 #include "jetson_pi_gr00t.h"
+#include "gr00t-input.h"
 
 #include "ggml-backend.h"
 #include "llama.h"
@@ -6,8 +7,6 @@
 #include "mtmd-helper.h"
 
 #include <algorithm>
-#include <cctype>
-#include <cmath>
 #include <cstring>
 #include <limits>
 #include <new>
@@ -42,74 +41,6 @@ int32_t reject(Gr00tEngine * e, int32_t code, const char * message) {
 void free_bitmaps(std::vector<mtmd_bitmap *> & bitmaps) {
     for (mtmd_bitmap * bitmap : bitmaps) mtmd_bitmap_free(bitmap);
     bitmaps.clear();
-}
-
-// Pixel-center bilinear interpolation. GR00T's two SmallestMaxSize operations
-// use INTER_AREA; for the normal camera path both operations upscale, where
-// OpenCV uses its linear resampling path.
-std::vector<uint8_t> resize_rgb(const uint8_t * src, int sw, int sh, int dw, int dh) {
-    std::vector<uint8_t> dst((size_t) dw * dh * 3);
-    for (int y = 0; y < dh; ++y) {
-        const float sy = ((y + 0.5f) * sh / dh) - 0.5f;
-        const int y0 = std::max(0, std::min(sh - 1, (int) std::floor(sy)));
-        const int y1 = std::min(sh - 1, y0 + 1);
-        const float fy = std::max(0.0f, sy - std::floor(sy));
-        for (int x = 0; x < dw; ++x) {
-            const float sx = ((x + 0.5f) * sw / dw) - 0.5f;
-            const int x0 = std::max(0, std::min(sw - 1, (int) std::floor(sx)));
-            const int x1 = std::min(sw - 1, x0 + 1);
-            const float fx = std::max(0.0f, sx - std::floor(sx));
-            for (int c = 0; c < 3; ++c) {
-                const float a = src[((size_t) y0 * sw + x0) * 3 + c] * (1 - fx) +
-                                src[((size_t) y0 * sw + x1) * 3 + c] * fx;
-                const float b = src[((size_t) y1 * sw + x0) * 3 + c] * (1 - fx) +
-                                src[((size_t) y1 * sw + x1) * 3 + c] * fx;
-                dst[((size_t) y * dw + x) * 3 + c] =
-                    (uint8_t) std::max(0.0f, std::min(255.0f, std::round(a * (1 - fy) + b * fy)));
-            }
-        }
-    }
-    return dst;
-}
-
-std::vector<uint8_t> preprocess_gr00t(const uint8_t * rgb, int width, int height,
-                                      int & output_width, int & output_height) {
-    constexpr int shortest = 256;
-    const double first_scale = (double) shortest / std::min(width, height);
-    const int resized_w = (int) std::round(width * first_scale);
-    const int resized_h = (int) std::round(height * first_scale);
-    std::vector<uint8_t> resized = resize_rgb(rgb, width, height, resized_w, resized_h);
-
-    const int crop_w = std::max(1, (int) (resized_w * 0.95));
-    const int crop_h = std::max(1, (int) (resized_h * 0.95));
-    const int x0 = (resized_w - crop_w) / 2;
-    const int y0 = (resized_h - crop_h) / 2;
-    std::vector<uint8_t> crop((size_t) crop_w * crop_h * 3);
-    for (int y = 0; y < crop_h; ++y) {
-        std::memcpy(crop.data() + (size_t) y * crop_w * 3,
-                    resized.data() + ((size_t) (y + y0) * resized_w + x0) * 3,
-                    (size_t) crop_w * 3);
-    }
-
-    const double second_scale = (double) shortest / std::min(crop_w, crop_h);
-    output_width = (int) std::round(crop_w * second_scale);
-    output_height = (int) std::round(crop_h * second_scale);
-    return resize_rgb(crop.data(), crop_w, crop_h, output_width, output_height);
-}
-
-std::string formalize_instruction(const char * text, size_t size) {
-    std::string result;
-    result.reserve(size);
-    for (size_t i = 0; i < size; ++i) {
-        const unsigned char ch = (unsigned char) text[i];
-        // Match Python re.sub(r"[^\w\s]", "", lang.lower()) for ASCII;
-        // preserve non-ASCII UTF-8 bytes so multilingual instructions remain
-        // valid input to the tokenizer.
-        if (ch >= 0x80) result.push_back((char) ch);
-        else if (std::isalnum(ch) || ch == '_' || std::isspace(ch))
-            result.push_back((char) std::tolower(ch));
-    }
-    return result;
 }
 
 } // namespace
@@ -232,32 +163,34 @@ int32_t jetson_pi_gr00t_infer(jetson_pi_gr00t * handle,
     }
     const size_t action_count = (size_t) e->action_steps * e->action_dim;
     if (action_capacity < action_count) { *actions_written = action_count; return reject(e, JETSON_PI_GR00T_BUFFER_TOO_SMALL, "action buffer too small"); }
-    if (n_state > e->state_dim) return reject(e, JETSON_PI_GR00T_STATE_SIZE, "state exceeds GR00T state width");
-    std::vector<float> padded_state(e->state_dim, 0.0f);
-    for (size_t i = 0; i < n_state; ++i) {
-        if (!std::isfinite(state[i])) return reject(e, JETSON_PI_GR00T_INVALID, "state must be finite");
-        padded_state[i] = state[i];
+    std::vector<float> padded_state;
+    std::string input_error;
+    if (!gr00t_input::prepare_state(state, n_state, e->state_dim, padded_state, input_error)) {
+        const int32_t code = n_state > e->state_dim ? JETSON_PI_GR00T_STATE_SIZE : JETSON_PI_GR00T_INVALID;
+        return reject(e, code, input_error.c_str());
     }
     llama_set_gr00t_state(e->lctx, padded_state.data(), padded_state.size());
     llama_memory_clear(llama_get_memory(e->lctx), true);
 
-    std::vector<std::vector<uint8_t>> processed;
+    std::vector<gr00t_input::processed_image> processed;
     std::vector<mtmd_bitmap *> bitmaps;
     std::vector<const mtmd_bitmap *> bitmap_ptrs;
     processed.reserve(n_images); bitmaps.reserve(n_images); bitmap_ptrs.reserve(n_images);
-    int processed_w = 0, processed_h = 0;
     for (uint32_t i = 0; i < n_images; ++i) {
         if (!images_rgb[i]) { free_bitmaps(bitmaps); return reject(e, JETSON_PI_GR00T_INVALID, "null RGB image"); }
-        processed.push_back(preprocess_gr00t(images_rgb[i], e->image_width, e->image_height, processed_w, processed_h));
-        mtmd_bitmap * bitmap = mtmd_bitmap_init(processed_w, processed_h, processed.back().data());
+        gr00t_input::processed_image image;
+        if (!gr00t_input::preprocess_rgb(images_rgb[i], e->image_width, e->image_height, image, input_error)) {
+            free_bitmaps(bitmaps);
+            return reject(e, JETSON_PI_GR00T_INVALID, input_error.c_str());
+        }
+        processed.push_back(std::move(image));
+        mtmd_bitmap * bitmap = mtmd_bitmap_init(processed.back().width, processed.back().height, processed.back().rgb.data());
         if (!bitmap) { free_bitmaps(bitmaps); return reject(e, JETSON_PI_GR00T_INFER_FAILED, "failed to create bitmap"); }
         bitmaps.push_back(bitmap); bitmap_ptrs.push_back(bitmap);
     }
 
-    std::string prompt = "<|im_start|>user\n";
-    for (uint32_t i = 0; i < n_images; ++i) prompt += mtmd_default_marker();
-    prompt += formalize_instruction(instruction, instruction_len);
-    prompt += "<|im_end|>\n";
+    std::string prompt = gr00t_input::build_prompt(
+            instruction, instruction_len, n_images, mtmd_default_marker());
     mtmd_input_text text{prompt.c_str(), false, true};
     mtmd_input_chunks * chunks = mtmd_input_chunks_init();
     if (!chunks) { free_bitmaps(bitmaps); return reject(e, JETSON_PI_GR00T_INFER_FAILED, "failed to allocate chunks"); }

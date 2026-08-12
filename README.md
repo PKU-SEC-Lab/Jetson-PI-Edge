@@ -21,7 +21,7 @@
   <p>
     <a href="#real-world-demo">Demo</a> ·
     <a href="#quick-start">Quick Start</a> ·
-    <a href="#gr00t-n17-c-api">GR00T C API</a> ·
+    <a href="#gr00t-n17-c-api-and-server">GR00T APIs</a> ·
     <a href="#performance-on-jetson-orin">Performance</a> ·
     <a href="docs/model_conversion.md">Model Conversion</a> ·
     <a href="docs/foreground_server_usage.md">Server API</a> ·
@@ -33,7 +33,7 @@
 
 ## News
 
-- **[2026/08] NVIDIA Isaac GR00T N1.7 inference is available.** Convert the official checkpoint to GGUF and run the complete Qwen3-VL backbone, Action Head, and four-step action flow through the standalone `libjetson_pi_gr00t` C API.
+- **[2026/08] NVIDIA Isaac GR00T N1.7 inference is available.** Convert the official checkpoint to GGUF and run the complete Qwen3-VL backbone, Action Head, and four-step action flow through either `libjetson_pi_gr00t` or the foreground HTTP server.
 - **[2026/07] Python APIs are available.** Use the managed foreground NumPy client for persistent `llama-server` sessions or the optional pybind11 module for in-process PI0/PI0.5 action inference.
 - **[2026/07] Updated to the latest llama.cpp codebase.** Jetson-PI-Edge now tracks the latest llama.cpp architecture while retaining PI0/PI0.5 inference, foreground server, and FlashRT integration support.
 - **[2026/07] FlashRT support is available.** Jetson-PI is exposed as a FlashRT-loadable provider through a C API, allowing [FlashRT](https://github.com/flashrt-project/FlashRT) to invoke the same PI0/PI0.5 model path directly from Python without starting the foreground HTTP server.
@@ -69,7 +69,7 @@ The project is built on [llama.cpp](https://github.com/ggml-org/llama.cpp). The 
 - ✅ **PI0** - PI-specific multimodal preprocessing, language backbone, action expert, and continuous action-chunk generation.
 - ✅ **PI0.5** - two-view prefix construction, PI0.5 prompt/state handling, and 10-step action generation.
 - ✅ **NVIDIA Isaac GR00T N1.7** - Qwen3-VL multimodal backbone, complete GR00T Action Head, four-step flow matching, and `[40, 132]` action generation.
-- ✅ **Automatic model dispatch** - detect PI0 and PI0.5 from GGUF metadata and model tensor names, with an explicit `PI_MODEL` override.
+- ✅ **Automatic model dispatch** - detect PI0, PI0.5, and GR00T N1.7 from GGUF metadata and model tensor names, with an explicit `PI_MODEL` override for PI models.
 
 ### Runtime Optimizations
 
@@ -79,11 +79,13 @@ The project is built on [llama.cpp](https://github.com/ggml-org/llama.cpp). The 
 
 ### Interfaces and Deployment
 
-- ✅ **Foreground HTTP server** - persistent image, robot-state, and instruction endpoints with action and timing outputs.
+- ✅ **Foreground HTTP server** - persistent PI0, PI0.5, and GR00T image, robot-state, and instruction endpoints with action and timing outputs.
 - ✅ **FlashRT provider** - expose the same PI0/PI0.5 GGUF runtime through a C API for the FlashRT Python model interface.
 - ✅ **GR00T C API** - accept raw multi-camera RGB, instruction, normalized state, and embodiment ID through `libjetson_pi_gr00t`.
 
-The foreground HTTP server, Python API, and FlashRT provider currently target PI0 and PI0.5. GR00T uses its standalone C API.
+The foreground HTTP server supports PI0, PI0.5, and GR00T N1.7. The managed Python
+foreground client and FlashRT provider currently remain specific to PI0 and PI0.5;
+GR00T callers can use the HTTP endpoints directly or the standalone C API.
 
 ### Planned Model Support
 
@@ -104,9 +106,9 @@ flowchart LR
     CAM[Camera views] --> SESSION[Foreground session]
     STATE[Robot state] --> SESSION
     TEXT[Language instruction] --> SESSION
-    SESSION --> VIT[SigLIP / mmproj]
-    VIT --> VLM[PI language backbone]
-    VLM --> AE[Action expert]
+    SESSION --> VIT[SigLIP or Qwen3-VL mmproj]
+    VIT --> VLM[PI or GR00T backbone]
+    VLM --> AE[PI action expert or GR00T Action Head]
     AE --> ACTION[Action chunk]
     ACTION --> ROBOT[Robot controller]
 
@@ -196,14 +198,14 @@ curl -X POST http://127.0.0.1:8080/foreground/infer \
 
 The response contains `action_final` together with model and server timing fields such as `encode_ms`, `decode_ms`, `total_ms`, and `timing_breakdown_ms`. See the [Foreground Server API](docs/foreground_server_usage.md) for endpoint semantics and all response fields.
 
-## GR00T N1.7 C API
+## GR00T N1.7 C API and Server
 
-GR00T N1.7 is exposed through a separate product library rather than the PI foreground
-server. Build the runtime with CUDA support using:
+GR00T N1.7 is available through both a standalone product library and the existing
+foreground HTTP server. Build the runtime with CUDA support using:
 
 ```bash
 cmake -S . -B build -DGGML_CUDA=ON -DCMAKE_BUILD_TYPE=Release
-cmake --build build --target jetson_pi_gr00t -j
+cmake --build build --target jetson_pi_gr00t llama-server -j
 ```
 
 Convert the official GR00T and Cosmos checkpoints into a matching main GGUF and mmproj
@@ -236,8 +238,33 @@ inference, the complete Action Head, and four flow-matching steps before returni
 checkpoint's normalized `[40, 132]` action chunk. Query the exact output shape with
 `jetson_pi_gr00t_action_shape()`.
 
-The existing foreground HTTP server, Python foreground API, and FlashRT provider do not
-yet dispatch GR00T models; those interfaces remain specific to PI0 and PI0.5.
+To use Server mode, start `llama-server` with the GR00T main GGUF and matching mmproj.
+The server detects `gr00t-n1d7` from model metadata; do not set `PI_MODEL`:
+
+```bash
+./build/bin/llama-server \
+  -m /path/to/gr00t-n1d7.gguf \
+  --mmproj /path/to/mmproj-gr00t-n1d7.gguf \
+  -ngl 99 --host 0.0.0.0 --port 8080
+```
+
+Use the normal `/foreground/reset` and ordered `/foreground/image` calls, then submit
+the normalized state together with its GR00T embodiment ID:
+
+```bash
+curl -X PUT http://127.0.0.1:8080/foreground/state \
+  -H 'Content-Type: application/json' \
+  -d '{"state":[0.0,0.0,0.0],"embodiment_id":24}'
+
+curl -X POST http://127.0.0.1:8080/foreground/infer \
+  -H 'Content-Type: application/json' \
+  -d '{"text":"pick up the object and place it into the tray"}'
+```
+
+The server pads short state arrays to the width stored in GGUF metadata and returns the
+normalized action in `action_final` with `action_steps` and `action_dim`. Image upload
+order must match the checkpoint's camera/time convention. The managed Python foreground
+client and FlashRT provider do not yet dispatch GR00T models.
 
 ## Python Foreground API
 
