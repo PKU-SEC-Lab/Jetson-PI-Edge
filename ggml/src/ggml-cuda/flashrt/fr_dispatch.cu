@@ -205,6 +205,134 @@ void ggml_cuda_flashrt_mul_mat(ggml_backend_cuda_context & ctx, const ggml_tenso
     }
 }
 
+bool ggml_cuda_flashrt_should_fuse_ada(const ggml_tensor * rms, const ggml_tensor * mm, const ggml_tensor * bias_add,
+                                       const ggml_tensor * view_scale, const ggml_tensor * repeat_scale,
+                                       const ggml_tensor * mul, const ggml_tensor * add1,
+                                       const ggml_tensor * view_shift, const ggml_tensor * repeat_shift,
+                                       const ggml_tensor * add2) {
+    const ggml_tensor * x = rms != nullptr ? rms->src[0] : mul->src[0];
+    const ggml_tensor * normed = rms != nullptr ? rms : x;
+    const int64_t C = x->ne[0];
+    const int64_t M = x->ne[1];
+
+    if (x->type != GGML_TYPE_F32 || !ggml_is_contiguous(x) || x->ne[2] != 1 || x->ne[3] != 1) {
+        return false;
+    }
+    // modulation projection: [3C, 1] from the shared conditioning vector
+    if (!ggml_cuda_flashrt_should_use(mm->src[0], mm->src[1], mm) ||
+        mm->ne[0] != 3 * C || mm->ne[1] != 1) {
+        return false;
+    }
+    const ggml_tensor * bias = bias_add->src[1];
+    if (bias_add->src[0] != mm || bias->type != GGML_TYPE_F32 ||
+        !ggml_is_contiguous(bias) || bias->ne[0] != 3 * C || !ggml_is_contiguous(bias_add)) {
+        return false;
+    }
+    // scale = mod[0:C], shift = mod[C:2C]
+    if (view_scale->src[0] != bias_add || view_scale->ne[0] != C || view_scale->ne[1] != 1 ||
+        view_scale->view_offs != 0) {
+        return false;
+    }
+    if (view_shift->src[0] != bias_add || view_shift->ne[0] != C || view_shift->ne[1] != 1 ||
+        view_shift->view_offs != (size_t) C * sizeof(float)) {
+        return false;
+    }
+    if (repeat_scale->src[0] != view_scale || repeat_shift->src[0] != view_shift ||
+        repeat_scale->ne[0] != C || repeat_scale->ne[1] != M) {
+        return false;
+    }
+    // t = normed * scale; t2 = normed + t; out = t2 + shift
+    if (mul->src[0] != normed || mul->src[1] != repeat_scale ||
+        add1->src[0] != normed || add1->src[1] != mul ||
+        add2->src[0] != add1 || add2->src[1] != repeat_shift ||
+        !ggml_is_contiguous(add2) || add2->ne[0] != C || add2->ne[1] != M) {
+        return false;
+    }
+    return true;
+}
+
+void ggml_cuda_flashrt_ada_norm(ggml_backend_cuda_context & ctx, const ggml_tensor * rms, const ggml_tensor * mm,
+                                ggml_tensor * bias_add, const ggml_tensor * view_scale, const ggml_tensor * mul,
+                                const ggml_tensor * view_shift, ggml_tensor * add2) {
+    const ggml_tensor * x    = rms != nullptr ? rms->src[0] : mul->src[0];
+    const ggml_tensor * cond = mm->src[1];
+
+    const int C = (int) x->ne[0];
+    const int M = (int) x->ne[1];
+    const int K = (int) mm->src[0]->ne[0];
+    const int N = (int) mm->src[0]->ne[1]; // 3C
+
+    cudaStream_t stream = ctx.stream();
+
+    const repacked_weight * w = get_repacked(mm->src[0], stream);
+
+    ggml_cuda_pool_alloc<uint8_t> c_packed(ctx.pool(), ggml_cuda_flashrt::packed_bytes(1, K));
+    ggml_cuda_pool_alloc<uint8_t> c_sf    (ctx.pool(), ggml_cuda_flashrt::sf_bytes(1, K));
+    ggml_cuda_pool_alloc<float>   mod_raw (ctx.pool(), N);
+
+    int rc = ggml_cuda_flashrt::quantize_act_f32((const float *) cond->data, c_packed.get(), c_sf.get(), 1, K, stream);
+    if (rc == 0) {
+        rc = ggml_cuda_flashrt::gemm_f32out(c_packed.get(), c_sf.get(), w->packed, w->sf,
+                                            mod_raw.get(), 1, N, K, 1.0f, false, stream);
+    }
+    if (rc == 0) {
+        // materialize the biased modulation vector: the gate view reads it later
+        rc = ggml_cuda_flashrt::vec_add_f32(mod_raw.get(), (const float *) bias_add->src[1]->data,
+                                            (float *) bias_add->data, N, stream);
+    }
+    if (rc == 0) {
+        const float eps = rms != nullptr ? ggml_get_op_params_f32(rms, 0) : 0.0f;
+        rc = ggml_cuda_flashrt::ada_rms_mod((const float *) x->data,
+                                            (const float *) view_scale->data,
+                                            (const float *) view_shift->data,
+                                            (float *) add2->data, M, C, eps, rms != nullptr, stream);
+    }
+    if (rc != 0) {
+        GGML_ABORT("flashrt: fused adaLN failed (M=%d C=%d rc=%d)", M, C, rc);
+    }
+}
+
+bool ggml_cuda_flashrt_should_fuse_gated_res(const ggml_tensor * view, const ggml_tensor * repeat,
+                                             const ggml_tensor * mul, const ggml_tensor * add) {
+    const int64_t C = view->ne[0];
+    const int64_t M = mul->ne[1];
+    if (view->type != GGML_TYPE_F32 || view->ne[1] != 1 ||
+        view->src[0] == nullptr || view->src[0]->type != GGML_TYPE_F32) {
+        return false;
+    }
+    if (repeat->src[0] != view || repeat->ne[0] != C || repeat->ne[1] != M) {
+        return false;
+    }
+    const ggml_tensor * branch = mul->src[0];
+    if (mul->src[1] != repeat || branch->type != GGML_TYPE_F32 || !ggml_is_contiguous(branch) ||
+        branch->ne[0] != C || branch->ne[1] != M) {
+        return false;
+    }
+    const ggml_tensor * residual = add->src[0] == mul ? add->src[1] : add->src[0];
+    if ((add->src[0] != mul && add->src[1] != mul) || residual == mul ||
+        residual->type != GGML_TYPE_F32 || !ggml_is_contiguous(residual) ||
+        residual->ne[0] != C || residual->ne[1] != M ||
+        !ggml_is_contiguous(add) || add->ne[0] != C || add->ne[1] != M) {
+        return false;
+    }
+    return true;
+}
+
+void ggml_cuda_flashrt_gated_residual(ggml_backend_cuda_context & ctx, const ggml_tensor * view,
+                                      const ggml_tensor * mul, ggml_tensor * add) {
+    const ggml_tensor * branch   = mul->src[0];
+    const ggml_tensor * residual = add->src[0] == mul ? add->src[1] : add->src[0];
+    const int C = (int) view->ne[0];
+    const int M = (int) mul->ne[1];
+
+    const int rc = ggml_cuda_flashrt::gated_residual(
+        (const float *) residual->data, (const float *) branch->data,
+        (const float *) view->data, (float *) add->data, M, C, ctx.stream());
+    if (rc != 0) {
+        GGML_ABORT("flashrt: fused gated residual failed (M=%d C=%d rc=%d)", M, C, rc);
+    }
+}
+
 bool ggml_cuda_flashrt_should_fuse_geglu(const ggml_tensor * gate_mm, const ggml_tensor * up_mm, const ggml_tensor * glu, const ggml_tensor * down_mm) {
     if (ggml_get_glu_op(glu) != GGML_GLU_OP_GEGLU) {
         return false;

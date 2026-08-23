@@ -147,6 +147,7 @@ if (CUDAToolkit_FOUND)
         add_library(ggml-cuda-flashrt OBJECT
             flashrt/fr_gemm_f32out.cu
             flashrt/fr_geglu.cu
+            flashrt/fr_ada.cu
             flashrt/fr_quant_act.cu
             flashrt/fr_repack.cu
             flashrt/fr_dispatch.cu)

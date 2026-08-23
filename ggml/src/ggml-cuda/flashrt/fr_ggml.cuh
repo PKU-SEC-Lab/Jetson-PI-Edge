@@ -21,3 +21,23 @@ bool ggml_cuda_flashrt_should_fuse_geglu(const ggml_tensor * gate_mm, const ggml
 
 // Execute that fused FFN; writes the down mul_mat's dst.
 void ggml_cuda_flashrt_geglu_ffn(ggml_backend_cuda_context & ctx, const ggml_tensor * gate_mm, const ggml_tensor * up_mm, const ggml_tensor * glu, ggml_tensor * down_mm);
+
+// pi0.5 adaLN modulate window: {rms_norm?, mul_mat mod, add bias, view,
+// repeat, mul, add, view, repeat, add}. rms is null for the variant whose
+// normalized input arrives from a previous graph split. Outputs written by
+// the fused execution: the bias add (consumed by the gate view later) and
+// the final add.
+bool ggml_cuda_flashrt_should_fuse_ada(const ggml_tensor * rms, const ggml_tensor * mm, const ggml_tensor * bias_add,
+                                       const ggml_tensor * view_scale, const ggml_tensor * repeat_scale,
+                                       const ggml_tensor * mul, const ggml_tensor * add1,
+                                       const ggml_tensor * view_shift, const ggml_tensor * repeat_shift,
+                                       const ggml_tensor * add2);
+void ggml_cuda_flashrt_ada_norm(ggml_backend_cuda_context & ctx, const ggml_tensor * rms, const ggml_tensor * mm,
+                                ggml_tensor * bias_add, const ggml_tensor * view_scale, const ggml_tensor * mul,
+                                const ggml_tensor * view_shift, ggml_tensor * add2);
+
+// pi0.5 gated residual window: {view gate, repeat, mul, add}.
+bool ggml_cuda_flashrt_should_fuse_gated_res(const ggml_tensor * view, const ggml_tensor * repeat,
+                                             const ggml_tensor * mul, const ggml_tensor * add);
+void ggml_cuda_flashrt_gated_residual(ggml_backend_cuda_context & ctx, const ggml_tensor * view,
+                                      const ggml_tensor * mul, ggml_tensor * add);

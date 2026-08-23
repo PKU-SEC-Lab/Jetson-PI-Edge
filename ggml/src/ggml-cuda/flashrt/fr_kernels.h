@@ -64,4 +64,18 @@ int repack_weight_pair_interleaved(const void * gate_blocks, const void * up_blo
                                    void * dst_packed, void * dst_sf,
                                    int n_ff, int K, cudaStream_t stream);
 
+// Fused adaLN modulate: out[m,c] = norm(x[m])[c] * (1 + scale[c]) + shift[c],
+// norm = rms-normalize when with_rms else identity. x/out are [M, C]
+// contiguous fp32; scale/shift are [C] vectors.
+int ada_rms_mod(const float * x, const float * scale, const float * shift,
+                float * out, int M, int C, float eps, bool with_rms,
+                cudaStream_t stream);
+
+// Fused gated residual: out[m,c] = residual[m,c] + branch[m,c] * gate[c].
+int gated_residual(const float * residual, const float * branch, const float * gate,
+                   float * out, int M, int C, cudaStream_t stream);
+
+// out[i] = a[i] + b[i] for n fp32 elements.
+int vec_add_f32(const float * a, const float * b, float * out, int n, cudaStream_t stream);
+
 } // namespace ggml_cuda_flashrt

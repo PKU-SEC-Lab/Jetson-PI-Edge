@@ -3058,6 +3058,77 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
     ggml_tensor * node = cgraph->nodes[i];
 
 #ifdef GGML_CUDA_FLASHRT
+    // temporary dev aid: dump the first few evaluated graphs' node sequences
+    if (getenv("GGML_FLASHRT_DUMP") != nullptr && i == 0) {
+        static int dumped = 0;
+        if (dumped < 8) {
+            dumped++;
+            FILE * f = fopen(getenv("GGML_FLASHRT_DUMP"), "a");
+            if (f) {
+                fprintf(f, "=== graph %d: %d nodes ===\n", dumped, cgraph->n_nodes);
+                for (int k = 0; k < cgraph->n_nodes; k++) {
+                    const ggml_tensor * t = cgraph->nodes[k];
+                    fprintf(f, "%4d %-14s %-28s [%5lld,%5lld,%3lld] s0=%-24s s1=%s\n",
+                            k, ggml_op_name(t->op), t->name,
+                            (long long) t->ne[0], (long long) t->ne[1], (long long) t->ne[2],
+                            t->src[0] ? t->src[0]->name : "-",
+                            t->src[1] ? t->src[1]->name : "-");
+                }
+                fclose(f);
+            }
+        }
+    }
+
+    // pi0.5 adaLN modulate: {rms_norm?, mul_mat mod, add bias, view, repeat,
+    // mul, add, view, repeat, add} -> mod GEMM + one ada kernel.
+    if ((node->op == GGML_OP_RMS_NORM || node->op == GGML_OP_MUL_MAT) &&
+        ggml_cuda_info().devices[cuda_ctx->device].cc == 1100) {
+        const int base = node->op == GGML_OP_RMS_NORM ? 1 : 0;
+        const bool win_ok = base == 1
+            ? ggml_can_fuse_subgraph(cgraph, i, { GGML_OP_RMS_NORM, GGML_OP_MUL_MAT, GGML_OP_ADD, GGML_OP_VIEW, GGML_OP_REPEAT,
+                                                  GGML_OP_MUL, GGML_OP_ADD, GGML_OP_VIEW, GGML_OP_REPEAT, GGML_OP_ADD },
+                                     { i + 2, i + 9 })
+            : ggml_can_fuse_subgraph(cgraph, i, { GGML_OP_MUL_MAT, GGML_OP_ADD, GGML_OP_VIEW, GGML_OP_REPEAT,
+                                                  GGML_OP_MUL, GGML_OP_ADD, GGML_OP_VIEW, GGML_OP_REPEAT, GGML_OP_ADD },
+                                     { i + 1, i + 8 });
+        if (win_ok) {
+            const ggml_tensor * rms  = base == 1 ? node : nullptr;
+            const ggml_tensor * mm   = cgraph->nodes[i + base + 0];
+            ggml_tensor * bias_add   = cgraph->nodes[i + base + 1];
+            const ggml_tensor * v_sc = cgraph->nodes[i + base + 2];
+            const ggml_tensor * r_sc = cgraph->nodes[i + base + 3];
+            const ggml_tensor * mul  = cgraph->nodes[i + base + 4];
+            const ggml_tensor * add1 = cgraph->nodes[i + base + 5];
+            const ggml_tensor * v_sh = cgraph->nodes[i + base + 6];
+            const ggml_tensor * r_sh = cgraph->nodes[i + base + 7];
+            ggml_tensor * add2       = cgraph->nodes[i + base + 8];
+
+            int out_nodes[] = { i + base + 1, i + base + 8 };
+            if (ggml_cuda_flashrt_should_fuse_ada(rms, mm, bias_add, v_sc, r_sc, mul, add1, v_sh, r_sh, add2) &&
+                ggml_cuda_check_fusion_memory_ranges(cgraph, i, base + 9, out_nodes, 2)) {
+                ggml_cuda_flashrt_ada_norm(*cuda_ctx, rms, mm, bias_add, v_sc, mul, v_sh, add2);
+                return base + 8;
+            }
+        }
+    }
+
+    // pi0.5 gated residual: {view gate, repeat, mul, add} -> one kernel.
+    if (node->op == GGML_OP_VIEW && i + 3 < cgraph->n_nodes &&
+        ggml_cuda_info().devices[cuda_ctx->device].cc == 1100 &&
+        ggml_can_fuse_subgraph(cgraph, i, { GGML_OP_VIEW, GGML_OP_REPEAT, GGML_OP_MUL, GGML_OP_ADD }, { i + 3 })) {
+        const ggml_tensor * view   = cgraph->nodes[i];
+        const ggml_tensor * repeat = cgraph->nodes[i + 1];
+        const ggml_tensor * mul    = cgraph->nodes[i + 2];
+        ggml_tensor * add          = cgraph->nodes[i + 3];
+
+        int out_nodes[] = { i + 3 };
+        if (ggml_cuda_flashrt_should_fuse_gated_res(view, repeat, mul, add) &&
+            ggml_cuda_check_fusion_memory_ranges(cgraph, i, 4, out_nodes, 1)) {
+            ggml_cuda_flashrt_gated_residual(*cuda_ctx, view, mul, add);
+            return 3;
+        }
+    }
+
     // {mul_mat gate, mul_mat up, GEGLU, mul_mat down} -> fused GeGLU GEMM
     // (interleaved gate/up weights, FP4 intermediate) + down GEMM.
     if (node->op == GGML_OP_MUL_MAT && i + 3 < cgraph->n_nodes &&
