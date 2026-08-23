@@ -66,7 +66,9 @@ bool ggml_cuda_flashrt_should_use(const ggml_tensor * src0, const ggml_tensor * 
     if (!ggml_is_contiguous(src0) || !ggml_is_contiguous(src1) || !ggml_is_contiguous(dst)) {
         return false;
     }
-    if (src0->ne[2] != 1 || src0->ne[3] != 1 || src1->ne[2] != 1 || src1->ne[3] != 1) {
+    // Batched src1 with unbatched (broadcast) weights folds into a single
+    // GEMM over all rows because src1/dst are fully contiguous.
+    if (src0->ne[2] != 1 || src0->ne[3] != 1) {
         return false;
     }
     const int64_t K = src0->ne[0];
@@ -80,7 +82,7 @@ bool ggml_cuda_flashrt_should_use(const ggml_tensor * src0, const ggml_tensor * 
 void ggml_cuda_flashrt_mul_mat(ggml_backend_cuda_context & ctx, const ggml_tensor * src0, const ggml_tensor * src1, ggml_tensor * dst) {
     const int K = (int) src0->ne[0];
     const int N = (int) src0->ne[1];
-    const int M = (int) src1->ne[1];
+    const int M = (int) ggml_nrows(src1); // batch dims fold into rows (contiguous, broadcast weights)
 
     cudaStream_t stream = ctx.stream();
 
@@ -124,7 +126,9 @@ void ggml_cuda_flashrt_mul_mat(ggml_backend_cuda_context & ctx, const ggml_tenso
     // dequant table doubles the e2m1 values but its ue4m3 decode halves the
     // scale, so the two cancel and no alpha compensation is needed.
     const float alpha = 1.0f;
-    const bool  widen = N >= 8192;
+    // The 128x128x256 tile beats the wide-N 128x256x128 tile on Thor for
+    // every production shape measured (including N=16384 prefill FFN).
+    const bool  widen = false;
 
     rc = ggml_cuda_flashrt::gemm_f32out(
         a_packed.get(), a_sf.get(), b_packed, b_sf,
