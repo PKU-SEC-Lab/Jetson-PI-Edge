@@ -391,7 +391,9 @@ private:
         ggml_context_ptr            ctx;
         ggml_backend_buffer_ptr     buf;
         std::vector<ggml_tensor *>  tensors;
+        std::vector<ggml_tensor *>  prefix_views; // first-kv_tokens views for the padded-f16 layout
         int64_t                     kv_tokens = 0;
+        bool                        padded_f16 = false;
     };
 
     pi0_encoded_kv_gpu_storage pi0_enc_kv_gpu;

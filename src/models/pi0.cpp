@@ -335,6 +335,14 @@ llm_build_pi0::llm_build_pi0(const llama_model & model, const llm_graph_params &
             kv_copy_ops.push_back(k_copy_op);
             kv_copy_ops.push_back(v_copy_op);
 
+            // f16 exports feed the persistent padded-f16 decode KV buffers
+            if (cparams.flash_attn) {
+                res->encoded_kv_f16[2*il]   = ggml_new_tensor_3d(ctx0, GGML_TYPE_F16, Kcur->ne[0], Kcur->ne[1], Kcur->ne[2]);
+                res->encoded_kv_f16[2*il+1] = ggml_new_tensor_3d(ctx0, GGML_TYPE_F16, Vcur->ne[0], Vcur->ne[1], Vcur->ne[2]);
+                kv_copy_ops.push_back(ggml_cpy(ctx0, Kcur, res->encoded_kv_f16[2*il]));
+                kv_copy_ops.push_back(ggml_cpy(ctx0, Vcur, res->encoded_kv_f16[2*il+1]));
+            }
+
             // Pad the KV dim to the FA KQ stride so the MMA kernel's GQA
             // packing applies; the mask covers the zero-padded columns.
             // The cross-KV export above stays unpadded.

@@ -416,6 +416,10 @@ public:
     static constexpr int max_layers = 36;
     std::vector<ggml_tensor*> kv_array = std::vector<ggml_tensor*>(max_layers);
     // kv_array.reserve(max_layers);
+
+    // set when kv_array holds the persistent padded-f16 GPU buffers directly
+    bool    padded_f16    = false;
+    int64_t build_n_token = 0;
 };
 
 class llm_graph_input_attn_no_cache_pi0 : public llm_graph_input_i {
@@ -1134,6 +1138,7 @@ public:
     ggml_tensor * get_h_nextn()     const { return t_h_nextn; }
     ggml_tensor * get_action()      const { return action; }
     const std::vector<ggml_tensor *> & get_encoded_kv() const { return encoded_kv; }
+    const std::vector<ggml_tensor *> & get_encoded_kv_f16() const { return encoded_kv_f16; }
     ggml_tensor * get_inpL()        const { return inpL; }
 
     ggml_tensor * get_layer_inp(int il) const { return t_layer_inp[il]; }
@@ -1175,6 +1180,7 @@ public:
     ggml_tensor * attention_output = nullptr;
     static constexpr int max_pi0_layers = 36;
     std::vector<ggml_tensor *> encoded_kv = std::vector<ggml_tensor *>(max_pi0_layers);
+    std::vector<ggml_tensor *> encoded_kv_f16 = std::vector<ggml_tensor *>(max_pi0_layers);
     ggml_tensor * inpL = nullptr;
 
     std::vector<ggml_tensor *> t_layer_inp;
@@ -1426,7 +1432,7 @@ struct llm_graph_context {
     ggml_tensor * build_inp_cls() const;
 
     ggml_tensor * build_inp_cross_embd() const;
-    std::vector<ggml_tensor *> build_inp_cross_kv_pi0() const;
+    std::vector<ggml_tensor *> build_inp_cross_kv_pi0(bool padded_f16 = false) const;
     ggml_tensor * build_inp_pos_bucket_enc() const;
     ggml_tensor * build_inp_pos_bucket_dec() const;
     ggml_tensor * build_pos_bias(ggml_tensor * pos_bucket, ggml_tensor * attn_rel_b) const;
@@ -1477,7 +1483,7 @@ struct llm_graph_context {
                   float   kq_scale,
                     int   il) const;
 
-    llm_graph_input_attn_no_cache_ae * build_attn_inp_no_cache_ae(int64_t token_num, int64_t kv_token_num) const;
+    llm_graph_input_attn_no_cache_ae * build_attn_inp_no_cache_ae(int64_t token_num, int64_t kv_token_num, int64_t kv_pad_num = 0) const;
     ggml_tensor * build_attn(
             llm_graph_input_attn_no_cache_ae * inp,
             ggml_tensor * wo,

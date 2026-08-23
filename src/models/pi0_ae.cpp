@@ -147,12 +147,22 @@ llm_build_pi0_ae::llm_build_pi0_ae(const llama_model & model, const llm_graph_pa
     ggml_tensor * cur;
     ggml_tensor * inpL;
 
-    auto cross_kv_tensors = build_inp_cross_kv_pi0();
     const bool weights_are_pi05 = model.time_mlp_in != nullptr &&
                                   model.time_mlp_out != nullptr &&
                                   model.ae_output_norm_dense != nullptr;
     const pi_model_kind pi_model = pi_model_kind_from_env();
     const bool is_pi05 = weights_are_pi05 && !pi_model_kind_is_pi0(pi_model);
+
+    // Persistent padded-f16 KV: the prefix lives in the padded GPU buffers,
+    // each step writes only the suffix rows in place, and flash attention
+    // reads the full padded f16 tensors (no concat, no per-step f16 copies,
+    // KV length a multiple of the FA KQ stride so GQA packing applies).
+    const bool kv_persistent = is_pi05 && cparams.flash_attn &&
+        cross != nullptr && cross->pi0_use_gpu_kv && cross->n_token > 0 &&
+        !cross->encoded_kv_gpu.empty() && cross->encoded_kv_gpu[0] != nullptr &&
+        cross->encoded_kv_gpu[0]->type == GGML_TYPE_F16;
+
+    auto cross_kv_tensors = build_inp_cross_kv_pi0(kv_persistent);
 
     const char * pi05_debug_env = std::getenv("PI05_DEBUG_PREFIX");
     const bool keep_debug = is_pi05 && pi05_debug_env != nullptr && pi05_debug_env[0] != '\0' && std::strcmp(pi05_debug_env, "0") != 0;
@@ -198,7 +208,9 @@ llm_build_pi0_ae::llm_build_pi0_ae(const llama_model & model, const llm_graph_pa
 
     ggml_tensor * inp_pos_ae = build_inp_pos_ae(suffix_len - 1);
     ggml_tensor * rope_ff = is_pi05 ? build_inp_rope_freq_factors_pi0() : nullptr;
-    auto * inp_attn_ae = build_attn_inp_no_cache_ae(suffix_len, cross_kv_tensors[0]->ne[2] + suffix_len);
+    const int64_t kv_prefix_len = kv_persistent ? cross->n_token : cross_kv_tensors[0]->ne[2];
+    auto * inp_attn_ae = build_attn_inp_no_cache_ae(suffix_len, kv_prefix_len + suffix_len,
+                                                    kv_persistent ? cross_kv_tensors[0]->ne[2] : 0);
 
     auto build_pi05_modulation = [&](ggml_tensor * cond, ggml_tensor * dense_w, ggml_tensor * dense_b, int il, const char * tag) -> std::array<ggml_tensor *, 3> {
         GGML_ASSERT(cond != nullptr);
@@ -344,8 +356,22 @@ llm_build_pi0_ae::llm_build_pi0_ae(const llama_model & model, const llm_graph_pa
                 ggml_tensor * Kcur_old = cross_kv_tensors[2 * (il - n_layer / 2)];
                 ggml_tensor * Vcur_old = cross_kv_tensors[2 * (il - n_layer / 2) + 1];
 
-                Kcur = ggml_concat(ctx0, Kcur_old, Kcur, 2);
-                Vcur = ggml_concat(ctx0, Vcur_old, Vcur, 2);
+                if (kv_persistent) {
+                    // write the suffix KV rows into the persistent padded-f16
+                    // buffers (cast f32 -> f16 in the copy) and attend over
+                    // the full padded tensors
+                    ggml_tensor * k_dst = ggml_view_3d(ctx0, Kcur_old, n_embd_head, n_head_kv, suffix_len,
+                                                       Kcur_old->nb[1], Kcur_old->nb[2], kv_prefix_len * Kcur_old->nb[2]);
+                    ggml_tensor * v_dst = ggml_view_3d(ctx0, Vcur_old, n_embd_head, n_head_kv, suffix_len,
+                                                       Vcur_old->nb[1], Vcur_old->nb[2], kv_prefix_len * Vcur_old->nb[2]);
+                    ggml_build_forward_expand(gf, ggml_cpy(ctx0, Kcur, k_dst));
+                    ggml_build_forward_expand(gf, ggml_cpy(ctx0, Vcur, v_dst));
+                    Kcur = Kcur_old;
+                    Vcur = Vcur_old;
+                } else {
+                    Kcur = ggml_concat(ctx0, Kcur_old, Kcur, 2);
+                    Vcur = ggml_concat(ctx0, Vcur_old, Vcur, 2);
+                }
 
                 Qcur = ggml_scale(ctx0, Qcur, 1.0f / sqrtf(float(n_embd_head)));
 

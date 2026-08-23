@@ -1577,9 +1577,19 @@ void llama_context::pi0_refresh_encoded_kv_gpu(const std::vector<ggml_tensor *> 
         return;
     }
 
+    // f16 sources select the padded persistent layout: the decode graph
+    // writes the per-step suffix KV in place after the prefix and reads the
+    // full padded tensor, so the buffer holds prefix + suffix rounded up to
+    // the flash-attention KQ stride.
+    const bool padded_f16 = src_ref->type == GGML_TYPE_F16;
+    const int64_t kv_alloc = padded_f16
+        ? GGML_PAD(kv_tokens + hparams.action_steps + 1, 256)
+        : kv_tokens;
+
     const bool need_realloc =
         !pi0_enc_kv_gpu.buf ||
         pi0_enc_kv_gpu.kv_tokens != kv_tokens ||
+        pi0_enc_kv_gpu.padded_f16 != padded_f16 ||
         (int) pi0_enc_kv_gpu.tensors.size() != n_layer;
 
     if (need_realloc) {
@@ -1591,9 +1601,10 @@ void llama_context::pi0_refresh_encoded_kv_gpu(const std::vector<ggml_tensor *> 
         pi0_enc_kv_gpu.ctx.reset();
         pi0_enc_kv_gpu.buf.reset();
         pi0_enc_kv_gpu.tensors.clear();
+        pi0_enc_kv_gpu.prefix_views.clear();
 
         ggml_init_params params = {
-            /*.mem_size   =*/ size_t(n_layer + 1) * ggml_tensor_overhead(),
+            /*.mem_size   =*/ size_t(2 * n_layer + 1) * ggml_tensor_overhead(),
             /*.mem_buffer =*/ nullptr,
             /*.no_alloc   =*/ true,
         };
@@ -1604,21 +1615,35 @@ void llama_context::pi0_refresh_encoded_kv_gpu(const std::vector<ggml_tensor *> 
         }
 
         pi0_enc_kv_gpu.tensors.resize(n_layer, nullptr);
+        pi0_enc_kv_gpu.prefix_views.resize(n_layer, nullptr);
         for (int i = 0; i < n_layer; ++i) {
             const int64_t n_embd_head = hparams.n_embd_head_v(i);
             const int n_head_kv_layer = hparams.n_head_kv(i);
             pi0_enc_kv_gpu.tensors[i] = ggml_new_tensor_3d(
-                pi0_enc_kv_gpu.ctx.get(), GGML_TYPE_F32, n_embd_head, n_head_kv_layer, kv_tokens);
+                pi0_enc_kv_gpu.ctx.get(), padded_f16 ? GGML_TYPE_F16 : GGML_TYPE_F32,
+                n_embd_head, n_head_kv_layer, kv_alloc);
             ggml_format_name(pi0_enc_kv_gpu.tensors[i], "pi0_enc_kv_%d", i);
+            if (padded_f16) {
+                ggml_tensor * t = pi0_enc_kv_gpu.tensors[i];
+                pi0_enc_kv_gpu.prefix_views[i] = ggml_view_3d(
+                    pi0_enc_kv_gpu.ctx.get(), t, n_embd_head, n_head_kv_layer, kv_tokens,
+                    t->nb[1], t->nb[2], 0);
+            }
         }
 
         pi0_enc_kv_gpu.buf.reset(ggml_backend_alloc_ctx_tensors_from_buft(pi0_enc_kv_gpu.ctx.get(), buft));
         if (!pi0_enc_kv_gpu.buf) {
             pi0_enc_kv_gpu.tensors.clear();
+            pi0_enc_kv_gpu.prefix_views.clear();
             cross.pi0_use_gpu_kv = false;
             return;
         }
-        pi0_enc_kv_gpu.kv_tokens = kv_tokens;
+        if (padded_f16) {
+            // defined values in the padded tail (masked out by the attention mask)
+            ggml_backend_buffer_clear(pi0_enc_kv_gpu.buf.get(), 0);
+        }
+        pi0_enc_kv_gpu.kv_tokens  = kv_tokens;
+        pi0_enc_kv_gpu.padded_f16 = padded_f16;
     }
 
     cross.encoded_kv_gpu.assign(n_layer, nullptr);
@@ -1626,7 +1651,11 @@ void llama_context::pi0_refresh_encoded_kv_gpu(const std::vector<ggml_tensor *> 
         if (src[i] == nullptr || pi0_enc_kv_gpu.tensors[i] == nullptr) {
             continue;
         }
-        llama_backend_tensor_copy_compat(src[i], pi0_enc_kv_gpu.tensors[i]);
+        if (padded_f16) {
+            llama_backend_tensor_copy_compat(src[i], pi0_enc_kv_gpu.prefix_views[i]);
+        } else {
+            llama_backend_tensor_copy_compat(src[i], pi0_enc_kv_gpu.tensors[i]);
+        }
         cross.encoded_kv_gpu[i] = pi0_enc_kv_gpu.tensors[i];
     }
 
@@ -1882,7 +1911,11 @@ int llama_context::encode(const llama_batch & batch_inp) {
             }
         }
 
-        pi0_refresh_encoded_kv_gpu(t_encoded_kv, hparams.n_layer());
+        {
+            const auto & t_encoded_kv_f16 = res->get_encoded_kv_f16();
+            const bool have_f16 = !t_encoded_kv_f16.empty() && t_encoded_kv_f16[0] != nullptr;
+            pi0_refresh_encoded_kv_gpu(have_f16 ? t_encoded_kv_f16 : t_encoded_kv, hparams.n_layer());
+        }
 
         if ((int) cross.encoded_kv_data.size() < (int) hparams.n_layer()) {
             cross.encoded_kv_data.resize(hparams.n_layer());

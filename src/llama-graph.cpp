@@ -878,6 +878,21 @@ void llm_graph_input_cross_kv_pi0::set_input(const llama_ubatch * ubatch) {
 bool llm_graph_input_cross_kv_pi0::can_reuse(const llm_graph_params & params) {
     const int64_t kv_tokens = params.cross != nullptr && params.cross->n_token > 0 ?
         params.cross->n_token : params.ubatch.n_tokens;
+    if (padded_f16) {
+        // reuse only while the prefix length and the persistent buffers are unchanged
+        if (kv_tokens != build_n_token || params.cross == nullptr) {
+            return false;
+        }
+        for (size_t i = 0; i < kv_array.size(); ++i) {
+            if (kv_array[i] == nullptr) {
+                continue;
+            }
+            if (i >= params.cross->encoded_kv_gpu.size() || kv_array[i] != params.cross->encoded_kv_gpu[i]) {
+                return false;
+            }
+        }
+        return true;
+    }
     for (ggml_tensor * kv : kv_array) {
         if (kv == nullptr) {
             continue;
@@ -1122,7 +1137,7 @@ bool llm_graph_input_attn_no_cache_ae::can_reuse(const llm_graph_params & params
         params.cross->n_token : params.ubatch.n_tokens;
     return self_kq_mask != nullptr &&
            kv_token_num == prefix_tokens + token_num &&
-           self_kq_mask->ne[0] == kv_token_num &&
+           self_kq_mask->ne[0] >= kv_token_num && // KV dim may be padded to the FA KQ stride
            self_kq_mask->ne[1] == GGML_PAD(token_num, GGML_KQ_MASK_PAD);
 }
 
@@ -3280,7 +3295,7 @@ ggml_tensor * llm_graph_context::build_inp_cross_embd() const {
     return cur;
 }
 
-std::vector<ggml_tensor*> llm_graph_context::build_inp_cross_kv_pi0() const {
+std::vector<ggml_tensor*> llm_graph_context::build_inp_cross_kv_pi0(bool padded_f16) const {
     const int n_layers = hparams.n_layer(); 
     std::vector<ggml_tensor *> kv_tensors(n_layers);
     // kv_tensors.reserve(n_layers);
@@ -3294,7 +3309,16 @@ std::vector<ggml_tensor*> llm_graph_context::build_inp_cross_kv_pi0() const {
         const int n_head_kv_layer = hparams.n_head_kv(i);
 
         auto & cur_layer_kv = inp->kv_array[i];
-        if (cross != nullptr &&
+        if (padded_f16) {
+            // persistent padded-f16 GPU buffers consumed (and suffix-written)
+            // in place; the caller has verified they exist and match
+            GGML_ASSERT(cross != nullptr && cross->pi0_use_gpu_kv &&
+                        i < (int) cross->encoded_kv_gpu.size() &&
+                        cross->encoded_kv_gpu[i] != nullptr &&
+                        cross->encoded_kv_gpu[i]->type == GGML_TYPE_F16 &&
+                        cross->encoded_kv_gpu[i]->ne[2] >= n_kv_tokens);
+            cur_layer_kv = cross->encoded_kv_gpu[i];
+        } else if (cross != nullptr &&
             cross->pi0_use_gpu_kv &&
             i < (int) cross->encoded_kv_gpu.size() &&
             cross->encoded_kv_gpu[i] != nullptr &&
@@ -3306,6 +3330,8 @@ std::vector<ggml_tensor*> llm_graph_context::build_inp_cross_kv_pi0() const {
         ggml_set_input(cur_layer_kv);
         kv_tensors[i] = cur_layer_kv;
     }
+    inp->padded_f16    = padded_f16;
+    inp->build_n_token = n_kv_tokens;
     res->add_input(std::move(inp));
     return kv_tensors;
 }
@@ -3630,10 +3656,13 @@ ggml_tensor * llm_graph_context::build_attn(
     return cur;
 }
 
-llm_graph_input_attn_no_cache_ae * llm_graph_context::build_attn_inp_no_cache_ae(int64_t token_num, int64_t kv_token_num) const {
+llm_graph_input_attn_no_cache_ae * llm_graph_context::build_attn_inp_no_cache_ae(int64_t token_num, int64_t kv_token_num, int64_t kv_pad_num) const {
     auto inp = std::make_unique<llm_graph_input_attn_no_cache_ae>(hparams, cparams, token_num, kv_token_num, cross);
 
-    inp->self_kq_mask = ggml_new_tensor_4d(ctx0, GGML_TYPE_F32, kv_token_num, GGML_PAD(token_num, GGML_KQ_MASK_PAD), 1, 1);
+    const int64_t n_kv_dim = kv_pad_num > 0 ? kv_pad_num : kv_token_num;
+    GGML_ASSERT(n_kv_dim >= kv_token_num);
+
+    inp->self_kq_mask = ggml_new_tensor_4d(ctx0, GGML_TYPE_F32, n_kv_dim, GGML_PAD(token_num, GGML_KQ_MASK_PAD), 1, 1);
     ggml_set_input(inp->self_kq_mask);
 
     inp->self_kq_mask_cnv = cparams.flash_attn ? ggml_cast(ctx0, inp->self_kq_mask, GGML_TYPE_F16) : inp->self_kq_mask;
