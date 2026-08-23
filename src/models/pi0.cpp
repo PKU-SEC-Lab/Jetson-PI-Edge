@@ -335,6 +335,17 @@ llm_build_pi0::llm_build_pi0(const llama_model & model, const llm_graph_params &
             kv_copy_ops.push_back(k_copy_op);
             kv_copy_ops.push_back(v_copy_op);
 
+            // Pad the KV dim to the FA KQ stride so the MMA kernel's GQA
+            // packing applies; the mask covers the zero-padded columns.
+            // The cross-KV export above stays unpadded.
+            if (cparams.flash_attn) {
+                const int64_t n_kv_pad = GGML_PAD(n_tokens, 256);
+                if (n_kv_pad != n_tokens) {
+                    Kcur = ggml_pad(ctx0, Kcur, 0, 0, (int)(n_kv_pad - n_tokens), 0);
+                    Vcur = ggml_pad(ctx0, Vcur, 0, 0, (int)(n_kv_pad - n_tokens), 0);
+                }
+            }
+
             Qcur = ggml_scale(ctx0, Qcur, q_scale);
 
             cur = build_attn(inp_attn,

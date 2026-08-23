@@ -987,7 +987,6 @@ void llm_graph_input_attn_no_cache::set_input(const llama_ubatch * ubatch) {
 }
 
 void llm_graph_input_attn_no_cache_pi0::set_input(const llama_ubatch * ubatch) {
-    const int64_t n_kv     = ubatch->n_tokens;
     const int64_t n_tokens = ubatch->n_tokens;
 
     {
@@ -995,15 +994,18 @@ void llm_graph_input_attn_no_cache_pi0::set_input(const llama_ubatch * ubatch) {
         GGML_ASSERT(ggml_backend_buffer_is_host(self_kq_mask->buffer));
         float * data = (float *) self_kq_mask->data;
 
-        // std::fill(data, data + ggml_nelements(self_kq_mask), 0.0f);
-
+        // The KV dim (ne[0]) may be padded past n_tokens to a multiple of the
+        // flash-attention KQ stride; padded KV columns are masked out.
+        const int64_t n_kv_pad = self_kq_mask->ne[0];
         const int64_t n_pad    = self_kq_mask->ne[1]; // Padded mask width for this view.
 
-        std::fill(data, data + n_tokens * n_tokens, 0.0f);
-        std::fill(data + n_tokens * n_tokens, data + n_pad * n_tokens, -INFINITY);
-        
+        std::fill(data, data + n_kv_pad * n_pad, -INFINITY);
+        for (int64_t q = 0; q < n_tokens; ++q) {
+            std::fill(data + q * n_kv_pad, data + q * n_kv_pad + n_tokens, 0.0f);
+        }
+
         if (debug) {
-            print_mask(data, n_tokens, n_kv, 0, LLAMA_SWA_TYPE_NONE);
+            print_mask(data, n_tokens, n_kv_pad, 0, LLAMA_SWA_TYPE_NONE);
         }
     }
 }
@@ -1085,16 +1087,18 @@ void llm_graph_input_attn_no_cache_ae::set_input(const llama_ubatch * ubatch) {
     {
         GGML_ASSERT(self_kq_mask);
         GGML_ASSERT(ggml_backend_buffer_is_host(self_kq_mask->buffer));
-        GGML_ASSERT(self_kq_mask->ne[0] == kv_token_num);
+        GGML_ASSERT(self_kq_mask->ne[0] >= kv_token_num); // KV dim may be padded to the FA KQ stride
         GGML_ASSERT(self_kq_mask->ne[1] >= token_num);
         GGML_ASSERT(n_cross_tokens_num >= 0);
 
         float * data = (float *) self_kq_mask->data;
 
+        const int64_t n_kv_pad = self_kq_mask->ne[0];
+
         std::fill(data, data + ggml_nelements(self_kq_mask), -INFINITY);
 
         for (int64_t q = 0; q < token_num; ++q) {
-            const int64_t row = q * kv_token_num;
+            const int64_t row = q * n_kv_pad;
             for (int64_t k = 0; k < n_cross_tokens_num; ++k) {
                 data[row + k] = 0.0f;
             }
@@ -3568,7 +3572,13 @@ ggml_tensor * llm_graph_context::build_attn(
 llm_graph_input_attn_no_cache_pi0 * llm_graph_context::build_attn_inp_no_cache_pi0() const {
     auto inp = std::make_unique<llm_graph_input_attn_no_cache_pi0>(hparams, cparams);
 
-    inp->self_kq_mask = ggml_new_tensor_4d(ctx0, GGML_TYPE_F32, n_tokens, GGML_PAD(n_tokens, GGML_KQ_MASK_PAD), 1, 1);
+    // Pad the KV dim to the flash-attention KQ stride (256) so the MMA
+    // kernel's GQA packing applies; K/V are padded to match in the model
+    // graph and the extra columns are masked out.
+    const int64_t n_kv_pad = cparams.flash_attn && !pi_model_kind_is_pi0(pi_model_kind_from_env())
+        ? GGML_PAD(n_tokens, 256) : n_tokens;
+
+    inp->self_kq_mask = ggml_new_tensor_4d(ctx0, GGML_TYPE_F32, n_kv_pad, GGML_PAD(n_tokens, GGML_KQ_MASK_PAD), 1, 1);
     ggml_set_input(inp->self_kq_mask);
 
     inp->self_kq_mask_cnv = cparams.flash_attn ? ggml_cast(ctx0, inp->self_kq_mask, GGML_TYPE_F16) : inp->self_kq_mask;
