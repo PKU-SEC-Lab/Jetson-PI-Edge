@@ -3057,6 +3057,31 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
 
     ggml_tensor * node = cgraph->nodes[i];
 
+#ifdef GGML_CUDA_FLASHRT
+    // {mul_mat gate, mul_mat up, GEGLU, mul_mat down} -> fused GeGLU GEMM
+    // (interleaved gate/up weights, FP4 intermediate) + down GEMM.
+    if (node->op == GGML_OP_MUL_MAT && i + 3 < cgraph->n_nodes &&
+        ggml_cuda_info().devices[cuda_ctx->device].cc == 1100 &&
+        ggml_can_fuse_subgraph(cgraph, i, { GGML_OP_MUL_MAT, GGML_OP_MUL_MAT, GGML_OP_GLU, GGML_OP_MUL_MAT }, { i + 3 })) {
+        ggml_tensor * glu     = cgraph->nodes[i + 2];
+        ggml_tensor * down_mm = cgraph->nodes[i + 3];
+        const ggml_tensor * gate_mm = glu->src[0];
+        const ggml_tensor * up_mm   = glu->src[1];
+
+        const bool nodes_match =
+            (gate_mm == cgraph->nodes[i] && up_mm == cgraph->nodes[i + 1]) ||
+            (gate_mm == cgraph->nodes[i + 1] && up_mm == cgraph->nodes[i]);
+
+        int out_nodes[] = { i + 3 };
+        if (nodes_match &&
+            ggml_cuda_flashrt_should_fuse_geglu(gate_mm, up_mm, glu, down_mm) &&
+            ggml_cuda_check_fusion_memory_ranges(cgraph, i, 4, out_nodes, 1)) {
+            ggml_cuda_flashrt_geglu_ffn(*cuda_ctx, gate_mm, up_mm, glu, down_mm);
+            return 3;
+        }
+    }
+#endif // GGML_CUDA_FLASHRT
+
     // gated_delta_net -> cpy: scatter recurrent-state snapshots into the cache
     if (node->op == GGML_OP_GATED_DELTA_NET) {
         ggml_cuda_gated_delta_net_fused_cache fused_state_cpy;

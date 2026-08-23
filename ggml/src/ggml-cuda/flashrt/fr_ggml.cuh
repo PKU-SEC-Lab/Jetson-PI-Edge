@@ -13,3 +13,11 @@ bool ggml_cuda_flashrt_should_use(const ggml_tensor * src0, const ggml_tensor * 
 // Weights are repacked into the CUTLASS wire format on first use and cached
 // for the process lifetime.
 void ggml_cuda_flashrt_mul_mat(ggml_backend_cuda_context & ctx, const ggml_tensor * src0, const ggml_tensor * src1, ggml_tensor * dst);
+
+// True when the 4-node FFN subgraph {mul_mat gate, mul_mat up, GEGLU,
+// mul_mat down} can run as one fused GeGLU GEMM (interleaved gate/up
+// weights, FP4 intermediate) followed by the down GEMM.
+bool ggml_cuda_flashrt_should_fuse_geglu(const ggml_tensor * gate_mm, const ggml_tensor * up_mm, const ggml_tensor * glu, const ggml_tensor * down_mm);
+
+// Execute that fused FFN; writes the down mul_mat's dst.
+void ggml_cuda_flashrt_geglu_ffn(ggml_backend_cuda_context & ctx, const ggml_tensor * gate_mm, const ggml_tensor * up_mm, const ggml_tensor * glu, ggml_tensor * down_mm);

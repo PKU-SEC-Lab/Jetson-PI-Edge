@@ -56,4 +56,12 @@ int quantize_act_f32(const float * src, void * dst_packed, void * dst_sfa,
 int repack_weight(const void * ggml_blocks, void * dst_packed, void * dst_sf,
                   int N, int K, cudaStream_t stream);
 
+// Pairwise-interleave two ggml NVFP4 weight tensors (gate, up; each
+// [n_ff rows, K]) into one B operand for the fused GeGLU GEMM: output row 2j
+// is gate row j, row 2j+1 is up row j. dst_packed holds 2*n_ff rows; dst_sf
+// is sized sf_bytes(2*n_ff, K).
+int repack_weight_pair_interleaved(const void * gate_blocks, const void * up_blocks,
+                                   void * dst_packed, void * dst_sf,
+                                   int n_ff, int K, cudaStream_t stream);
+
 } // namespace ggml_cuda_flashrt

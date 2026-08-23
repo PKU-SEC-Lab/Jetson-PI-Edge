@@ -60,6 +60,73 @@ __global__ void kernel_repack(
 
 } // namespace
 
+namespace {
+
+// Pairwise-interleaved variant for the fused GeGLU GEMM: output row 2j is
+// gate row j, row 2j+1 is up row j (N_il = 2 * n_ff rows total).
+template <class LayoutSF>
+__global__ void kernel_repack_pair(
+        const uint8_t * __restrict__ gate,
+        const uint8_t * __restrict__ up,
+        uint2 * __restrict__ dst_packed,
+        uint8_t * __restrict__ dst_sf,
+        LayoutSF layout,
+        int n_ff, int K16) {
+    const int t = blockIdx.x * blockDim.x + threadIdx.x;
+    const int row = blockIdx.y;             // row within gate/up
+    const int which = blockIdx.z;           // 0 = gate, 1 = up
+    if (row >= n_ff || t >= K16) return;
+
+    const int blk = t >> 2;
+    const int sub = t & 3;
+    const uint8_t * src = which ? up : gate;
+    const uint8_t * b = src + (static_cast<int64_t>(row) * (K16 >> 2) + blk) * GGML_NVFP4_BLOCK_BYTES;
+    const uint8_t scale = b[sub];
+    const uint8_t * qs = b + 4 + sub * 8;
+
+    uint2 out;
+    uint8_t * ob = reinterpret_cast<uint8_t *>(&out);
+    #pragma unroll
+    for (int p = 0; p < 4; ++p) {
+        ob[p]     = static_cast<uint8_t>((qs[2 * p] & 0x0F) | ((qs[2 * p + 1] & 0x0F) << 4));
+        ob[p + 4] = static_cast<uint8_t>((qs[2 * p] >> 4)   | ((qs[2 * p + 1] & 0xF0)));
+    }
+
+    const int out_row = 2 * row + which;
+    dst_packed[static_cast<int64_t>(out_row) * K16 + t] = out;
+    dst_sf[layout(out_row, t * 16, 0)] = scale;
+}
+
+} // namespace
+
+int repack_weight_pair_interleaved(const void * gate_blocks, const void * up_blocks,
+                                   void * dst_packed, void * dst_sf,
+                                   int n_ff, int K, cudaStream_t stream) {
+    if (K % 64 != 0) return -1;
+    if (reinterpret_cast<uintptr_t>(dst_packed) & 7) return -1;
+
+    const int K16  = K / 16;
+    const int N_il = 2 * n_ff;
+    const int threads = 128;
+    dim3 grid((K16 + threads - 1) / threads, n_ff, 2);
+
+    auto shape = cute::make_shape(1, N_il, K, 1);
+    auto layout = CfgVec::tile_atom_to_shape_SFB(shape);
+    if (static_cast<int64_t>(cute::cosize(layout)) > sf_bytes(N_il, K)) {
+        return -3;
+    }
+
+    kernel_repack_pair<<<grid, threads, 0, stream>>>(
+        reinterpret_cast<const uint8_t *>(gate_blocks),
+        reinterpret_cast<const uint8_t *>(up_blocks),
+        reinterpret_cast<uint2 *>(dst_packed),
+        reinterpret_cast<uint8_t *>(dst_sf),
+        layout, n_ff, K16);
+
+    const cudaError_t e = cudaGetLastError();
+    return (e == cudaSuccess) ? 0 : -static_cast<int>(e);
+}
+
 int repack_weight(const void * ggml_blocks, void * dst_packed, void * dst_sf,
                   int N, int K, cudaStream_t stream) {
     if (K % 64 != 0) return -1;

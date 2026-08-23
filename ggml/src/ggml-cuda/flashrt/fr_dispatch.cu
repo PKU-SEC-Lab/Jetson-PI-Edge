@@ -3,6 +3,7 @@
 
 #include "fr_ggml.cuh"
 #include "fr_kernels.h"
+#include "fr_geglu.cuh"
 
 #include <mutex>
 #include <unordered_map>
@@ -51,6 +52,72 @@ const repacked_weight * get_repacked(const ggml_tensor * src0, cudaStream_t stre
 
     auto res = g_repack_cache.emplace(src0->data, w);
     return &res.first->second;
+}
+
+// Interleaved gate/up weight pairs for the fused GeGLU GEMM, keyed by the
+// two tensors' device pointers (same immortality caveat as above).
+struct pair_key {
+    const void * gate;
+    const void * up;
+    bool operator==(const pair_key & o) const { return gate == o.gate && up == o.up; }
+};
+struct pair_key_hash {
+    size_t operator()(const pair_key & k) const noexcept {
+        return std::hash<const void *>()(k.gate) ^ (std::hash<const void *>()(k.up) << 1);
+    }
+};
+
+std::unordered_map<pair_key, repacked_weight, pair_key_hash> g_pair_cache;
+
+const repacked_weight * get_repacked_pair(const ggml_tensor * gate_w, const ggml_tensor * up_w, cudaStream_t stream) {
+    std::lock_guard<std::mutex> lk(g_repack_mu);
+
+    pair_key key{gate_w->data, up_w->data};
+    auto it = g_pair_cache.find(key);
+    if (it != g_pair_cache.end()) {
+        return &it->second;
+    }
+
+    const int64_t K    = gate_w->ne[0];
+    const int64_t n_ff = gate_w->ne[1];
+    const int64_t N_il = 2 * n_ff;
+
+    cudaStreamCaptureStatus cap = cudaStreamCaptureStatusNone;
+    cudaStreamIsCapturing(stream, &cap);
+    if (cap != cudaStreamCaptureStatusNone) {
+        GGML_ABORT("flashrt: geglu pair repack for %s requested during CUDA graph capture", gate_w->name);
+    }
+
+    repacked_weight w;
+    CUDA_CHECK(cudaMalloc(&w.packed, ggml_cuda_flashrt::packed_bytes(N_il, K)));
+    CUDA_CHECK(cudaMalloc(&w.sf,     ggml_cuda_flashrt::sf_bytes(N_il, K)));
+
+    const int rc = ggml_cuda_flashrt::repack_weight_pair_interleaved(
+        gate_w->data, up_w->data, w.packed, w.sf, (int) n_ff, (int) K, stream);
+    if (rc != 0) {
+        GGML_ABORT("flashrt: geglu pair repack failed for %s (n_ff=%lld K=%lld rc=%d)",
+                   gate_w->name, (long long) n_ff, (long long) K, rc);
+    }
+
+    auto res = g_pair_cache.emplace(key, w);
+    return &res.first->second;
+}
+
+// Grow-only device buffer for the never-written D of the no-D-store GeGLU
+// variants (the host-side TMA descriptor still needs a valid allocation).
+void * get_dummy_d(size_t bytes) {
+    static void * buf = nullptr;
+    static size_t cap = 0;
+    static std::mutex mu;
+    std::lock_guard<std::mutex> lk(mu);
+    if (bytes > cap) {
+        if (buf != nullptr) {
+            cudaFree(buf);
+        }
+        CUDA_CHECK(cudaMalloc(&buf, bytes));
+        cap = bytes;
+    }
+    return buf;
 }
 
 } // namespace
@@ -135,5 +202,84 @@ void ggml_cuda_flashrt_mul_mat(ggml_backend_cuda_context & ctx, const ggml_tenso
         (float *) dst->data, M, N, K, alpha, widen, stream);
     if (rc != 0) {
         GGML_ABORT("flashrt: gemm failed (M=%d N=%d K=%d rc=%d)", M, N, K, rc);
+    }
+}
+
+bool ggml_cuda_flashrt_should_fuse_geglu(const ggml_tensor * gate_mm, const ggml_tensor * up_mm, const ggml_tensor * glu, const ggml_tensor * down_mm) {
+    if (ggml_get_glu_op(glu) != GGML_GLU_OP_GEGLU) {
+        return false;
+    }
+    // both projections share the same input and shape
+    if (gate_mm->src[1] != up_mm->src[1]) {
+        return false;
+    }
+    const ggml_tensor * gate_w = gate_mm->src[0];
+    const ggml_tensor * up_w   = up_mm->src[0];
+    const ggml_tensor * down_w = down_mm->src[0];
+    if (gate_w->ne[0] != up_w->ne[0] || gate_w->ne[1] != up_w->ne[1]) {
+        return false;
+    }
+    if (!ggml_cuda_flashrt_should_use(gate_w, gate_mm->src[1], gate_mm) ||
+        !ggml_cuda_flashrt_should_use(up_w,   up_mm->src[1],   up_mm)   ||
+        !ggml_cuda_flashrt_should_use(down_w, glu,             down_mm)) {
+        return false;
+    }
+    // the down projection must consume the GLU output with K = n_ff
+    if (down_mm->src[1] != glu || down_w->ne[0] != gate_w->ne[1]) {
+        return false;
+    }
+    return true;
+}
+
+void ggml_cuda_flashrt_geglu_ffn(ggml_backend_cuda_context & ctx, const ggml_tensor * gate_mm, const ggml_tensor * up_mm, const ggml_tensor * glu, ggml_tensor * down_mm) {
+    GGML_UNUSED(glu);
+
+    const ggml_tensor * src1   = gate_mm->src[1];
+    const ggml_tensor * gate_w = gate_mm->src[0];
+    const ggml_tensor * down_w = down_mm->src[0];
+
+    const int K    = (int) gate_w->ne[0];
+    const int n_ff = (int) gate_w->ne[1];
+    const int N_il = 2 * n_ff;
+    const int M    = (int) ggml_nrows(src1);
+    const int N_out = (int) down_w->ne[1];
+
+    cudaStream_t stream = ctx.stream();
+
+    const repacked_weight * w_il   = get_repacked_pair(gate_w, up_mm->src[0], stream);
+    const repacked_weight * w_down = get_repacked(down_w, stream);
+
+    ggml_cuda_pool_alloc<uint8_t> a_packed(ctx.pool(), ggml_cuda_flashrt::packed_bytes(M, K));
+    ggml_cuda_pool_alloc<uint8_t> a_sf    (ctx.pool(), ggml_cuda_flashrt::sf_bytes(M, K));
+
+    int rc = ggml_cuda_flashrt::quantize_act_f32(
+        (const float *) src1->data, a_packed.get(), a_sf.get(), M, K, stream);
+    if (rc != 0) {
+        GGML_ABORT("flashrt: geglu activation quantize failed (M=%d K=%d rc=%d)", M, K, rc);
+    }
+
+    ggml_cuda_pool_alloc<uint8_t> compact_packed(ctx.pool(), ggml_cuda_flashrt::packed_bytes(M, n_ff));
+    ggml_cuda_pool_alloc<uint8_t> compact_sfa   (ctx.pool(), ggml_cuda_flashrt::sf_bytes(M, n_ff));
+    void * dummy_d = get_dummy_d(ggml_cuda_flashrt::packed_bytes(M, N_il));
+
+    // skinny-M tile for decode-sized batches, default tile otherwise
+    if (M < 128) {
+        rc = flash_rt::fp4::cutlass_fp4_gemm_geglu_il_hw_nod_v10(
+            a_packed.get(), a_sf.get(), w_il->packed, w_il->sf,
+            dummy_d, compact_packed.get(), compact_sfa.get(), M, N_il, K, stream);
+    } else {
+        rc = flash_rt::fp4::cutlass_fp4_gemm_geglu_il_hw_nod(
+            a_packed.get(), a_sf.get(), w_il->packed, w_il->sf,
+            dummy_d, compact_packed.get(), compact_sfa.get(), M, N_il, K, stream);
+    }
+    if (rc != 0) {
+        GGML_ABORT("flashrt: geglu gemm failed (M=%d N_il=%d K=%d rc=%d)", M, N_il, K, rc);
+    }
+
+    rc = ggml_cuda_flashrt::gemm_f32out(
+        compact_packed.get(), compact_sfa.get(), w_down->packed, w_down->sf,
+        (float *) down_mm->data, M, N_out, n_ff, /*alpha=*/1.0f, /*widen=*/false, stream);
+    if (rc != 0) {
+        GGML_ABORT("flashrt: geglu down gemm failed (M=%d N=%d K=%d rc=%d)", M, N_out, n_ff, rc);
     }
 }
