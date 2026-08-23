@@ -31,7 +31,7 @@ namespace {
 
 using namespace cute;
 
-template <class TileShape>
+template <class TileShape, class ClusterShapeT = Shape<_1, _1, _1>>
 struct FrGemmConfig {
     using ElementA           = cutlass::float_e2m1_t;
     using ElementB           = cutlass::float_e2m1_t;
@@ -54,7 +54,7 @@ struct FrGemmConfig {
     static constexpr int AlignmentC = 128 / cutlass::sizeof_bits<ElementC>::value; // 4
     static constexpr int AlignmentD = 128 / cutlass::sizeof_bits<ElementD>::value; // 4
 
-    using ClusterShape = Shape<_1, _1, _1>;
+    using ClusterShape = ClusterShapeT;
 
     using CollectiveEpilogue =
         typename cutlass::epilogue::collective::CollectiveBuilder<
@@ -187,7 +187,9 @@ int run_gemm(const void * A_packed, const void * SFA,
 }
 
 using ConfigDefault = FrGemmConfig<Shape<_128, _128, _256>>;
-using ConfigWideN   = FrGemmConfig<Shape<_128, _256, _128>>;
+// 2-SM tcgen05 tile: 11-15% faster than the 1-SM tile on Thor for every
+// prefill shape measured (M >= ~256); slower at decode-sized M.
+using ConfigLargeM  = FrGemmConfig<Shape<_256, _128, _256>, Shape<_2, _1, _1>>;
 
 } // namespace
 
@@ -195,8 +197,9 @@ int gemm_f32out(const void * A_packed, const void * SFA,
                 const void * B_packed, const void * SFB,
                 float * D, int M, int N, int K,
                 float alpha, bool widen, cudaStream_t stream) {
-    if (widen) {
-        return run_gemm<ConfigWideN>(A_packed, SFA, B_packed, SFB, D, M, N, K, alpha, stream);
+    (void) widen; // superseded by the M-based tile choice
+    if (M >= 256) {
+        return run_gemm<ConfigLargeM>(A_packed, SFA, B_packed, SFB, D, M, N, K, alpha, stream);
     }
     return run_gemm<ConfigDefault>(A_packed, SFA, B_packed, SFB, D, M, N, K, alpha, stream);
 }
