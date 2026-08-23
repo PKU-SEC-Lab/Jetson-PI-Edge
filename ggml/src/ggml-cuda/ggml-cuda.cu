@@ -31,6 +31,9 @@
 #include "ggml-cuda/mmf.cuh"
 #include "ggml-cuda/mmq.cuh"
 #include "ggml-cuda/mmvf.cuh"
+#ifdef GGML_CUDA_FLASHRT
+#include "ggml-cuda/flashrt/fr_ggml.cuh"
+#endif // GGML_CUDA_FLASHRT
 #include "ggml-cuda/mmvq.cuh"
 #include "ggml-cuda/norm.cuh"
 #include "ggml-cuda/opt-step-adamw.cuh"
@@ -1748,6 +1751,15 @@ static void ggml_cuda_mul_mat(ggml_backend_cuda_context & ctx, const ggml_tensor
 
     const int cc        = ggml_cuda_info().devices[ctx.device].cc;
     const int warp_size = ggml_cuda_info().devices[ctx.device].warp_size;
+
+#ifdef GGML_CUDA_FLASHRT
+    // Thor (SM110) has no BLACKWELL_MMA path for NVFP4; route to the FlashRT
+    // block-scaled tcgen05 GEMM instead of the dp4a-based MMQ/MMVQ kernels.
+    if (cc == 1100 && ggml_cuda_flashrt_should_use(src0, src1, dst)) {
+        ggml_cuda_flashrt_mul_mat(ctx, src0, src1, dst);
+        return;
+    }
+#endif // GGML_CUDA_FLASHRT
 
     if (ggml_cuda_should_use_mmvf(src0->type, cc, src0->ne, src0->nb, ne11)) {
         // The custom F16 vector kernel can be used over batched cuBLAS GEMM.

@@ -131,6 +131,42 @@ if (CUDAToolkit_FOUND)
 
     add_compile_definitions(GGML_CUDA_PEER_MAX_BATCH_SIZE=${GGML_CUDA_PEER_MAX_BATCH_SIZE})
 
+    if (GGML_CUDA_FLASHRT)
+        # FlashRT NVFP4 tcgen05 kernels for Jetson AGX Thor (SM110). Compiled
+        # as a separate object library because they require -arch=sm_110a and
+        # CUTLASS headers, unlike the rest of ggml-cuda.
+        if (GGML_CUDA_FLASHRT_CUTLASS_DIR)
+            set(FLASHRT_CUTLASS_DIR "${GGML_CUDA_FLASHRT_CUTLASS_DIR}")
+        else()
+            get_filename_component(FLASHRT_CUTLASS_DIR "${CMAKE_CURRENT_SOURCE_DIR}/../../../../cutlass" ABSOLUTE)
+        endif()
+        if (NOT EXISTS "${FLASHRT_CUTLASS_DIR}/include/cutlass/cutlass.h")
+            message(FATAL_ERROR "GGML_CUDA_FLASHRT: CUTLASS not found at ${FLASHRT_CUTLASS_DIR} (set GGML_CUDA_FLASHRT_CUTLASS_DIR)")
+        endif()
+
+        add_library(ggml-cuda-flashrt OBJECT
+            flashrt/fr_gemm_f32out.cu
+            flashrt/fr_quant_act.cu
+            flashrt/fr_repack.cu
+            flashrt/fr_dispatch.cu)
+        set_target_properties(ggml-cuda-flashrt PROPERTIES
+            CUDA_STANDARD 17
+            POSITION_INDEPENDENT_CODE ON
+            CUDA_ARCHITECTURES "110a")
+        target_include_directories(ggml-cuda-flashrt PRIVATE
+            ${FLASHRT_CUTLASS_DIR}/include
+            ${FLASHRT_CUTLASS_DIR}/tools/util/include
+            ${CMAKE_CURRENT_SOURCE_DIR}
+            ${CMAKE_CURRENT_SOURCE_DIR}/..
+            ${CMAKE_CURRENT_SOURCE_DIR}/../../include)
+        target_link_libraries(ggml-cuda-flashrt PRIVATE CUDA::cudart CUDA::cublas)
+        target_compile_options(ggml-cuda-flashrt PRIVATE
+            $<$<COMPILE_LANGUAGE:CUDA>:--expt-relaxed-constexpr --use_fast_math>)
+        target_link_libraries(ggml-cuda PRIVATE ggml-cuda-flashrt)
+        add_compile_definitions(GGML_CUDA_FLASHRT)
+        message(STATUS "GGML_CUDA_FLASHRT: enabled (CUTLASS at ${FLASHRT_CUTLASS_DIR})")
+    endif()
+
     if (GGML_CUDA_GRAPHS)
         add_compile_definitions(GGML_CUDA_USE_GRAPHS)
     endif()
