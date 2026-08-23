@@ -4,6 +4,10 @@
 
 #include "../common.cuh"
 
+// Called at the start of every backend graph evaluation; invalidates the
+// per-evaluation quantized-activation cache.
+void ggml_cuda_flashrt_begin_eval();
+
 // True when this mul_mat should be routed to the FlashRT block-scaled NVFP4
 // GEMM: NVFP4 weights, fp32 contiguous activations/dst, no batch dims,
 // shapes within kernel alignment. cc must already be checked by the caller.

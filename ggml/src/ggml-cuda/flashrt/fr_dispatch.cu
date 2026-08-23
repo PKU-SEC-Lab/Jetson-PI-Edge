@@ -103,6 +103,76 @@ const repacked_weight * get_repacked_pair(const ggml_tensor * gate_w, const ggml
     return &res.first->second;
 }
 
+// Per-evaluation quantized-activation cache. Several ops consume the same
+// fp32 activation tensor (q/k/v projections, the adaLN conditioning vector
+// across all layers); quantizing it once per graph evaluation removes the
+// duplicate quantize launches. Keys use the ggml tensor pointer (unique
+// within one evaluation) plus an evaluation counter, so recycled device
+// addresses across graphs can never alias. Slot buffers are grow-only and
+// never freed, which keeps addresses stable for captured CUDA graphs; a
+// replayed graph rewrites any slot before its baked consumers read it.
+struct act_slot {
+    const ggml_tensor * key = nullptr;
+    uint64_t eval_id = 0;
+    void * packed = nullptr;
+    size_t packed_cap = 0;
+    void * sf = nullptr;
+    size_t sf_cap = 0;
+};
+
+act_slot g_act_slots[4];
+int      g_act_slot_rr = 0;
+uint64_t g_eval_id = 1;
+
+// Returns cached (packed, sf) for src1 quantized as [M, K], quantizing on a
+// miss. Returns false when the cache cannot be used (slot growth needed
+// while capturing a CUDA graph); the caller must quantize into pool memory.
+bool get_quantized_act(const ggml_tensor * src1, int M, int K,
+                       const void ** out_packed, const void ** out_sf,
+                       cudaStream_t stream) {
+    for (auto & s : g_act_slots) {
+        if (s.key == src1 && s.eval_id == g_eval_id) {
+            *out_packed = s.packed;
+            *out_sf     = s.sf;
+            return true;
+        }
+    }
+
+    act_slot & s = g_act_slots[g_act_slot_rr];
+    const size_t need_packed = (size_t) ggml_cuda_flashrt::packed_bytes(M, K);
+    const size_t need_sf     = (size_t) ggml_cuda_flashrt::sf_bytes(M, K);
+
+    if (need_packed > s.packed_cap || need_sf > s.sf_cap) {
+        cudaStreamCaptureStatus cap = cudaStreamCaptureStatusNone;
+        cudaStreamIsCapturing(stream, &cap);
+        if (cap != cudaStreamCaptureStatusNone) {
+            return false;
+        }
+        if (need_packed > s.packed_cap) {
+            if (s.packed != nullptr) { cudaFree(s.packed); }
+            CUDA_CHECK(cudaMalloc(&s.packed, need_packed));
+            s.packed_cap = need_packed;
+        }
+        if (need_sf > s.sf_cap) {
+            if (s.sf != nullptr) { cudaFree(s.sf); }
+            CUDA_CHECK(cudaMalloc(&s.sf, need_sf));
+            s.sf_cap = need_sf;
+        }
+    }
+    g_act_slot_rr = (g_act_slot_rr + 1) % 4;
+
+    const int rc = ggml_cuda_flashrt::quantize_act_f32(
+        (const float *) src1->data, s.packed, s.sf, M, K, stream);
+    if (rc != 0) {
+        GGML_ABORT("flashrt: activation quantize failed (M=%d K=%d rc=%d)", M, K, rc);
+    }
+    s.key     = src1;
+    s.eval_id = g_eval_id;
+    *out_packed = s.packed;
+    *out_sf     = s.sf;
+    return true;
+}
+
 // Grow-only device buffer for the never-written D of the no-D-store GeGLU
 // variants (the host-side TMA descriptor still needs a valid allocation).
 void * get_dummy_d(size_t bytes) {
@@ -180,13 +250,21 @@ void ggml_cuda_flashrt_mul_mat(ggml_backend_cuda_context & ctx, const ggml_tenso
         b_sf     = w->sf;
     }
 
-    ggml_cuda_pool_alloc<uint8_t> a_packed(ctx.pool(), ggml_cuda_flashrt::packed_bytes(M, K));
-    ggml_cuda_pool_alloc<uint8_t> a_sf    (ctx.pool(), ggml_cuda_flashrt::sf_bytes(M, K));
+    ggml_cuda_pool_alloc<uint8_t> a_packed(ctx.pool());
+    ggml_cuda_pool_alloc<uint8_t> a_sf    (ctx.pool());
 
-    int rc = ggml_cuda_flashrt::quantize_act_f32(
-        (const float *) src1->data, a_packed.get(), a_sf.get(), M, K, stream);
-    if (rc != 0) {
-        GGML_ABORT("flashrt: activation quantize failed (M=%d K=%d rc=%d)", M, K, rc);
+    const void * q_packed = nullptr;
+    const void * q_sf     = nullptr;
+    if (!get_quantized_act(src1, M, K, &q_packed, &q_sf, stream)) {
+        a_packed.alloc(ggml_cuda_flashrt::packed_bytes(M, K));
+        a_sf.alloc(ggml_cuda_flashrt::sf_bytes(M, K));
+        const int qrc = ggml_cuda_flashrt::quantize_act_f32(
+            (const float *) src1->data, a_packed.get(), a_sf.get(), M, K, stream);
+        if (qrc != 0) {
+            GGML_ABORT("flashrt: activation quantize failed (M=%d K=%d rc=%d)", M, K, qrc);
+        }
+        q_packed = a_packed.get();
+        q_sf     = a_sf.get();
     }
 
     // ggml's block_nvfp4 scale bytes carry standard e4m3 semantics: its
@@ -197,8 +275,8 @@ void ggml_cuda_flashrt_mul_mat(ggml_backend_cuda_context & ctx, const ggml_tenso
     // every production shape measured (including N=16384 prefill FFN).
     const bool  widen = false;
 
-    rc = ggml_cuda_flashrt::gemm_f32out(
-        a_packed.get(), a_sf.get(), b_packed, b_sf,
+    const int rc = ggml_cuda_flashrt::gemm_f32out(
+        q_packed, q_sf, b_packed, b_sf,
         (float *) dst->data, M, N, K, alpha, widen, stream);
     if (rc != 0) {
         GGML_ABORT("flashrt: gemm failed (M=%d N=%d K=%d rc=%d)", M, N, K, rc);
@@ -266,13 +344,22 @@ void ggml_cuda_flashrt_ada_norm(ggml_backend_cuda_context & ctx, const ggml_tens
 
     const repacked_weight * w = get_repacked(mm->src[0], stream);
 
-    ggml_cuda_pool_alloc<uint8_t> c_packed(ctx.pool(), ggml_cuda_flashrt::packed_bytes(1, K));
-    ggml_cuda_pool_alloc<uint8_t> c_sf    (ctx.pool(), ggml_cuda_flashrt::sf_bytes(1, K));
+    ggml_cuda_pool_alloc<uint8_t> c_packed(ctx.pool());
+    ggml_cuda_pool_alloc<uint8_t> c_sf    (ctx.pool());
     ggml_cuda_pool_alloc<float>   mod_raw (ctx.pool(), N);
 
-    int rc = ggml_cuda_flashrt::quantize_act_f32((const float *) cond->data, c_packed.get(), c_sf.get(), 1, K, stream);
+    const void * q_packed = nullptr;
+    const void * q_sf     = nullptr;
+    int rc = 0;
+    if (!get_quantized_act(cond, 1, K, &q_packed, &q_sf, stream)) {
+        c_packed.alloc(ggml_cuda_flashrt::packed_bytes(1, K));
+        c_sf.alloc(ggml_cuda_flashrt::sf_bytes(1, K));
+        rc = ggml_cuda_flashrt::quantize_act_f32((const float *) cond->data, c_packed.get(), c_sf.get(), 1, K, stream);
+        q_packed = c_packed.get();
+        q_sf     = c_sf.get();
+    }
     if (rc == 0) {
-        rc = ggml_cuda_flashrt::gemm_f32out(c_packed.get(), c_sf.get(), w->packed, w->sf,
+        rc = ggml_cuda_flashrt::gemm_f32out(q_packed, q_sf, w->packed, w->sf,
                                             mod_raw.get(), 1, N, K, 1.0f, false, stream);
     }
     if (rc == 0) {
@@ -377,13 +464,22 @@ void ggml_cuda_flashrt_geglu_ffn(ggml_backend_cuda_context & ctx, const ggml_ten
     const repacked_weight * w_il   = get_repacked_pair(gate_w, up_mm->src[0], stream);
     const repacked_weight * w_down = get_repacked(down_w, stream);
 
-    ggml_cuda_pool_alloc<uint8_t> a_packed(ctx.pool(), ggml_cuda_flashrt::packed_bytes(M, K));
-    ggml_cuda_pool_alloc<uint8_t> a_sf    (ctx.pool(), ggml_cuda_flashrt::sf_bytes(M, K));
+    ggml_cuda_pool_alloc<uint8_t> a_packed(ctx.pool());
+    ggml_cuda_pool_alloc<uint8_t> a_sf    (ctx.pool());
 
-    int rc = ggml_cuda_flashrt::quantize_act_f32(
-        (const float *) src1->data, a_packed.get(), a_sf.get(), M, K, stream);
-    if (rc != 0) {
-        GGML_ABORT("flashrt: geglu activation quantize failed (M=%d K=%d rc=%d)", M, K, rc);
+    const void * q_packed = nullptr;
+    const void * q_sf     = nullptr;
+    int rc = 0;
+    if (!get_quantized_act(src1, M, K, &q_packed, &q_sf, stream)) {
+        a_packed.alloc(ggml_cuda_flashrt::packed_bytes(M, K));
+        a_sf.alloc(ggml_cuda_flashrt::sf_bytes(M, K));
+        rc = ggml_cuda_flashrt::quantize_act_f32(
+            (const float *) src1->data, a_packed.get(), a_sf.get(), M, K, stream);
+        if (rc != 0) {
+            GGML_ABORT("flashrt: geglu activation quantize failed (M=%d K=%d rc=%d)", M, K, rc);
+        }
+        q_packed = a_packed.get();
+        q_sf     = a_sf.get();
     }
 
     ggml_cuda_pool_alloc<uint8_t> compact_packed(ctx.pool(), ggml_cuda_flashrt::packed_bytes(M, n_ff));
@@ -393,11 +489,11 @@ void ggml_cuda_flashrt_geglu_ffn(ggml_backend_cuda_context & ctx, const ggml_ten
     // skinny-M tile for decode-sized batches, default tile otherwise
     if (M < 128) {
         rc = flash_rt::fp4::cutlass_fp4_gemm_geglu_il_hw_nod_v10(
-            a_packed.get(), a_sf.get(), w_il->packed, w_il->sf,
+            q_packed, q_sf, w_il->packed, w_il->sf,
             dummy_d, compact_packed.get(), compact_sfa.get(), M, N_il, K, stream);
     } else {
         rc = flash_rt::fp4::cutlass_fp4_gemm_geglu_il_hw_nod(
-            a_packed.get(), a_sf.get(), w_il->packed, w_il->sf,
+            q_packed, q_sf, w_il->packed, w_il->sf,
             dummy_d, compact_packed.get(), compact_sfa.get(), M, N_il, K, stream);
     }
     if (rc != 0) {
@@ -410,4 +506,8 @@ void ggml_cuda_flashrt_geglu_ffn(ggml_backend_cuda_context & ctx, const ggml_ten
     if (rc != 0) {
         GGML_ABORT("flashrt: geglu down gemm failed (M=%d N=%d K=%d rc=%d)", M, N_out, n_ff, rc);
     }
+}
+
+void ggml_cuda_flashrt_begin_eval() {
+    g_eval_id++;
 }
