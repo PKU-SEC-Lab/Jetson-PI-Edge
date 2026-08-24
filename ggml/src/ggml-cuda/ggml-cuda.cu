@@ -3415,19 +3415,75 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
     }
 
     // pi0.5 gated residual: {view gate, repeat, mul, add} -> one kernel.
-    if (node->op == GGML_OP_VIEW && i + 3 < cgraph->n_nodes &&
+    // Anchored at the REPEAT: the evaluate loop skips view/noop nodes before
+    // calling try_fuse, so a VIEW can never be the window's entry node.
+    if (node->op == GGML_OP_REPEAT && i >= 1 && i + 2 < cgraph->n_nodes &&
         ggml_cuda_info().devices[cuda_ctx->device].cc == 1100 &&
-        ggml_can_fuse_subgraph(cgraph, i, { GGML_OP_VIEW, GGML_OP_REPEAT, GGML_OP_MUL, GGML_OP_ADD }, { i + 3 })) {
-        const ggml_tensor * view   = cgraph->nodes[i];
-        const ggml_tensor * repeat = cgraph->nodes[i + 1];
-        const ggml_tensor * mul    = cgraph->nodes[i + 2];
-        ggml_tensor * add          = cgraph->nodes[i + 3];
+        cgraph->nodes[i - 1]->op == GGML_OP_VIEW && cgraph->nodes[i + 1]->op == GGML_OP_MUL &&
+        cgraph->nodes[i + 2]->op == GGML_OP_ADD) {
+        const ggml_tensor * view   = cgraph->nodes[i - 1];
+        const ggml_tensor * repeat = cgraph->nodes[i];
+        const ggml_tensor * mul    = cgraph->nodes[i + 1];
+        ggml_tensor * add          = cgraph->nodes[i + 2];
 
-        int out_nodes[] = { i + 3 };
-        if (ggml_cuda_flashrt_should_fuse_gated_res(view, repeat, mul, add) &&
-            ggml_cuda_check_fusion_memory_ranges(cgraph, i, 4, out_nodes, 1)) {
+        int out_nodes[] = { i + 2 };
+        // bespoke sequence check (ggml_can_fuse_subgraph rejects windows led
+        // by a view of an external tensor): strictly window-internal use
+        // counts for the compute intermediates, no OUTPUT flags inside.
+        bool g_seq = (repeat->flags & GGML_TENSOR_FLAG_COMPUTE) != 0 &&
+                     (mul->flags & GGML_TENSOR_FLAG_COMPUTE) != 0 &&
+                     (add->flags & GGML_TENSOR_FLAG_COMPUTE) != 0 &&
+                     (repeat->flags & GGML_TENSOR_FLAG_OUTPUT) == 0 &&
+                     (mul->flags & GGML_TENSOR_FLAG_OUTPUT) == 0 &&
+                     mul->src[1] == repeat &&
+                     (add->src[0] == mul || add->src[1] == mul) &&
+                     ggml_node_get_use_count(cgraph, i)     == 1 &&
+                     ggml_node_get_use_count(cgraph, i + 1) == 1;
+        const bool g_sf  = g_seq && ggml_cuda_flashrt_should_fuse_gated_res(view, repeat, mul, add);
+        // relaxed overlap check: the fused kernel is element-wise and reads
+        // residual/branch before writing the same element, so an exact alias
+        // of the output with either of them is safe; any other overlap vetoes
+        bool g_mem = g_sf;
+        if (g_sf) {
+            GGML_UNUSED(out_nodes);
+            const ggml_tensor * branch   = mul->src[0];
+            const ggml_tensor * residual = add->src[0] == mul ? add->src[1] : add->src[0];
+            const int64_t d_lo = (int64_t) (uintptr_t) add->data;
+            const int64_t d_hi = d_lo + (int64_t) ggml_nbytes(add);
+            const ggml_tensor * srcs[3] = { view, branch, residual };
+            for (const ggml_tensor * src : srcs) {
+                if (src == nullptr || src->buffer == nullptr) {
+                    continue;
+                }
+                const int64_t s_lo = (int64_t) (uintptr_t) src->data;
+                const int64_t s_hi = s_lo + (int64_t) ggml_nbytes(src);
+                const bool overlap = (s_lo <= d_lo && d_lo < s_hi) || (d_lo <= s_lo && s_lo < d_hi);
+                const bool exact   = s_lo == d_lo && s_hi == d_hi;
+                if (overlap && !((src == residual || src == branch) && exact)) {
+                    g_mem = false;
+                    break;
+                }
+            }
+        }
+        if (g_sf && g_mem) {
             ggml_cuda_flashrt_gated_residual(*cuda_ctx, view, mul, add);
-            return 3;
+            return 2;
+        }
+        if (getenv("GGML_FLASHRT_DEBUG") != nullptr) {
+            static int dbg_g = 0;
+            if (dbg_g++ < 8) {
+                fprintf(stderr, "[fr-gated] at %d: seq=%d sf=%d mem=%d | cf=%d%d%d of=%d%d wire=%d%d uc=%d,%d\n",
+                        i, (int) g_seq, (int) g_sf, (int) g_mem,
+                        (int) ((repeat->flags & GGML_TENSOR_FLAG_COMPUTE) != 0),
+                        (int) ((mul->flags & GGML_TENSOR_FLAG_COMPUTE) != 0),
+                        (int) ((add->flags & GGML_TENSOR_FLAG_COMPUTE) != 0),
+                        (int) ((repeat->flags & GGML_TENSOR_FLAG_OUTPUT) == 0),
+                        (int) ((mul->flags & GGML_TENSOR_FLAG_OUTPUT) == 0),
+                        (int) (mul->src[1] == repeat),
+                        (int) (add->src[0] == mul || add->src[1] == mul),
+                        ggml_node_get_use_count(cgraph, i),
+                        ggml_node_get_use_count(cgraph, i + 1));
+            }
         }
     }
 
