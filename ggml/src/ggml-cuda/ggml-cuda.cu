@@ -3417,6 +3417,69 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
     // pi0.5 gated residual: {view gate, repeat, mul, add} -> one kernel.
     // Anchored at the REPEAT: the evaluate loop skips view/noop nodes before
     // calling try_fuse, so a VIEW can never be the window's entry node.
+    // {RMS_NORM, MUL(w), ADD(mul, norm)} -> one Gemma-norm kernel
+    // (out = rms_norm(x)*(1+w)). ggml's fused rms_norm cannot express the
+    // add-of-norm-output form, so this chain otherwise runs as 3 kernels.
+    if (node->op == GGML_OP_RMS_NORM && i + 2 < cgraph->n_nodes &&
+        ggml_cuda_info().devices[cuda_ctx->device].cc == 1100 &&
+        cgraph->nodes[i + 1]->op == GGML_OP_MUL && cgraph->nodes[i + 2]->op == GGML_OP_ADD) {
+        const ggml_tensor * rms = cgraph->nodes[i];
+        const ggml_tensor * mul = cgraph->nodes[i + 1];
+        ggml_tensor * add       = cgraph->nodes[i + 2];
+        const bool rg_seq = (rms->flags & GGML_TENSOR_FLAG_COMPUTE) != 0 &&
+                            (mul->flags & GGML_TENSOR_FLAG_COMPUTE) != 0 &&
+                            (add->flags & GGML_TENSOR_FLAG_COMPUTE) != 0 &&
+                            (rms->flags & GGML_TENSOR_FLAG_OUTPUT) == 0 &&
+                            (mul->flags & GGML_TENSOR_FLAG_OUTPUT) == 0 &&
+                            ggml_node_get_use_count(cgraph, i)     == 2 &&
+                            ggml_node_get_use_count(cgraph, i + 1) == 1;
+        bool rg_mem = rg_seq && ggml_cuda_flashrt_should_fuse_rms_gemma(rms, mul, add);
+        if (rg_mem) {
+            // the kernel reads each x element before writing the same output
+            // element, so an exact alias of the output with x is safe; any
+            // other overlap with live inputs vetoes.
+            const ggml_tensor * x = rms->src[0];
+            const ggml_tensor * w = mul->src[1];
+            const int64_t d_lo = (int64_t) (uintptr_t) add->data;
+            const int64_t d_hi = d_lo + (int64_t) ggml_nbytes(add);
+            const ggml_tensor * srcs[2] = { x, w };
+            for (const ggml_tensor * src : srcs) {
+                if (src == nullptr || src->buffer == nullptr) {
+                    continue;
+                }
+                const int64_t s_lo = (int64_t) (uintptr_t) src->data;
+                const int64_t s_hi = s_lo + (int64_t) ggml_nbytes(src);
+                const bool overlap = (s_lo <= d_lo && d_lo < s_hi) || (d_lo <= s_lo && s_lo < d_hi);
+                const bool exact   = s_lo == d_lo && s_hi == d_hi;
+                if (overlap && !(src == x && exact)) {
+                    rg_mem = false;
+                    break;
+                }
+            }
+        }
+        if (rg_mem && ggml_cuda_flashrt_rms_gemma(*cuda_ctx, rms, mul, add)) {
+            return 2;
+        }
+        if (getenv("GGML_FLASHRT_DEBUG") != nullptr) {
+            static int dbg_rg = 0;
+            if (dbg_rg++ < 8) {
+                fprintf(stderr, "[fr-rmsg] at %d: seq=%d sf=%d mem=%d | cf=%d%d%d of=%d%d uc=%d,%d wire=%d,%d\n",
+                        i, (int) rg_seq,
+                        (int) (rg_seq && ggml_cuda_flashrt_should_fuse_rms_gemma(rms, mul, add)),
+                        (int) rg_mem,
+                        (int) ((rms->flags & GGML_TENSOR_FLAG_COMPUTE) != 0),
+                        (int) ((mul->flags & GGML_TENSOR_FLAG_COMPUTE) != 0),
+                        (int) ((add->flags & GGML_TENSOR_FLAG_COMPUTE) != 0),
+                        (int) ((rms->flags & GGML_TENSOR_FLAG_OUTPUT) == 0),
+                        (int) ((mul->flags & GGML_TENSOR_FLAG_OUTPUT) == 0),
+                        ggml_node_get_use_count(cgraph, i),
+                        ggml_node_get_use_count(cgraph, i + 1),
+                        (int) (mul->src[0] == rms),
+                        (int) (add->src[0] == mul && add->src[1] == rms));
+            }
+        }
+    }
+
     if (node->op == GGML_OP_REPEAT && i >= 1 && i + 2 < cgraph->n_nodes &&
         ggml_cuda_info().devices[cuda_ctx->device].cc == 1100 &&
         cgraph->nodes[i - 1]->op == GGML_OP_VIEW && cgraph->nodes[i + 1]->op == GGML_OP_MUL &&
