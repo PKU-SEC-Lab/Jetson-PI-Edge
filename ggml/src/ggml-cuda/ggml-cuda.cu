@@ -3546,6 +3546,19 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
     // pi0.5 gated residual: {view gate, repeat, mul, add} -> one kernel.
     // Anchored at the REPEAT: the evaluate loop skips view/noop nodes before
     // calling try_fuse, so a VIEW can never be the window's entry node.
+    // FLASH_ATTN_EXT with tiny q over a single padded f16 KV head runs as
+    // QK-GEMM + masked softmax + PV-GEMM through the FlashRT adapter.
+    // (the caller treats a 0 return as "not fused", so the window also
+    // consumes the pure-view RESHAPE that always follows the FA node)
+    if (node->op == GGML_OP_FLASH_ATTN_EXT && i + 1 < cgraph->n_nodes &&
+        ggml_cuda_info().devices[cuda_ctx->device].cc == 1100 &&
+        cgraph->nodes[i + 1]->op == GGML_OP_RESHAPE &&
+        cgraph->nodes[i + 1]->src[0] == node &&
+        ggml_cuda_flashrt_should_fuse_dec_attn(node)) {
+        ggml_cuda_flashrt_dec_attn(*cuda_ctx, node);
+        return 1;
+    }
+
     // {RMS_NORM, MUL(w), ADD(mul, norm)} -> one Gemma-norm kernel
     // (out = rms_norm(x)*(1+w)). ggml's fused rms_norm cannot express the
     // add-of-norm-output form, so this chain otherwise runs as 3 kernels.

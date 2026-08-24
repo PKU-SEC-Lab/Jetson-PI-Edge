@@ -172,6 +172,7 @@ if (CUDAToolkit_FOUND)
             ${FLASHRT_ADAPTER_DIR}/fr_qkv_post.cu
             ${FLASHRT_ADAPTER_DIR}/fr_quant_act.cu
             ${FLASHRT_ADAPTER_DIR}/fr_repack.cu
+            ${FLASHRT_ADAPTER_DIR}/fr_decode_attn.cu
             ${FLASHRT_ADAPTER_DIR}/fr_dispatch.cu)
         set_target_properties(ggml-cuda-flashrt PROPERTIES
             CUDA_STANDARD 17
