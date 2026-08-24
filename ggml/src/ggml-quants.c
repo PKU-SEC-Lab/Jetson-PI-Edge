@@ -416,6 +416,61 @@ void quantize_row_nvfp4_ref(const float * GGML_RESTRICT x, block_nvfp4 * GGML_RE
     }
 }
 
+// MSE-searched variant: per 16-value block, try a compact set of scale
+// candidates around amax/6 (each rounded to UE4M3) and keep the one with the
+// lowest reconstruction error. The 1.0 candidate reproduces the plain amax
+// scale, so per-block error is never worse than quantize_row_nvfp4_ref.
+void quantize_row_nvfp4_mse_ref(const float * GGML_RESTRICT x, block_nvfp4 * GGML_RESTRICT y, int64_t k) {
+    static const int qk = QK_NVFP4;
+    static const int qk_sub = QK_NVFP4_SUB;
+    static const int n_sub = QK_NVFP4 / QK_NVFP4_SUB;
+    static const float mults[9] = {0.375f, 0.5f, 0.625f, 0.75f, 0.875f, 1.0f, 1.125f, 1.25f, 1.5f};
+
+    assert(k % qk == 0);
+
+    const int nb = k / qk;
+
+    for (int i = 0; i < nb; i++) {
+        for (int s = 0; s < n_sub; s++) {
+            const float * xb = x + i*qk + s*qk_sub;
+
+            float amax = 0.0f;
+            for (int j = 0; j < qk_sub; j++) {
+                if (amax < fabsf(xb[j])) {
+                    amax = fabsf(xb[j]);
+                }
+            }
+
+            uint8_t best_ue = ggml_fp32_to_ue4m3(amax / 6.0f);
+            float best_err = FLT_MAX;
+            for (int c = 0; c < 9; ++c) {
+                const uint8_t ue = ggml_fp32_to_ue4m3(amax / 6.0f * mults[c]);
+                const float d = ggml_ue4m3_to_fp32(ue);
+                float err = 0.0f;
+                for (int j = 0; j < qk_sub; j++) {
+                    const int q = best_index_mxfp4(xb[j], d);
+                    const float diff = kvalues_mxfp4[q]*d - xb[j];
+                    err += diff * diff;
+                }
+                if (err < best_err) {
+                    best_err = err;
+                    best_ue = ue;
+                }
+            }
+
+            y[i].d[s] = best_ue;
+            const float d = ggml_ue4m3_to_fp32(best_ue);
+
+            for (int j = 0; j < qk_sub/2; ++j) {
+                const uint8_t x0 = best_index_mxfp4(xb[0        + j], d);
+                const uint8_t x1 = best_index_mxfp4(xb[qk_sub/2 + j], d);
+
+                y[i].qs[s*(qk_sub/2) + j] = x0 | (x1 << 4);
+            }
+        }
+    }
+}
+
 void dequantize_row_q1_0(const block_q1_0 * GGML_RESTRICT x, float * GGML_RESTRICT y, int64_t k) {
     static const int qk = QK1_0;
 
@@ -2307,7 +2362,14 @@ size_t quantize_mxfp4(const float * GGML_RESTRICT src, void * GGML_RESTRICT dst,
 
 size_t quantize_nvfp4(const float * GGML_RESTRICT src, void * GGML_RESTRICT dst, int64_t nrow, int64_t n_per_row, const float * quant_weights) {
     GGML_UNUSED(quant_weights);
-    quantize_row_nvfp4_ref(src, dst, (int64_t)nrow*n_per_row);
+    // GGML_NVFP4_MSE=1 selects the per-block MSE-searched scale (opt-in so
+    // existing quantizations stay reproducible byte-for-byte).
+    const char * mse = getenv("GGML_NVFP4_MSE");
+    if (mse && mse[0] == '1') {
+        quantize_row_nvfp4_mse_ref(src, dst, (int64_t)nrow*n_per_row);
+    } else {
+        quantize_row_nvfp4_ref(src, dst, (int64_t)nrow*n_per_row);
+    }
     return nrow * ggml_row_size(GGML_TYPE_NVFP4, n_per_row);
 }
 
