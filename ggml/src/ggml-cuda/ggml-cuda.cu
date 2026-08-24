@@ -3293,11 +3293,47 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
                 cgraph->nodes[i + 3], cgraph->nodes[i + 4], cgraph->nodes[i + 5],
                 cgraph->nodes[i + 6], cgraph->nodes[i + 7], cgraph->nodes[i + 8],
                 cgraph->nodes[i + 9], cgraph->nodes[i + 10], cgraph->nodes[i + 11])) {
+            ggml_tensor * pad_k = cgraph->nodes[i + 10];
+            ggml_tensor * pad_v = cgraph->nodes[i + 11];
+            // optional tail {permute q, cpy k->f16, permute, cpy v->f16,
+            // permute}: the K/V f16 casts then come straight out of the GEMM
+            // epilogue (single rounding from the fp32 accumulator), the f32
+            // pads become dead and the two big cast copies disappear.
+            ggml_tensor * k_cast = nullptr;
+            ggml_tensor * v_cast = nullptr;
+            static const bool vis_f16_off = getenv("GGML_FLASHRT_NO_VIS_F16") != nullptr;
+            if (!vis_f16_off && i + 16 < cgraph->n_nodes &&
+                cgraph->nodes[i + 12]->op == GGML_OP_PERMUTE &&
+                cgraph->nodes[i + 13]->op == GGML_OP_CPY &&
+                cgraph->nodes[i + 14]->op == GGML_OP_PERMUTE &&
+                cgraph->nodes[i + 15]->op == GGML_OP_CPY &&
+                cgraph->nodes[i + 16]->op == GGML_OP_PERMUTE &&
+                cgraph->nodes[i + 12]->src[0] == cgraph->nodes[i + 9] &&
+                cgraph->nodes[i + 13]->src[0] == pad_k &&
+                cgraph->nodes[i + 14]->src[0] == cgraph->nodes[i + 13] &&
+                cgraph->nodes[i + 15]->src[0] == pad_v &&
+                cgraph->nodes[i + 16]->src[0] == cgraph->nodes[i + 15] &&
+                ggml_node_get_use_count(cgraph, i + 10) == 1 &&
+                ggml_node_get_use_count(cgraph, i + 11) == 1) {
+                ggml_tensor * ck = cgraph->nodes[i + 13];
+                ggml_tensor * cv = cgraph->nodes[i + 15];
+                const bool casts_ok =
+                    ck->type == GGML_TYPE_F16 && cv->type == GGML_TYPE_F16 &&
+                    ggml_is_contiguous(ck) && ggml_is_contiguous(cv) &&
+                    ggml_are_same_shape(ck, pad_k) && ggml_are_same_shape(cv, pad_v) &&
+                    (ck->flags & GGML_TENSOR_FLAG_COMPUTE) != 0 &&
+                    (cv->flags & GGML_TENSOR_FLAG_COMPUTE) != 0;
+                if (casts_ok) {
+                    k_cast = ck;
+                    v_cast = cv;
+                }
+            }
             ggml_cuda_flashrt_vis_qkv_pad(*cuda_ctx,
                 cgraph->nodes[i],     cgraph->nodes[i + 1], cgraph->nodes[i + 9],
-                cgraph->nodes[i + 3], cgraph->nodes[i + 4], cgraph->nodes[i + 10],
-                cgraph->nodes[i + 6], cgraph->nodes[i + 7], cgraph->nodes[i + 11]);
-            return 11;
+                cgraph->nodes[i + 3], cgraph->nodes[i + 4], pad_k,
+                cgraph->nodes[i + 6], cgraph->nodes[i + 7], pad_v,
+                k_cast, v_cast);
+            return k_cast != nullptr ? 16 : 11;
         }
     }
 

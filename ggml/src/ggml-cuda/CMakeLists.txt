@@ -167,6 +167,7 @@ if (CUDAToolkit_FOUND)
             ${FLASHRT_ADAPTER_DIR}/fr_gemm_f32out.cu
             ${FLASHRT_PUBLIC_DIR}/csrc/gemm/fp4/cutlass_fp4_gemm_geglu_il_sm100.cu
             ${FLASHRT_PUBLIC_DIR}/csrc/gemm/fp4/cutlass_fp4_gemm_siglip_ffn_f32out_sm100.cu
+            ${FLASHRT_PUBLIC_DIR}/csrc/gemm/fp4/cutlass_fp4_gemm_bias_f32b_f16out_sm100.cu
             ${FLASHRT_ADAPTER_DIR}/fr_ada.cu
             ${FLASHRT_ADAPTER_DIR}/fr_qkv_post.cu
             ${FLASHRT_ADAPTER_DIR}/fr_quant_act.cu
