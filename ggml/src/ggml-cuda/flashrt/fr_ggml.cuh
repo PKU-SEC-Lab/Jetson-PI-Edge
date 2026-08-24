@@ -41,6 +41,16 @@ void ggml_cuda_flashrt_ada_norm(ggml_backend_cuda_context & ctx, const ggml_tens
                                 const ggml_tensor * view_shift, ggml_tensor * add2);
 
 // LayerNorm + affine window: {NORM, MUL weight, ADD bias} -> one kernel.
+bool ggml_cuda_flashrt_should_fuse_ada_cached(
+        const ggml_tensor * rms, const ggml_tensor * view_col,
+        const ggml_tensor * view_scale, const ggml_tensor * repeat_scale,
+        const ggml_tensor * mul, const ggml_tensor * add1,
+        const ggml_tensor * view_shift, const ggml_tensor * repeat_shift,
+        const ggml_tensor * add2);
+void ggml_cuda_flashrt_ada_norm_cached(ggml_backend_cuda_context & ctx, const ggml_tensor * rms,
+                                       const ggml_tensor * view_scale, const ggml_tensor * view_shift,
+                                       ggml_tensor * add2);
+
 bool ggml_cuda_flashrt_should_fuse_ln(const ggml_tensor * norm, const ggml_tensor * mul, const ggml_tensor * add);
 void ggml_cuda_flashrt_ln_affine(ggml_backend_cuda_context & ctx, const ggml_tensor * norm, const ggml_tensor * mul, ggml_tensor * add);
 

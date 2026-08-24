@@ -212,11 +212,39 @@ llm_build_pi0_ae::llm_build_pi0_ae(const llama_model & model, const llm_graph_pa
     auto * inp_attn_ae = build_attn_inp_no_cache_ae(suffix_len, kv_prefix_len + suffix_len,
                                                     kv_persistent ? cross_kv_tensors[0]->ne[2] : 0);
 
+    // AdaRMS modulation precompute: the modulation vectors depend only on the
+    // fixed denoise timestep schedule. The first (fill) inference exports each
+    // biased modulation output by name; once the host cache is filled, later
+    // graphs read the vectors from a per-step input tensor instead of running
+    // the modulation GEMMs and the time MLP.
+    const bool mod_precomp = is_pi05 && cross != nullptr && cross->ae_mod_precomp_enabled &&
+                             !keep_debug && cross->pi0_decode_unroll < 2;
+    const bool mod_cached  = mod_precomp && cross->ae_mod_ready && cross->ae_mod_gpu != nullptr;
+    ggml_tensor * inp_mod_all = nullptr;
+    int mod_site_idx = 0;
+
     auto build_pi05_modulation = [&](ggml_tensor * cond, ggml_tensor * dense_w, ggml_tensor * dense_b, int il, const char * tag) -> std::array<ggml_tensor *, 3> {
-        GGML_ASSERT(cond != nullptr);
         GGML_ASSERT(dense_w != nullptr);
 
-        ggml_tensor * modulation = pi05_dense(dense_w, dense_b, cond);
+        ggml_tensor * modulation = nullptr;
+        if (mod_cached) {
+            GGML_ASSERT(inp_mod_all != nullptr);
+            GGML_ASSERT(dense_w->ne[1] == inp_mod_all->ne[0]);
+            GGML_ASSERT(mod_site_idx < inp_mod_all->ne[1]);
+            modulation = ggml_view_2d(ctx0, inp_mod_all, inp_mod_all->ne[0], 1,
+                                      inp_mod_all->nb[1], (size_t) mod_site_idx * inp_mod_all->nb[1]);
+        } else {
+            GGML_ASSERT(cond != nullptr);
+            modulation = pi05_dense(dense_w, dense_b, cond);
+            if (mod_precomp) {
+                char mname[48];
+                snprintf(mname, sizeof(mname), "pi05_mod_cache_%d", mod_site_idx);
+                ggml_set_name(modulation, mname);
+                ggml_set_output(modulation);
+                ggml_build_forward_expand(gf, modulation);
+            }
+        }
+        mod_site_idx++;
 
         const int64_t dim = modulation->ne[0] / 3;
         GGML_ASSERT(modulation->ne[0] == 3 * dim);
@@ -484,6 +512,16 @@ llm_build_pi0_ae::llm_build_pi0_ae(const llama_model & model, const llm_graph_pa
 
     if (is_pi05) {
         if (n_unroll == 1) {
+            if (mod_cached) {
+                // modulation vectors come from the precomputed per-step input;
+                // no time MLP and no modulation GEMMs in the graph
+                if (std::getenv("GGML_PI05_MOD_DEBUG")) {
+                    fprintf(stderr, "[mod-precomp] building cached-mode AE graph (step %d)\n",
+                            cross ? cross->pi0_decode_step : -1);
+                }
+                inp_mod_all = build_inp_pi05_mod();
+                res->action = run_ae_stack(actions, nullptr);
+            } else {
             ggml_tensor * time0 = build_inp_sinusoidal_embedding(0);
             if (keep_debug) {
                 mark_debug(time0, "pi05_dbg_ae_time_sinusoid", -1);
@@ -493,6 +531,7 @@ llm_build_pi0_ae::llm_build_pi0_ae(const llama_model & model, const llm_graph_pa
                 mark_debug(adarms, "pi05_dbg_ae_adarms_from_sinusoid", -1);
             }
             res->action = run_ae_stack(actions, adarms);
+            }
         } else {
             ggml_tensor * cur_actions = actions;
             for (int u = 0; u < n_unroll; ++u) {

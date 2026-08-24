@@ -424,6 +424,83 @@ void ggml_cuda_flashrt_ada_norm(ggml_backend_cuda_context & ctx, const ggml_tens
     }
 }
 
+// Cached-modulation adaLN window: the modulation vector comes from a graph
+// input (precomputed per step, see pi0_ae.cpp) instead of a GEMM. Sequence:
+// {RMS_NORM, VIEW mod-col, VIEW scale, REPEAT, MUL, ADD, VIEW shift, REPEAT,
+// ADD} -> one ada kernel reading scale/shift straight from the input views.
+bool ggml_cuda_flashrt_should_fuse_ada_cached(
+        const ggml_tensor * rms, const ggml_tensor * view_col,
+        const ggml_tensor * view_scale, const ggml_tensor * repeat_scale,
+        const ggml_tensor * mul, const ggml_tensor * add1,
+        const ggml_tensor * view_shift, const ggml_tensor * repeat_shift,
+        const ggml_tensor * add2) {
+    static const bool disabled = getenv("GGML_CUDA_FLASHRT_DISABLE") != nullptr;
+    if (disabled) {
+        return false;
+    }
+    const ggml_tensor * x = rms->src[0];
+    if (x == nullptr || x->type != GGML_TYPE_F32 || !ggml_is_contiguous(x)) {
+        return false;
+    }
+    const int64_t C = x->ne[0];
+    const int64_t M = x->ne[1];
+    if (x->ne[2] != 1 || x->ne[3] != 1 || C % 4 != 0) {
+        return false;
+    }
+    if (view_col->type != GGML_TYPE_F32 || view_col->ne[0] != 3 * C || view_col->ne[1] != 1 ||
+        view_col->src[0] == nullptr) {
+        return false;
+    }
+    if (view_scale->src[0] != view_col || view_scale->ne[0] != C || view_scale->ne[1] != 1 ||
+        view_scale->view_offs != 0) {
+        return false;
+    }
+    if (view_shift->src[0] != view_col || view_shift->ne[0] != C || view_shift->ne[1] != 1 ||
+        view_shift->view_offs != (size_t) C * sizeof(float)) {
+        return false;
+    }
+    if (repeat_scale->src[0] != view_scale || repeat_scale->ne[0] != C || repeat_scale->ne[1] != M ||
+        repeat_shift->src[0] != view_shift || repeat_shift->ne[0] != C || repeat_shift->ne[1] != M) {
+        return false;
+    }
+    if (mul->src[0] != rms || mul->src[1] != repeat_scale ||
+        add1->src[0] != rms || add1->src[1] != mul ||
+        add2->src[0] != add1 || add2->src[1] != repeat_shift ||
+        !ggml_is_contiguous(add2) || add2->ne[0] != C || add2->ne[1] != M) {
+        return false;
+    }
+    return true;
+}
+
+void ggml_cuda_flashrt_ada_norm_cached(ggml_backend_cuda_context & ctx, const ggml_tensor * rms,
+                                       const ggml_tensor * view_scale, const ggml_tensor * view_shift,
+                                       ggml_tensor * add2) {
+    const ggml_tensor * x = rms->src[0];
+    const int C = (int) x->ne[0];
+    const int M = (int) x->ne[1];
+    const float eps = ggml_get_op_params_f32(rms, 0);
+    cudaStream_t stream = ctx.stream();
+
+    int rc;
+    void * q_out_packed = nullptr;
+    void * q_out_sf     = nullptr;
+    if (C % 16 == 0 && reserve_quantized_act(add2, M, C, &q_out_packed, &q_out_sf, stream)) {
+        rc = ggml_cuda_flashrt::ada_rms_mod_quant((const float *) x->data,
+                                                  (const float *) view_scale->data,
+                                                  (const float *) view_shift->data,
+                                                  (float *) add2->data, q_out_packed, q_out_sf,
+                                                  M, C, eps, true, stream);
+    } else {
+        rc = ggml_cuda_flashrt::ada_rms_mod((const float *) x->data,
+                                            (const float *) view_scale->data,
+                                            (const float *) view_shift->data,
+                                            (float *) add2->data, M, C, eps, true, stream);
+    }
+    if (rc != 0) {
+        GGML_ABORT("flashrt: cached adaLN failed (M=%d C=%d rc=%d)", M, C, rc);
+    }
+}
+
 bool ggml_cuda_flashrt_should_fuse_gated_res(const ggml_tensor * view, const ggml_tensor * repeat,
                                              const ggml_tensor * mul, const ggml_tensor * add) {
     const int64_t C = view->ne[0];

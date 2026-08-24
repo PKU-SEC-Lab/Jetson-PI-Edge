@@ -2412,6 +2412,27 @@ int llama_context::decode(const llama_batch & batch_inp) {
 
         std::vector<float> action_data((size_t) total_action_elements);
         const int32_t unroll_cfg = llama_pi0_decode_unroll_steps(is_pi05, hparams.inference_steps);
+
+        // AdaRMS modulation precompute (see pi0_ae.cpp): fill the host cache
+        // from the first inference's named modulation outputs, then feed them
+        // back as a per-step input. Timestep schedule is fixed, so the cache
+        // stays valid for the lifetime of the context.
+        {
+            static const bool mod_precomp_env = [] {
+                const char * e = getenv("GGML_PI05_MOD_PRECOMP");
+                return e == nullptr || e[0] != '0';
+            }();
+            cross.ae_mod_precomp_enabled = is_pi05 && mod_precomp_env && unroll_cfg < 2 &&
+                                           !pi05_debug_binary_enabled();
+            if (cross.ae_mod_steps != (int64_t) hparams.inference_steps) {
+                cross.ae_mod_ready = false;
+            }
+            if (getenv("GGML_PI05_MOD_DEBUG")) {
+                fprintf(stderr, "[mod-precomp] pre-loop: is_pi05=%d env=%d unroll_cfg=%d enabled=%d ready=%d\n",
+                        (int) is_pi05, (int) mod_precomp_env, (int) unroll_cfg,
+                        (int) cross.ae_mod_precomp_enabled, (int) cross.ae_mod_ready);
+            }
+        }
         for (int32_t step = 0; step < hparams.inference_steps; ) {
             const int32_t steps_left = hparams.inference_steps - step;
             const int32_t unroll = unroll_cfg >= 2 && steps_left >= 2
@@ -2453,6 +2474,96 @@ int llama_context::decode(const llama_batch & batch_inp) {
             }
             const size_t action_nbytes = (size_t) total_action_elements * ggml_element_size(action);
             pi0_fetch_action_to_host(sched.get(), action, action_data.data(), action_nbytes);
+
+            if (cross.ae_mod_precomp_enabled && !cross.ae_mod_ready && unroll == 1) {
+                ggml_cgraph * gf = res->get_gf();
+                // discover the modulation sites on the first step
+                if (step == 0) {
+                    int64_t count = 0, width = 0;
+                    for (;; ++count) {
+                        char mname[48];
+                        snprintf(mname, sizeof(mname), "pi05_mod_cache_%lld", (long long) count);
+                        ggml_tensor * t = ggml_graph_get_tensor(gf, mname);
+                        if (t == nullptr) {
+                            break;
+                        }
+                        if (count == 0) {
+                            width = t->ne[0];
+                        } else if (t->ne[0] != width) {
+                            count = 0; // non-uniform widths: bail out
+                            break;
+                        }
+                    }
+                    if (getenv("GGML_PI05_MOD_DEBUG")) {
+                        fprintf(stderr, "[mod-precomp] discovery: count=%lld width=%lld (gf nodes=%d)\n",
+                                (long long) count, (long long) width, ggml_graph_n_nodes(gf));
+                    }
+                    if (count > 0) {
+                        cross.ae_mod_width = width;
+                        cross.ae_mod_count = count;
+                        cross.ae_mod_steps = hparams.inference_steps;
+                        cross.ae_mod_cache.assign(
+                                (size_t) hparams.inference_steps * count * width, 0.0f);
+                    } else {
+                        cross.ae_mod_precomp_enabled = false; // graph did not export
+                    }
+                }
+                if (cross.ae_mod_precomp_enabled) {
+                    const int64_t width = cross.ae_mod_width;
+                    for (int64_t mi = 0; mi < cross.ae_mod_count; ++mi) {
+                        char mname[48];
+                        snprintf(mname, sizeof(mname), "pi05_mod_cache_%lld", (long long) mi);
+                        ggml_tensor * t = ggml_graph_get_tensor(gf, mname);
+                        if (t == nullptr || t->ne[0] != width) {
+                            cross.ae_mod_precomp_enabled = false;
+                            break;
+                        }
+                        float * dst = cross.ae_mod_cache.data() +
+                                ((size_t) step * cross.ae_mod_count + mi) * width;
+                        pi0_fetch_action_to_host(sched.get(), t, dst, (size_t) width * sizeof(float));
+                    }
+                    if (cross.ae_mod_precomp_enabled &&
+                            step + 1 == (int32_t) hparams.inference_steps) {
+                        // move the cache into a dedicated persistent device
+                        // buffer (graph-buffer inputs get clobbered by other
+                        // graphs between evaluations)
+                        ggml_tensor * ref = ggml_graph_get_tensor(gf, "pi05_mod_cache_0");
+                        ggml_backend_buffer_type_t buft = ref != nullptr && ref->buffer != nullptr
+                            ? ggml_backend_buffer_get_type(ref->buffer) : nullptr;
+                        if (buft != nullptr && cross.ae_mod_gpu == nullptr) {
+                            ggml_init_params ip = {
+                                /*.mem_size   =*/ 2 * ggml_tensor_overhead(),
+                                /*.mem_buffer =*/ nullptr,
+                                /*.no_alloc   =*/ true,
+                            };
+                            pi05_mod_gpu.ctx.reset(ggml_init(ip));
+                            if (pi05_mod_gpu.ctx) {
+                                ggml_tensor * t = ggml_new_tensor_2d(
+                                        pi05_mod_gpu.ctx.get(), GGML_TYPE_F32,
+                                        cross.ae_mod_width, cross.ae_mod_count * cross.ae_mod_steps);
+                                ggml_set_name(t, "pi05_mod_all");
+                                pi05_mod_gpu.buf.reset(ggml_backend_alloc_ctx_tensors_from_buft(
+                                        pi05_mod_gpu.ctx.get(), buft));
+                                if (pi05_mod_gpu.buf) {
+                                    ggml_backend_tensor_set(t, cross.ae_mod_cache.data(), 0,
+                                            cross.ae_mod_cache.size() * sizeof(float));
+                                    cross.ae_mod_gpu = t;
+                                }
+                            }
+                        }
+                        if (cross.ae_mod_gpu != nullptr) {
+                            cross.ae_mod_ready = true;
+                            if (getenv("GGML_PI05_MOD_DEBUG")) {
+                                fprintf(stderr, "[mod-precomp] cache ready: steps=%lld count=%lld width=%lld\n",
+                                        (long long) cross.ae_mod_steps, (long long) cross.ae_mod_count,
+                                        (long long) cross.ae_mod_width);
+                            }
+                        } else {
+                            cross.ae_mod_precomp_enabled = false;
+                        }
+                    }
+                }
+            }
 
             if (is_pi05 && pi05_debug_binary_enabled()) {
                 const std::string dump_name = "velocity_step_" + std::to_string(step);

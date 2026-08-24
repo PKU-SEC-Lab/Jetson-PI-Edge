@@ -3165,6 +3165,41 @@ ggml_tensor * llm_graph_context::build_inp_sinusoidal_embedding(int32_t time_ste
     return cur;
 }
 
+void llm_graph_input_pi05_mod::set_input(const llama_ubatch * ubatch) {
+    GGML_UNUSED(ubatch);
+    const int64_t count = cross->ae_mod_count;
+    const int64_t step  = cross->pi0_decode_step;
+    GGML_ASSERT(step >= 0 && step < cross->ae_mod_steps);
+
+    // mod_all is the persistent device tensor (uploaded once by the context);
+    // only the tiny per-step row-index vector moves host->device here
+    int32_t row_ids[128];
+    GGML_ASSERT(count <= (int64_t) (sizeof(row_ids) / sizeof(row_ids[0])));
+    for (int64_t i = 0; i < count; ++i) {
+        row_ids[i] = (int32_t) (step * count + i);
+    }
+    ggml_backend_tensor_set(rows, row_ids, 0, count * sizeof(int32_t));
+}
+
+bool llm_graph_input_pi05_mod::can_reuse(const llm_graph_params & params) {
+    GGML_UNUSED(params);
+    return mod_all != nullptr && rows != nullptr && cross->ae_mod_ready &&
+           mod_all == cross->ae_mod_gpu &&
+           ggml_nelements(rows) == cross->ae_mod_count;
+}
+
+ggml_tensor * llm_graph_context::build_inp_pi05_mod() const {
+    GGML_ASSERT(cross != nullptr && cross->ae_mod_gpu != nullptr);
+    auto inp = std::make_unique<llm_graph_input_pi05_mod>(cross);
+    inp->mod_all = cross->ae_mod_gpu;
+    ggml_set_input(inp->mod_all);
+    inp->rows = ggml_new_tensor_1d(ctx0, GGML_TYPE_I32, cross->ae_mod_count);
+    ggml_set_input(inp->rows);
+    ggml_tensor * sel = ggml_get_rows(ctx0, inp->mod_all, inp->rows);
+    res->add_input(std::move(inp));
+    return sel;
+}
+
 ggml_tensor * llm_graph_context::build_inp_gr00t_dit_time() const {
     auto inp = std::make_unique<llm_graph_input_gr00t_dit_time>(cross);
     auto & cur = inp->time;

@@ -98,6 +98,19 @@ struct llama_cross {
     int64_t ae_time_cache_action_steps = 0;
     int64_t ae_time_cache_n_embd_ae = 0;
 
+    // pi0.5 AdaRMS modulation precompute: the modulation vectors depend only
+    // on the fixed denoise timestep schedule, so after one fill inference the
+    // per-step biased modulation outputs are cached host-side and later
+    // graphs consume them as an input instead of running the 37 modulation
+    // GEMMs (+ the time MLP) every step.
+    bool ae_mod_precomp_enabled = false;         // set by the context before the denoise loop
+    bool ae_mod_ready = false;                   // cache filled and usable
+    int64_t ae_mod_width = 0;                    // 3 * n_embd_ae (scale|shift|gate)
+    int64_t ae_mod_count = 0;                    // modulation sites per step
+    int64_t ae_mod_steps = 0;                    // inference steps the cache was built for
+    std::vector<float> ae_mod_cache;             // [steps][count][width]
+    ggml_tensor * ae_mod_gpu = nullptr;          // persistent device copy [width, count*steps]
+
     int max_layers = 36;
     bool encoded_kv_dirty = true;
     std::vector<std::vector<float>> encoded_kv_data = std::vector<std::vector<float>>(max_layers);
@@ -331,6 +344,23 @@ public:
     const llama_hparams hparams;
     const llama_cross * cross;
     const int32_t       time_step_offset = 0;
+};
+
+// pi0.5 precomputed AdaRMS modulation vectors. The full cache (all steps) is
+// uploaded once and stays resident; per step only a tiny row-index vector is
+// uploaded and the graph selects the step's vectors with ggml_get_rows.
+class llm_graph_input_pi05_mod : public llm_graph_input_i {
+public:
+    llm_graph_input_pi05_mod(const llama_cross * cross) : cross(cross) {}
+    virtual ~llm_graph_input_pi05_mod() = default;
+
+    void set_input(const llama_ubatch * ubatch) override;
+    bool can_reuse(const llm_graph_params & params) override;
+    bool is_static_input() const override { return false; }
+
+    ggml_tensor * mod_all = nullptr; // F32 [ae_mod_width, ae_mod_count * ae_mod_steps]
+    ggml_tensor * rows    = nullptr; // I32 [ae_mod_count]
+    const llama_cross * cross;
 };
 
 class llm_graph_input_gr00t_dit_time : public llm_graph_input_i {
@@ -1421,6 +1451,7 @@ struct llm_graph_context {
     ggml_tensor * build_inp_time() const;
     ggml_tensor * build_inp_ae_time_cond() const;
     ggml_tensor * build_inp_sinusoidal_embedding(int32_t time_step_offset = 0) const;
+    ggml_tensor * build_inp_pi05_mod() const;
     ggml_tensor * build_inp_gr00t_dit_time() const;
     ggml_tensor * build_inp_gr00t_vl_mask(bool attend_image) const;
     ggml_tensor * build_inp_pos_ae(int64_t action_steps) const;

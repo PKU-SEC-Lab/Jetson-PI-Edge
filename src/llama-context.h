@@ -398,6 +398,14 @@ private:
 
     pi0_encoded_kv_gpu_storage pi0_enc_kv_gpu;
 
+    // pi0.5 precomputed AdaRMS modulation vectors, resident on the device in
+    // a dedicated buffer (graph-buffer input tensors get clobbered by other
+    // graphs between evaluations, so they cannot hold a persistent cache)
+    struct {
+        ggml_context_ptr        ctx;
+        ggml_backend_buffer_ptr buf;
+    } pi05_mod_gpu;
+
     // host buffer for the model output (logits and embeddings)
     ggml_backend_buffer_ptr buf_output;
 

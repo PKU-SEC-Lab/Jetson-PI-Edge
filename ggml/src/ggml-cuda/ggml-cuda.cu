@@ -3061,7 +3061,11 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
     // temporary dev aid: dump the first few evaluated graphs' node sequences
     if (getenv("GGML_FLASHRT_DUMP") != nullptr && i == 0) {
         static int dumped = 0;
-        if (dumped < 8) {
+        static const int dump_max = [] {
+            const char * e = getenv("GGML_FLASHRT_DUMP_MAX");
+            return e != nullptr ? atoi(e) : 8;
+        }();
+        if (dumped < dump_max) {
             dumped++;
             FILE * f = fopen(getenv("GGML_FLASHRT_DUMP"), "a");
             if (f) {
@@ -3201,6 +3205,62 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
                 cgraph->nodes[i + 3], cgraph->nodes[i + 4], cgraph->nodes[i + 10],
                 cgraph->nodes[i + 6], cgraph->nodes[i + 7], cgraph->nodes[i + 11]);
             return 11;
+        }
+    }
+
+    // pi0.5 adaLN with precomputed modulation (mod vectors are a graph input):
+    // {RMS_NORM, VIEW mod-col, VIEW scale, REPEAT, MUL, ADD, VIEW shift,
+    // REPEAT, ADD} -> one ada kernel. The mod-col view is also read later by
+    // the gate view (outside the window), which is a zero-cost view, so a
+    // bespoke check replaces ggml_can_fuse_subgraph: compute intermediates
+    // (REPEAT/MUL/ADD) must be window-internal, views are exempt. The fused
+    // kernel writes only the final ADD; its reads (x, the input-buffer mod
+    // views) cannot alias that destination (x outlives the window via the
+    // residual, the mod input tensor lives for the whole graph).
+    if (node->op == GGML_OP_RMS_NORM && i + 8 < cgraph->n_nodes &&
+        ggml_cuda_info().devices[cuda_ctx->device].cc == 1100) {
+        static const enum ggml_op ada_c_ops[9] = {
+            GGML_OP_RMS_NORM, GGML_OP_VIEW, GGML_OP_VIEW, GGML_OP_REPEAT, GGML_OP_MUL,
+            GGML_OP_ADD, GGML_OP_VIEW, GGML_OP_REPEAT, GGML_OP_ADD };
+        bool seq_ok = true;
+        for (int j = 0; j < 9 && seq_ok; ++j) {
+            const ggml_tensor * t = cgraph->nodes[i + j];
+            if (t->op != ada_c_ops[j] || (t->flags & GGML_TENSOR_FLAG_COMPUTE) == 0) {
+                seq_ok = false;
+                break;
+            }
+            if (j == 8) {
+                continue; // window output
+            }
+            if (t->flags & GGML_TENSOR_FLAG_OUTPUT) {
+                seq_ok = false;
+                break;
+            }
+            if (t->op == GGML_OP_VIEW) {
+                continue; // views execute nothing; external gate reads allowed
+            }
+            int uses_in_window = 0;
+            for (int k = j + 1; k < 9; ++k) {
+                const ggml_tensor * o = cgraph->nodes[i + k];
+                for (int si = 0; si < GGML_MAX_SRC; ++si) {
+                    if (o->src[si] == t) {
+                        uses_in_window++;
+                    }
+                }
+            }
+            if (uses_in_window != ggml_node_get_use_count(cgraph, i + j)) {
+                seq_ok = false;
+            }
+        }
+        if (seq_ok &&
+            ggml_cuda_flashrt_should_fuse_ada_cached(
+                cgraph->nodes[i],     cgraph->nodes[i + 1], cgraph->nodes[i + 2],
+                cgraph->nodes[i + 3], cgraph->nodes[i + 4], cgraph->nodes[i + 5],
+                cgraph->nodes[i + 6], cgraph->nodes[i + 7], cgraph->nodes[i + 8])) {
+            ggml_cuda_flashrt_ada_norm_cached(*cuda_ctx,
+                cgraph->nodes[i], cgraph->nodes[i + 2], cgraph->nodes[i + 6],
+                cgraph->nodes[i + 8]);
+            return 8;
         }
     }
 
