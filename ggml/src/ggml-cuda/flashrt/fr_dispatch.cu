@@ -173,6 +173,42 @@ bool get_quantized_act(const ggml_tensor * src1, int M, int K,
     return true;
 }
 
+// Reserve a cache slot for an activation that a producer kernel will fill
+// with already-quantized data (fused quantize). Returns false when slot
+// growth would be needed during CUDA graph capture.
+bool reserve_quantized_act(const ggml_tensor * out_tensor, int M, int K,
+                           void ** out_packed, void ** out_sf,
+                           cudaStream_t stream) {
+    act_slot & s = g_act_slots[g_act_slot_rr];
+    const size_t need_packed = (size_t) ggml_cuda_flashrt::packed_bytes(M, K);
+    const size_t need_sf     = (size_t) ggml_cuda_flashrt::sf_bytes(M, K);
+
+    if (need_packed > s.packed_cap || need_sf > s.sf_cap) {
+        cudaStreamCaptureStatus cap = cudaStreamCaptureStatusNone;
+        cudaStreamIsCapturing(stream, &cap);
+        if (cap != cudaStreamCaptureStatusNone) {
+            return false;
+        }
+        if (need_packed > s.packed_cap) {
+            if (s.packed != nullptr) { cudaFree(s.packed); }
+            CUDA_CHECK(cudaMalloc(&s.packed, need_packed));
+            s.packed_cap = need_packed;
+        }
+        if (need_sf > s.sf_cap) {
+            if (s.sf != nullptr) { cudaFree(s.sf); }
+            CUDA_CHECK(cudaMalloc(&s.sf, need_sf));
+            s.sf_cap = need_sf;
+        }
+    }
+    g_act_slot_rr = (g_act_slot_rr + 1) % 4;
+
+    s.key     = out_tensor;
+    s.eval_id = g_eval_id;
+    *out_packed = s.packed;
+    *out_sf     = s.sf;
+    return true;
+}
+
 // Grow-only device buffer for the never-written D of the no-D-store GeGLU
 // variants (the host-side TMA descriptor still needs a valid allocation).
 void * get_dummy_d(size_t bytes) {
@@ -369,10 +405,22 @@ void ggml_cuda_flashrt_ada_norm(ggml_backend_cuda_context & ctx, const ggml_tens
     }
     if (rc == 0) {
         const float eps = rms != nullptr ? ggml_get_op_params_f32(rms, 0) : 0.0f;
-        rc = ggml_cuda_flashrt::ada_rms_mod((const float *) x->data,
-                                            (const float *) view_scale->data,
-                                            (const float *) view_shift->data,
-                                            (float *) add2->data, M, C, eps, rms != nullptr, stream);
+        // emit the quantized form alongside f32 so downstream GEMMs skip
+        // their activation quantize (registered in the per-eval cache)
+        void * q_out_packed = nullptr;
+        void * q_out_sf     = nullptr;
+        if (C % 16 == 0 && reserve_quantized_act(add2, M, C, &q_out_packed, &q_out_sf, stream)) {
+            rc = ggml_cuda_flashrt::ada_rms_mod_quant((const float *) x->data,
+                                                      (const float *) view_scale->data,
+                                                      (const float *) view_shift->data,
+                                                      (float *) add2->data, q_out_packed, q_out_sf,
+                                                      M, C, eps, rms != nullptr, stream);
+        } else {
+            rc = ggml_cuda_flashrt::ada_rms_mod((const float *) x->data,
+                                                (const float *) view_scale->data,
+                                                (const float *) view_shift->data,
+                                                (float *) add2->data, M, C, eps, rms != nullptr, stream);
+        }
     }
     if (rc != 0) {
         GGML_ABORT("flashrt: fused adaLN failed (M=%d C=%d rc=%d)", M, C, rc);
@@ -507,9 +555,18 @@ void ggml_cuda_flashrt_ln_affine(ggml_backend_cuda_context & ctx, const ggml_ten
     const int M = (int) ggml_nrows(x);
     const float eps = ggml_get_op_params_f32(norm, 0);
 
-    const int rc = ggml_cuda_flashrt::layer_norm_affine(
-        (const float *) x->data, (const float *) w->data, (const float *) b->data,
-        (float *) add->data, M, C, eps, ctx.stream());
+    int rc;
+    void * q_out_packed = nullptr;
+    void * q_out_sf     = nullptr;
+    if (C % 16 == 0 && reserve_quantized_act(add, M, C, &q_out_packed, &q_out_sf, ctx.stream())) {
+        rc = ggml_cuda_flashrt::layer_norm_affine_quant(
+            (const float *) x->data, (const float *) w->data, (const float *) b->data,
+            (float *) add->data, q_out_packed, q_out_sf, M, C, eps, ctx.stream());
+    } else {
+        rc = ggml_cuda_flashrt::layer_norm_affine(
+            (const float *) x->data, (const float *) w->data, (const float *) b->data,
+            (float *) add->data, M, C, eps, ctx.stream());
+    }
     if (rc != 0) {
         GGML_ABORT("flashrt: fused layer norm failed (M=%d C=%d rc=%d)", M, C, rc);
     }

@@ -96,6 +96,15 @@ int ada_rms_mod(const float * x, const float * scale, const float * shift,
 int gated_residual(const float * residual, const float * branch, const float * gate,
                    float * out, int M, int C, cudaStream_t stream);
 
+// Quant-emitting variants: additionally write the result quantized to
+// NVFP4 packed + SFA (atom layout for an [M, C] activation operand).
+int ada_rms_mod_quant(const float * x, const float * scale, const float * shift,
+                      float * out, void * dst_packed, void * dst_sfa,
+                      int M, int C, float eps, bool with_rms, cudaStream_t stream);
+int layer_norm_affine_quant(const float * x, const float * w, const float * b,
+                            float * out, void * dst_packed, void * dst_sfa,
+                            int M, int C, float eps, cudaStream_t stream);
+
 // Fused LayerNorm + affine: out[m,c] = normalize(x[m])[c] * w[c] + b[c].
 int layer_norm_affine(const float * x, const float * w, const float * b,
                       float * out, int M, int C, float eps, cudaStream_t stream);
