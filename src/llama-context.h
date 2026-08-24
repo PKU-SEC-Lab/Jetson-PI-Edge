@@ -121,6 +121,9 @@ struct llama_context {
 
 
     void set_state(const std::vector<float>& state_array);
+
+    int32_t pi0_set_image_embd_device(const ggml_tensor * embd, int32_t n_views, int32_t tokens_per_view);
+    void    pi0_clear_image_embd_device();
     const float * get_pi0_state() const;
     int32_t get_pi0_state_size() const;
     const float * get_pi0_action_input() const;
@@ -405,6 +408,12 @@ private:
         ggml_context_ptr        ctx;
         ggml_backend_buffer_ptr buf;
     } pi05_mod_gpu;
+
+    // pi0 device-resident image embeddings (see llama_cross::image_embd_gpu)
+    struct {
+        ggml_context_ptr        ctx;
+        ggml_backend_buffer_ptr buf;
+    } pi0_embd_gpu;
 
     // host buffer for the model output (logits and embeddings)
     ggml_backend_buffer_ptr buf_output;

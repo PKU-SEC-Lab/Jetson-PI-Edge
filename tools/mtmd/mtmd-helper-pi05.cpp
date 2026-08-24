@@ -153,6 +153,53 @@ static int32_t mtmd_encode_chunks_batched_pi05(
     return 0;
 }
 
+// Device-resident variant: encode the batch without the device->host copy and
+// hand the vision tower's output tensor straight to the llama context, which
+// keeps a persistent device copy for the prefill graph to read directly.
+static int32_t mtmd_encode_chunks_batched_pi05_device(
+        mtmd_context * ctx,
+        const mtmd_input_chunks * chunks,
+        const size_t * image_indices,
+        size_t n_image_indices,
+        llama_context * lctx,
+        int * out_tokens_per_image) {
+    if (n_image_indices == 0 || lctx == nullptr) {
+        return 1;
+    }
+    mtmd::batch_ptr batch(mtmd_batch_init(ctx));
+    if (!batch) {
+        return 1;
+    }
+    int32_t tokens_per_image = -1;
+    for (size_t ii = 0; ii < n_image_indices; ++ii) {
+        const mtmd_input_chunk * chunk = mtmd_input_chunks_get(chunks, image_indices[ii]);
+        if (chunk == nullptr || mtmd_input_chunk_get_type(chunk) != MTMD_INPUT_CHUNK_TYPE_IMAGE) {
+            return 1;
+        }
+        const int32_t n_tok = (int32_t) mtmd_input_chunk_get_n_tokens(chunk);
+        if (tokens_per_image < 0) {
+            tokens_per_image = n_tok;
+        } else if (tokens_per_image != n_tok) {
+            return 1; // per-view slices require uniform token counts
+        }
+        if (mtmd_batch_add_chunk(batch.get(), chunk) != 0) {
+            return 1;
+        }
+    }
+    if (mtmd_batch_encode_device(batch.get()) != 0) {
+        return 1;
+    }
+    ggml_tensor * t = mtmd_batch_get_output_tensor(batch.get());
+    if (t == nullptr) {
+        return 1;
+    }
+    if (llama_pi0_set_image_embd_device(lctx, t, (int32_t) n_image_indices, tokens_per_image) != 0) {
+        return 1;
+    }
+    *out_tokens_per_image = tokens_per_image;
+    return 0;
+}
+
 static std::ofstream & pi05_debug_host_log_stream() {
     static bool initialized = false;
     static std::ofstream ofs;
@@ -443,7 +490,7 @@ struct decode_embd_batch {
         llama_batch view = {};
         view.n_tokens             = n_tokens;
         view.token                = nullptr;
-        view.embd                 = batch.embd + offset * n_mmproj_embd;
+        view.embd                 = batch.embd != nullptr ? batch.embd + offset * n_mmproj_embd : nullptr;
         view.embd2                = nullptr;
         view.embd3                = nullptr;
         view.img_token_num        = 0;
@@ -885,18 +932,44 @@ static int32_t mtmd_helper_eval_chunks_pi0_pi05(mtmd_context * ctx,
             << " n_image_chunks=" << batched_image_indices.size();
         pi05_debug_host_log_line(oss.str());
     }
+    // Device-resident image embeddings: skip the ViT output's host round trip
+    // (device->host copy + batch upload); the prefill graph reads the device
+    // tensor directly. GGML_PI05_EMBD_GPU=0 restores the host path.
+    const bool embd_device_env = [] {
+        const char * e = std::getenv("GGML_PI05_EMBD_GPU");
+        return e == nullptr || e[0] != '0';
+    }();
+    bool batched_on_device = false;
+
     if (use_pi05_adapter && !disable_vit_batch && batched_image_indices.size() > 1) {
         auto t_vit_start = std::chrono::high_resolution_clock::now();
-        int32_t ret_batched = mtmd_encode_chunks_batched_pi05(
-            ctx,
-            chunks,
-            batched_image_indices.data(),
-            batched_image_indices.size(),
-            n_mmproj_embd_cached,
-            batched_embds);
+        int32_t ret_batched = 1;
+        if (embd_device_env && !pi05_debug_binary_enabled()) {
+            ret_batched = mtmd_encode_chunks_batched_pi05_device(
+                ctx,
+                chunks,
+                batched_image_indices.data(),
+                batched_image_indices.size(),
+                lctx,
+                &n_tokens_per_image_cached);
+            batched_on_device = ret_batched == 0;
+        }
+        if (!batched_on_device) {
+            ret_batched = mtmd_encode_chunks_batched_pi05(
+                ctx,
+                chunks,
+                batched_image_indices.data(),
+                batched_image_indices.size(),
+                n_mmproj_embd_cached,
+                batched_embds);
+        }
         auto t_vit_end = std::chrono::high_resolution_clock::now();
         batched_vit_ms = std::chrono::duration<double, std::milli>(t_vit_end - t_vit_start).count();
 
+        if (batched_on_device) {
+            LOG_INF("batched ViT encoded %zu images in %.2f ms (device-resident)\n",
+                    batched_image_indices.size(), batched_vit_ms);
+        }
         if (ret_batched == 0) {
             auto first_chunk = mtmd_input_chunks_get(chunks, batched_image_indices[0]);
             n_tokens_per_image_cached = mtmd_input_chunk_get_n_tokens(first_chunk);
@@ -914,6 +987,10 @@ static int32_t mtmd_helper_eval_chunks_pi0_pi05(mtmd_context * ctx,
         } else {
             LOG_WRN("batched ViT failed, falling back to sequential encode\n");
         }
+    }
+    if (!batched_on_device) {
+        // stale device-resident embeddings must not shadow the host path
+        llama_pi0_clear_image_embd_device(lctx);
     }
 #if 0
     {
@@ -1055,9 +1132,13 @@ static int32_t mtmd_helper_eval_chunks_pi0_pi05(mtmd_context * ctx,
             double vit_ms = 0.0;
 
             // Check if this image was batch-encoded
-            if (!batched_embds.empty() && chunk_type == MTMD_INPUT_CHUNK_TYPE_IMAGE) {
-                int offset = batched_image_idx * n_tokens_per_image_cached * n_mmproj_embd_cached;
-                embd = batched_embds.data() + offset;
+            if ((batched_on_device || !batched_embds.empty()) && chunk_type == MTMD_INPUT_CHUNK_TYPE_IMAGE) {
+                if (batched_on_device) {
+                    embd = nullptr; // resident on the device; no host copy exists
+                } else {
+                    int offset = batched_image_idx * n_tokens_per_image_cached * n_mmproj_embd_cached;
+                    embd = batched_embds.data() + offset;
+                }
                 batched_image_idx++;
                 vit_ms = (batched_image_idx == 1) ? batched_vit_ms : 0.0;
                 total_vit_ms += vit_ms;
@@ -1175,20 +1256,16 @@ static int32_t mtmd_helper_eval_chunks_pi0_pi05(mtmd_context * ctx,
                 if (combined_batch.img_token_num>0){
                     img_num = combined_batch.img_token_num/ combined_batch.single_img_token_num;
                 }
-                if (img_num==1){
-                    std::memcpy(combined_batch.embd, batch_embd_view.embd, (size_t) n_tokens_batch * n_mmproj_embd * sizeof(float));
+                if (img_num > 3) {
+                    GGML_ABORT("Not supported more than 3 embd buffers");
                 }
-                else{
-                    if (img_num==2){
+                if (batch_embd_view.embd != nullptr) {
+                    if (img_num==1){
+                        std::memcpy(combined_batch.embd, batch_embd_view.embd, (size_t) n_tokens_batch * n_mmproj_embd * sizeof(float));
+                    } else if (img_num==2){
                         std::memcpy(combined_batch.embd2, batch_embd_view.embd, (size_t) n_tokens_batch * n_mmproj_embd * sizeof(float));
-                    }
-                    else{
-                        if (img_num==3){
-                            std::memcpy(combined_batch.embd3, batch_embd_view.embd, (size_t) n_tokens_batch * n_mmproj_embd * sizeof(float));
-                        }
-                        else{
-                            GGML_ABORT("Not supported more than 3 embd buffers");
-                        }
+                    } else if (img_num==3){
+                        std::memcpy(combined_batch.embd3, batch_embd_view.embd, (size_t) n_tokens_batch * n_mmproj_embd * sizeof(float));
                     }
                 }
                 
@@ -1364,9 +1441,17 @@ static int32_t mtmd_helper_eval_chunks_pi0_pi05(mtmd_context * ctx,
         fprintf(stderr, "\n");
     }
 
+    llama_batch prefix_batch = combined_batch;
+    if (batched_on_device) {
+        // embeddings live in the context's persistent device tensor
+        prefix_batch.embd  = nullptr;
+        prefix_batch.embd2 = nullptr;
+        prefix_batch.embd3 = nullptr;
+    }
+
     auto start_time = std::chrono::high_resolution_clock::now();
     auto t_encode_start = std::chrono::high_resolution_clock::now();
-    if (llama_encode(lctx, combined_batch)) {
+    if (llama_encode(lctx, prefix_batch)) {
         LOG_ERR("%s : failed to eval\n", __func__);
         return 1;
     }
@@ -1375,7 +1460,7 @@ static int32_t mtmd_helper_eval_chunks_pi0_pi05(mtmd_context * ctx,
     double encode_ms = std::chrono::duration<double, std::milli>(t_encode_end - t_encode_start).count();
 
     auto t_decode_start = std::chrono::high_resolution_clock::now();
-    int32_t ret = llama_decode(lctx, combined_batch);
+    int32_t ret = llama_decode(lctx, prefix_batch);
 
     
     auto t_decode_end = std::chrono::high_resolution_clock::now();

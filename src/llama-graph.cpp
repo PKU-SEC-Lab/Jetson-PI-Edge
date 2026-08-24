@@ -292,6 +292,14 @@ bool llm_graph_input_embd_pi0::can_reuse(const llm_graph_params & params) {
 
     res &= (!tokens && !params.ubatch.token) || (tokens && tokens->ne[0] == n_text_tokens);
 
+    // device-resident vs host embd mode must match the current cross state
+    const bool want_gpu = cross != nullptr && cross->image_embd_gpu != nullptr &&
+                          params.ubatch.embd == nullptr && params.ubatch.img_token_num > 0;
+    res &= (gpu_base != nullptr) == want_gpu;
+    if (gpu_base != nullptr) {
+        res &= cross != nullptr && gpu_base == cross->image_embd_gpu;
+    }
+
     return res;
 }
 
@@ -3010,6 +3018,30 @@ ggml_tensor * llm_graph_context::build_inp_embd_pi0(ggml_tensor * tok_embd) cons
     if (ubatch.img_token_num>0){
         img_num = ubatch.img_token_num/ ubatch.single_img_token_num;
     }
+
+    // device-resident image embeddings: the vision tower's output already
+    // lives in a persistent device tensor; read per-view slices directly and
+    // skip the host upload entirely (the batch carries no embd pointers).
+    const bool embd_on_device = img_num > 0 && cross != nullptr &&
+        cross->image_embd_gpu != nullptr &&
+        cross->image_embd_gpu_views == img_num &&
+        cross->image_embd_gpu_tokens == (int64_t) ubatch.single_img_token_num &&
+        cross->image_embd_gpu->ne[0] == n_embd &&
+        ubatch.embd == nullptr;
+
+    inp->cross    = cross;
+    inp->gpu_base = embd_on_device ? cross->image_embd_gpu : nullptr;
+
+    if (embd_on_device) {
+        ggml_tensor * base = cross->image_embd_gpu;
+        ggml_set_input(base);
+        const size_t view_bytes = (size_t) ubatch.single_img_token_num * base->nb[1];
+        for (int i = 0; i < img_num; ++i) {
+            ggml_tensor * v = ggml_view_2d(ctx0, base, n_embd, ubatch.single_img_token_num,
+                                           base->nb[1], (size_t) i * view_bytes);
+            cur = i == 0 ? v : build_pi0_encoder_input(ctx0, cur, v);
+        }
+    } else {
     if (img_num>0) {
         inp->embd = ggml_new_tensor_2d(ctx0, GGML_TYPE_F32, n_embd, ubatch.single_img_token_num);
         ggml_set_input(inp->embd);
@@ -3029,6 +3061,7 @@ ggml_tensor * llm_graph_context::build_inp_embd_pi0(ggml_tensor * tok_embd) cons
         ggml_set_input(inp->embd3);
 
         cur = build_pi0_encoder_input(ctx0, cur,inp->embd3);
+    }
     }
 
     if (ubatch.token) {

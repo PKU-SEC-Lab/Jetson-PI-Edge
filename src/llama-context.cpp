@@ -4589,6 +4589,80 @@ int32_t llama_get_pi0_action_steps(llama_context * ctx) {
     return ctx->get_pi0_action_steps();
 }
 
+int32_t llama_context::pi0_set_image_embd_device(const ggml_tensor * embd, int32_t n_views, int32_t tokens_per_view) {
+    if (embd == nullptr || embd->buffer == nullptr || embd->type != GGML_TYPE_F32 ||
+        n_views <= 0 || tokens_per_view <= 0 || !ggml_is_contiguous(embd)) {
+        return -1;
+    }
+    if (ggml_backend_buffer_is_host(embd->buffer)) {
+        return -1; // host-resident vision tower: use the batch path
+    }
+    const int64_t n_embd = embd->ne[0];
+    const int64_t total  = (int64_t) n_views * tokens_per_view;
+    if (ggml_nelements(embd) != n_embd * total) {
+        return -1;
+    }
+
+    const bool need_realloc = cross.image_embd_gpu == nullptr ||
+        !ggml_are_same_shape(cross.image_embd_gpu, embd);
+    if (need_realloc) {
+        ggml_backend_buffer_type_t buft = ggml_backend_buffer_get_type(embd->buffer);
+        if (buft == nullptr) {
+            return -1;
+        }
+        if (cross.image_embd_gpu != nullptr) {
+            ggml_backend_sched_reset(sched.get());
+            gf_res_prev->reset();
+        }
+        cross.image_embd_gpu = nullptr;
+        pi0_embd_gpu.ctx.reset();
+        pi0_embd_gpu.buf.reset();
+
+        ggml_init_params ip = {
+            /*.mem_size   =*/ 2 * ggml_tensor_overhead(),
+            /*.mem_buffer =*/ nullptr,
+            /*.no_alloc   =*/ true,
+        };
+        pi0_embd_gpu.ctx.reset(ggml_init(ip));
+        if (!pi0_embd_gpu.ctx) {
+            return -1;
+        }
+        ggml_tensor * t = ggml_new_tensor(pi0_embd_gpu.ctx.get(), GGML_TYPE_F32,
+                                          ggml_n_dims(embd), embd->ne);
+        ggml_set_name(t, "pi0_image_embd_gpu");
+        pi0_embd_gpu.buf.reset(ggml_backend_alloc_ctx_tensors_from_buft(pi0_embd_gpu.ctx.get(), buft));
+        if (!pi0_embd_gpu.buf) {
+            pi0_embd_gpu.ctx.reset();
+            return -1;
+        }
+        cross.image_embd_gpu = t;
+    }
+
+    // device-to-device copy of the whole batched vision output
+    ggml_backend_tensor_copy(const_cast<ggml_tensor *>(embd), cross.image_embd_gpu);
+
+    cross.image_embd_gpu_tokens = tokens_per_view;
+    cross.image_embd_gpu_views  = n_views;
+    return 0;
+}
+
+void llama_context::pi0_clear_image_embd_device() {
+    cross.image_embd_gpu = nullptr;
+    cross.image_embd_gpu_tokens = 0;
+    cross.image_embd_gpu_views  = 0;
+}
+
+int32_t llama_pi0_set_image_embd_device(llama_context * ctx, const ggml_tensor * embd,
+                                        int32_t n_views, int32_t tokens_per_view) {
+    return ctx == nullptr ? -1 : ctx->pi0_set_image_embd_device(embd, n_views, tokens_per_view);
+}
+
+void llama_pi0_clear_image_embd_device(llama_context * ctx) {
+    if (ctx != nullptr) {
+        ctx->pi0_clear_image_embd_device();
+    }
+}
+
 void llama_set_pi0_state(llama_context * ctx, const float * state_array, size_t size) {
     if (ctx == nullptr) {
         return;

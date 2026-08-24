@@ -176,6 +176,10 @@ struct clip_ctx {
     ggml_cgraph * cached_gf = nullptr;
     int cached_nx = 0, cached_ny = 0, cached_batch = 0;
 
+    // device-resident output: the embeddings tensor of the last encode; valid
+    // (in the sched buffer) until the next encode on this context
+    ggml_tensor * last_output_tensor = nullptr;
+
     bool debug_output_embeddings = false;
 
     // for measuring memory usage
@@ -4557,6 +4561,7 @@ bool clip_image_batch_encode(clip_ctx * ctx, int n_threads, const clip_image_f32
 
     // the last node is the embedding tensor
     ggml_tensor * embeddings = ggml_graph_node(gf, -1);
+    ctx->last_output_tensor = embeddings;
 
     // sanity check (assuming that all images in batch have the same number of tokens, so we only check the first one)
     const int n_tokens_out = embeddings->ne[1];
@@ -4578,7 +4583,7 @@ bool clip_image_batch_encode(clip_ctx * ctx, int n_threads, const clip_image_f32
         }
         ggml_backend_tensor_get(embeddings, out_batch_embd.data(), 0, ggml_nbytes(embeddings));
     } else {
-        LOG_WRN("%s: output buffer is empty, skipping copy\n", __func__);
+        LOG_DBG("%s: output buffer is empty, skipping copy (device-resident consumer)\n", __func__);
     }
 
     // Debug: dump final embeddings if MTMD_DEBUG_EMBEDDINGS is set
@@ -4767,4 +4772,8 @@ std::map<ggml_backend_dev_t, size_t> clip_get_mem_usage(const struct clip_ctx * 
 
 void clip_set_debug_output_embeddings(clip_ctx * ctx, bool enable) {
     ctx->debug_output_embeddings = enable;
+}
+
+ggml_tensor * clip_get_output_tensor(clip_ctx * ctx) {
+    return ctx->last_output_tensor;
 }

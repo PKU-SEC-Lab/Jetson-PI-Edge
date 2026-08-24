@@ -313,6 +313,12 @@ MTMD_API int32_t mtmd_batch_add_chunk(mtmd_batch * batch, const mtmd_input_chunk
 MTMD_API int32_t mtmd_batch_encode(mtmd_batch * batch);
 MTMD_API float * mtmd_batch_get_output_embd(mtmd_batch * batch, const mtmd_input_chunk * chunk);
 
+// encode leaving the result on the device (no host copy); retrieve the
+// device tensor with mtmd_batch_get_output_tensor. The tensor lives in the
+// vision context's compute buffer and is valid until the next encode.
+MTMD_API int32_t mtmd_batch_encode_device(mtmd_batch * batch);
+MTMD_API struct ggml_tensor * mtmd_batch_get_output_tensor(mtmd_batch * batch);
+
 
 // Set callback for all future logging events.
 // If this is not called, or NULL is supplied, everything is output on stderr.

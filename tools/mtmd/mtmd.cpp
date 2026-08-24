@@ -259,6 +259,10 @@ mtmd_context_params mtmd_context_params_default() {
 }
 
 struct mtmd_context {
+    // when set, encodes skip the device->host output copy (consumer reads
+    // the device tensor via clip_get_output_tensor)
+    bool encode_skip_host_copy = false;
+
     struct clip_ctx * ctx_v; // vision
     struct clip_ctx * ctx_a; // audio
     std::vector<float> out_embd; // image embedding vector
@@ -1466,7 +1470,11 @@ static int32_t mtmd_encode_impl(mtmd_context * ctx, const mtmd_image_tokens * im
 
     int n_embd_out = ctx->n_embd_out();
     auto n_tokens_out = image_tokens->n_tokens();
-    out_embd.resize((size_t)n_embd_out * n_tokens_out);
+    if (ctx->encode_skip_host_copy) {
+        out_embd.clear(); // clip skips the host copy for an empty buffer
+    } else {
+        out_embd.resize((size_t)n_embd_out * n_tokens_out);
+    }
 
     if (image_tokens->is_placeholder()) {
         LOG_ERR("%s: image tokens batch is placeholder\n", __func__);
@@ -1656,6 +1664,23 @@ int32_t mtmd_batch_encode(mtmd_batch * batch) {
         LOG_ERR("%s: error: %s\n", __func__, e.what());
         return 1;
     }
+}
+
+int32_t mtmd_batch_encode_device(mtmd_batch * batch) {
+    try {
+        batch->ctx->encode_skip_host_copy = true;
+        const int32_t res = mtmd_batch_encode_impl(batch);
+        batch->ctx->encode_skip_host_copy = false;
+        return res;
+    } catch (const std::exception & e) {
+        batch->ctx->encode_skip_host_copy = false;
+        LOG_ERR("%s: error: %s\n", __func__, e.what());
+        return 1;
+    }
+}
+
+struct ggml_tensor * mtmd_batch_get_output_tensor(mtmd_batch * batch) {
+    return batch->ctx->ctx_v ? clip_get_output_tensor(batch->ctx->ctx_v) : nullptr;
 }
 
 float * mtmd_batch_get_output_embd(mtmd_batch * batch, const mtmd_input_chunk * chunk) {

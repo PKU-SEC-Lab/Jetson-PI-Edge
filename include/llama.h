@@ -1059,6 +1059,18 @@ extern "C" {
     LLAMA_API int32_t llama_get_pi0_action_steps(struct llama_context * ctx);
     LLAMA_API void llama_set_pi0_state(struct llama_context * ctx, const float * state_array, size_t size);
 
+    // Copy the vision tower's output tensor (any device buffer) into the
+    // context's persistent device-resident image-embedding storage; the next
+    // pi0 prefill reads per-view slices of it directly instead of uploading
+    // host embeddings from the batch. Returns 0 on success.
+    LLAMA_API int32_t llama_pi0_set_image_embd_device(struct llama_context * ctx,
+                                                      const struct ggml_tensor * embd,
+                                                      int32_t n_views,
+                                                      int32_t tokens_per_view);
+    // Drop the device-resident image embeddings (next prefill falls back to
+    // host embeddings from the batch).
+    LLAMA_API void llama_pi0_clear_image_embd_device(struct llama_context * ctx);
+
     // GR00T N1.7 action interface. The returned action is laid out as
     // [action_steps, action_dim] and remains owned by the context.
     LLAMA_API const float * llama_get_gr00t_action_input(struct llama_context * ctx);

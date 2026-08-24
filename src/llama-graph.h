@@ -111,6 +111,14 @@ struct llama_cross {
     std::vector<float> ae_mod_cache;             // [steps][count][width]
     ggml_tensor * ae_mod_gpu = nullptr;          // persistent device copy [width, count*steps]
 
+    // pi0 image embeddings resident on the device: the vision tower's output
+    // is copied device-to-device into this persistent tensor each inference,
+    // and the prefill graph reads per-view slices of it directly (no
+    // device->host->device round trip through the batch).
+    ggml_tensor * image_embd_gpu = nullptr;      // F32 [n_embd, tokens_per_view * n_views]
+    int64_t image_embd_gpu_tokens = 0;           // tokens per view
+    int32_t image_embd_gpu_views  = 0;
+
     int max_layers = 36;
     bool encoded_kv_dirty = true;
     std::vector<std::vector<float>> encoded_kv_data = std::vector<std::vector<float>>(max_layers);
@@ -213,6 +221,11 @@ class llm_graph_input_embd_pi0 : public llm_graph_input_i {
         ggml_tensor * embd   = nullptr; // F32 [n_embd, n_batch]
         ggml_tensor * embd2   = nullptr; // F32 [n_embd, n_batch]
         ggml_tensor * embd3   = nullptr; // F32 [n_embd, n_batch]
+
+        // device-resident mode: image embeddings are read from the persistent
+        // cross tensor instead of being uploaded from the batch
+        const llama_cross * cross = nullptr;
+        ggml_tensor * gpu_base = nullptr;
     };
 // llm_graph_input_pos_bucket(const llama_hparams & hparams) : hparams(hparams) {}
 //     virtual ~llm_graph_input_pos_bucket() = default;

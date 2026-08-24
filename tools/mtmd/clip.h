@@ -84,6 +84,11 @@ int clip_n_mmproj_embd(const struct clip_ctx * ctx);
 bool clip_image_encode      (struct clip_ctx * ctx, int n_threads, const clip_image_f32 * img, std::vector<float> & out_vec);
 bool clip_image_batch_encode(struct clip_ctx * ctx, int n_threads, const struct clip_image_f32_batch * imgs, std::vector<float> & out_batch_embd);
 
+// device-resident output of the last encode on this context (sched-buffer
+// tensor; valid until the next encode). Pass an empty out_batch_embd to
+// clip_image_batch_encode to skip the host copy and consume this instead.
+struct ggml_tensor * clip_get_output_tensor(struct clip_ctx * ctx);
+
 bool clip_is_llava(const struct clip_ctx * ctx);
 // note for contributor: this clip_is_(model) pattern is deprecated
 //                       do NOT add new functions like this
