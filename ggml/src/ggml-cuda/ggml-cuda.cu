@@ -3223,10 +3223,12 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
             GGML_OP_RMS_NORM, GGML_OP_VIEW, GGML_OP_VIEW, GGML_OP_REPEAT, GGML_OP_MUL,
             GGML_OP_ADD, GGML_OP_VIEW, GGML_OP_REPEAT, GGML_OP_ADD };
         bool seq_ok = true;
+        int fail_j = -1;
         for (int j = 0; j < 9 && seq_ok; ++j) {
             const ggml_tensor * t = cgraph->nodes[i + j];
             if (t->op != ada_c_ops[j] || (t->flags & GGML_TENSOR_FLAG_COMPUTE) == 0) {
                 seq_ok = false;
+                fail_j = j;
                 break;
             }
             if (j == 8) {
@@ -3250,6 +3252,24 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
             }
             if (uses_in_window != ggml_node_get_use_count(cgraph, i + j)) {
                 seq_ok = false;
+                fail_j = 100 + j;
+            }
+        }
+        if (getenv("GGML_FLASHRT_DEBUG") != nullptr && cgraph->nodes[i + 1]->op == GGML_OP_VIEW &&
+            cgraph->nodes[i + 1]->src[0] != nullptr &&
+            cgraph->nodes[i + 1]->src[0]->op == GGML_OP_GET_ROWS) {
+            static int dbg_ac = 0;
+            if (dbg_ac++ < 8) {
+                extern int ggml_cuda_flashrt_ada_cached_fail_code();
+                const ggml_tensor * tf = fail_j >= 0 && fail_j < 100 ? cgraph->nodes[i + fail_j] : nullptr;
+                fprintf(stderr, "[fr-ada-cached] at %d: seq_ok=%d fail_j=%d fail_op=%s fail_flags=%d sf=%d",
+                        i, (int) seq_ok, fail_j,
+                        tf ? ggml_op_name(tf->op) : "-", tf ? (int) tf->flags : -1,
+                        seq_ok ? (int) ggml_cuda_flashrt_should_fuse_ada_cached(
+                            cgraph->nodes[i],     cgraph->nodes[i + 1], cgraph->nodes[i + 2],
+                            cgraph->nodes[i + 3], cgraph->nodes[i + 4], cgraph->nodes[i + 5],
+                            cgraph->nodes[i + 6], cgraph->nodes[i + 7], cgraph->nodes[i + 8]) : -1);
+                fprintf(stderr, " fail_code=%d\n", ggml_cuda_flashrt_ada_cached_fail_code());
             }
         }
         if (seq_ok &&

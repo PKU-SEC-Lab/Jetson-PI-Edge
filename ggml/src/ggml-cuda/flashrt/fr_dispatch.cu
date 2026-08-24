@@ -428,6 +428,9 @@ void ggml_cuda_flashrt_ada_norm(ggml_backend_cuda_context & ctx, const ggml_tens
 // input (precomputed per step, see pi0_ae.cpp) instead of a GEMM. Sequence:
 // {RMS_NORM, VIEW mod-col, VIEW scale, REPEAT, MUL, ADD, VIEW shift, REPEAT,
 // ADD} -> one ada kernel reading scale/shift straight from the input views.
+static int g_ada_cached_fail = 0;
+#define FR_ADA_FAIL(code) do { g_ada_cached_fail = (code); return false; } while (0)
+
 bool ggml_cuda_flashrt_should_fuse_ada_cached(
         const ggml_tensor * rms, const ggml_tensor * view_col,
         const ggml_tensor * view_scale, const ggml_tensor * repeat_scale,
@@ -436,41 +439,55 @@ bool ggml_cuda_flashrt_should_fuse_ada_cached(
         const ggml_tensor * add2) {
     static const bool disabled = getenv("GGML_CUDA_FLASHRT_DISABLE") != nullptr;
     if (disabled) {
-        return false;
+        FR_ADA_FAIL(1);
     }
     const ggml_tensor * x = rms->src[0];
     if (x == nullptr || x->type != GGML_TYPE_F32 || !ggml_is_contiguous(x)) {
-        return false;
+        FR_ADA_FAIL(2);
     }
     const int64_t C = x->ne[0];
     const int64_t M = x->ne[1];
     if (x->ne[2] != 1 || x->ne[3] != 1 || C % 4 != 0) {
-        return false;
+        FR_ADA_FAIL(3);
     }
     if (view_col->type != GGML_TYPE_F32 || view_col->ne[0] != 3 * C || view_col->ne[1] != 1 ||
         view_col->src[0] == nullptr) {
-        return false;
+        FR_ADA_FAIL(4);
     }
+    // view_offs accumulates through view-of-view chains down to the ultimate
+    // source, so compare offsets relative to the enclosing column view
     if (view_scale->src[0] != view_col || view_scale->ne[0] != C || view_scale->ne[1] != 1 ||
-        view_scale->view_offs != 0) {
-        return false;
+        view_scale->view_offs != view_col->view_offs) {
+        if (getenv("GGML_FLASHRT_DEBUG") != nullptr) {
+            static int dbg5 = 0;
+            if (dbg5++ < 4) {
+                fprintf(stderr, "[fr-ada-c5] src_ok=%d ne0=%lld (C=%lld) ne1=%lld offs=%zu col_offs=%zu\n",
+                        (int) (view_scale->src[0] == view_col), (long long) view_scale->ne[0],
+                        (long long) C, (long long) view_scale->ne[1],
+                        view_scale->view_offs, view_col->view_offs);
+            }
+        }
+        FR_ADA_FAIL(5);
     }
     if (view_shift->src[0] != view_col || view_shift->ne[0] != C || view_shift->ne[1] != 1 ||
-        view_shift->view_offs != (size_t) C * sizeof(float)) {
-        return false;
+        view_shift->view_offs != view_col->view_offs + (size_t) C * sizeof(float)) {
+        FR_ADA_FAIL(6);
     }
     if (repeat_scale->src[0] != view_scale || repeat_scale->ne[0] != C || repeat_scale->ne[1] != M ||
         repeat_shift->src[0] != view_shift || repeat_shift->ne[0] != C || repeat_shift->ne[1] != M) {
-        return false;
+        FR_ADA_FAIL(7);
     }
     if (mul->src[0] != rms || mul->src[1] != repeat_scale ||
         add1->src[0] != rms || add1->src[1] != mul ||
         add2->src[0] != add1 || add2->src[1] != repeat_shift ||
         !ggml_is_contiguous(add2) || add2->ne[0] != C || add2->ne[1] != M) {
-        return false;
+        FR_ADA_FAIL(8);
     }
+    g_ada_cached_fail = 0;
     return true;
 }
+
+int ggml_cuda_flashrt_ada_cached_fail_code() { return g_ada_cached_fail; }
 
 void ggml_cuda_flashrt_ada_norm_cached(ggml_backend_cuda_context & ctx, const ggml_tensor * rms,
                                        const ggml_tensor * view_scale, const ggml_tensor * view_shift,
