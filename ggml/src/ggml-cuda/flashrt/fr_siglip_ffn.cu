@@ -224,7 +224,7 @@ int siglip_ffn_down_bias_res_f32(
     const void * bias_f32,
     const void * C_f32, void * D_f32,
     int M, int N, int K,
-    cudaStream_t stream) {
+    cudaStream_t stream, float beta) {
   using namespace siglip_ffn;
   using Gemm = down::Gemm;
 
@@ -254,7 +254,7 @@ int siglip_ffn_down_bias_res_f32(
        reinterpret_cast<down::ElementC const*>(C_f32), stride_C,
        reinterpret_cast<down::ElementD*>(D_f32), stride_D}};
   args.epilogue.thread.alpha = 1.0f;
-  args.epilogue.thread.beta = 1.0f;
+  args.epilogue.thread.beta = beta;
   args.epilogue.thread.bias_ptr = reinterpret_cast<float const*>(bias_f32);
 
   Gemm gemm;
@@ -267,6 +267,17 @@ int siglip_ffn_down_bias_res_f32(
   st = gemm.run(stream);
   return (st == cutlass::Status::kSuccess) ? 0
                                            : (static_cast<int>(st) | 0x30000);
+}
+
+int gemm_bias_f32out(
+    const void * A_packed, const void * SFA,
+    const void * B_packed, const void * SFB,
+    const void * bias_f32, void * D_f32,
+    int M, int N, int K,
+    cudaStream_t stream) {
+  // the Down configuration with beta = 0: D = A@B + bias
+  return siglip_ffn_down_bias_res_f32(A_packed, SFA, B_packed, SFB, bias_f32,
+                                      /*C=*/D_f32, D_f32, M, N, K, stream, /*beta=*/0.0f);
 }
 
 }  // namespace ggml_cuda_flashrt

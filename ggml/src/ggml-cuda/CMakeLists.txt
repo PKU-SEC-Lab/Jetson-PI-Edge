@@ -149,6 +149,7 @@ if (CUDAToolkit_FOUND)
             flashrt/fr_geglu.cu
             flashrt/fr_siglip_ffn.cu
             flashrt/fr_ada.cu
+            flashrt/fr_qkv_post.cu
             flashrt/fr_quant_act.cu
             flashrt/fr_repack.cu
             flashrt/fr_dispatch.cu)

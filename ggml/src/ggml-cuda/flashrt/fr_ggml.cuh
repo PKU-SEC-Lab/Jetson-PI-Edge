@@ -54,6 +54,18 @@ void ggml_cuda_flashrt_siglip_ffn(ggml_backend_cuda_context & ctx, const ggml_te
                                   const ggml_tensor * dn_mm, const ggml_tensor * bias2,
                                   const ggml_tensor * cont2, ggml_tensor * res_add);
 
+// pi0.5 AE fused QKV window: {mm k, reshape, rope, view, cpy, mm v,
+// reshape, view, cpy, mm q, reshape, rope, scale} -> one fused GEMM over
+// row-concatenated [k|v|q] weights + one post kernel (rope/scale/f16 KV
+// suffix stores).
+bool ggml_cuda_flashrt_should_fuse_qkv(const ggml_tensor * k_mm, const ggml_tensor * k_rope, const ggml_tensor * k_cpy,
+                                       const ggml_tensor * v_mm, const ggml_tensor * v_cpy,
+                                       const ggml_tensor * q_mm, const ggml_tensor * q_rope, const ggml_tensor * q_scale);
+void ggml_cuda_flashrt_qkv(ggml_backend_cuda_context & ctx,
+                           const ggml_tensor * k_mm, const ggml_tensor * k_rope, const ggml_tensor * k_cpy,
+                           const ggml_tensor * v_mm, const ggml_tensor * v_cpy,
+                           const ggml_tensor * q_mm, const ggml_tensor * q_rope, ggml_tensor * q_scale);
+
 // pi0.5 gated residual window: {view gate, repeat, mul, add}.
 bool ggml_cuda_flashrt_should_fuse_gated_res(const ggml_tensor * view, const ggml_tensor * repeat,
                                              const ggml_tensor * mul, const ggml_tensor * add);

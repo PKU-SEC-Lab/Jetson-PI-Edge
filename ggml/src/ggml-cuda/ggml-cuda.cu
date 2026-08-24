@@ -3079,6 +3079,77 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
         }
     }
 
+    // pi0.5 AE fused QKV: 13-node window -> fused GEMM + post kernel.
+    //
+    // ggml_can_fuse_subgraph rejects this window because the KV-store CPY
+    // nodes are views of the external persistent KV tensor (its view-source
+    // rule guards against eliding externally visible writes). The fused
+    // execution performs those exact writes itself, so a bespoke check
+    // replicates the remaining conditions: op sequence, COMPUTE flags, no
+    // OUTPUT-flagged intermediates, and strictly window-internal use counts.
+    auto fr_qkv_window_ok = [&](int base) -> bool {
+        static const enum ggml_op fr_ops[13] = {
+            GGML_OP_MUL_MAT, GGML_OP_RESHAPE, GGML_OP_ROPE, GGML_OP_VIEW, GGML_OP_CPY,
+            GGML_OP_MUL_MAT, GGML_OP_RESHAPE, GGML_OP_VIEW, GGML_OP_CPY,
+            GGML_OP_MUL_MAT, GGML_OP_RESHAPE, GGML_OP_ROPE, GGML_OP_SCALE };
+        for (int j = 0; j < 13; ++j) {
+            const ggml_tensor * t = cgraph->nodes[base + j];
+            if (t->op != fr_ops[j]) {
+                return false;
+            }
+            if ((t->flags & GGML_TENSOR_FLAG_COMPUTE) == 0) {
+                return false;
+            }
+            if (j == 12) {
+                continue; // window output
+            }
+            if (t->flags & GGML_TENSOR_FLAG_OUTPUT) {
+                return false;
+            }
+            int uses_in_window = 0;
+            for (int k = j + 1; k < 13; ++k) {
+                const ggml_tensor * o = cgraph->nodes[base + k];
+                for (int si = 0; si < GGML_MAX_SRC; ++si) {
+                    if (o->src[si] == t) {
+                        uses_in_window++;
+                    }
+                }
+            }
+            if (uses_in_window != ggml_node_get_use_count(cgraph, base + j)) {
+                return false;
+            }
+        }
+        return true;
+    };
+
+    if (node->op == GGML_OP_MUL_MAT && i + 12 < cgraph->n_nodes &&
+        ggml_cuda_info().devices[cuda_ctx->device].cc == 1100 &&
+        fr_qkv_window_ok(i)) {
+        const ggml_tensor * k_mm   = cgraph->nodes[i];
+        const ggml_tensor * k_rope = cgraph->nodes[i + 2];
+        const ggml_tensor * k_cpy  = cgraph->nodes[i + 4];
+        const ggml_tensor * v_mm   = cgraph->nodes[i + 5];
+        const ggml_tensor * v_cpy  = cgraph->nodes[i + 8];
+        const ggml_tensor * q_mm   = cgraph->nodes[i + 9];
+        const ggml_tensor * q_rope = cgraph->nodes[i + 11];
+        ggml_tensor * q_scale      = cgraph->nodes[i + 12];
+
+        // no memory-range check needed: every fused read of a potentially
+        // recycled pool buffer (the shared activation) is enqueued before
+        // the fused writes on the same stream
+        const bool qkv_sf = ggml_cuda_flashrt_should_fuse_qkv(k_mm, k_rope, k_cpy, v_mm, v_cpy, q_mm, q_rope, q_scale);
+        if (qkv_sf) {
+            ggml_cuda_flashrt_qkv(*cuda_ctx, k_mm, k_rope, k_cpy, v_mm, v_cpy, q_mm, q_rope, q_scale);
+            return 12;
+        }
+        if (getenv("GGML_FLASHRT_DEBUG") != nullptr) {
+            static int dbg_q = 0;
+            if (dbg_q++ < 6) {
+                fprintf(stderr, "[fr-qkv] window at %d: should_fuse=%d\n", i, (int) qkv_sf);
+            }
+        }
+    }
+
     // pi0.5 adaLN modulate: {rms_norm?, mul_mat mod, add bias, view, repeat,
     // mul, add, view, repeat, add} -> mod GEMM + one ada kernel.
     if ((node->op == GGML_OP_RMS_NORM || node->op == GGML_OP_MUL_MAT) &&

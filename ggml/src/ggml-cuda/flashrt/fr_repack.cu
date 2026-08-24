@@ -260,6 +260,73 @@ int quantize_weight_f16_padded(const void * w_f16, void * dst_packed, void * dst
     return (e == cudaSuccess) ? 0 : -static_cast<int>(e);
 }
 
+namespace {
+
+// Three-tensor row-concat repack for the fused QKV GEMM: output rows are
+// [src0 | src1 | src2] stacked (N0 + N1 + N2 rows, same K).
+template <class LayoutSF>
+__global__ void kernel_repack_concat3(
+        const uint8_t * __restrict__ s0, int N0,
+        const uint8_t * __restrict__ s1, int N1,
+        const uint8_t * __restrict__ s2, int N2,
+        uint2 * __restrict__ dst_packed,
+        uint8_t * __restrict__ dst_sf,
+        LayoutSF layout,
+        int K16) {
+    const int t = blockIdx.x * blockDim.x + threadIdx.x;
+    const int row = blockIdx.y;
+    const int N_tot = N0 + N1 + N2;
+    if (row >= N_tot || t >= K16) return;
+
+    const uint8_t * src;
+    int src_row;
+    if (row < N0)            { src = s0; src_row = row; }
+    else if (row < N0 + N1)  { src = s1; src_row = row - N0; }
+    else                     { src = s2; src_row = row - N0 - N1; }
+
+    const int blk = t >> 2;
+    const int sub = t & 3;
+    const uint8_t * b = src + (static_cast<int64_t>(src_row) * (K16 >> 2) + blk) * GGML_NVFP4_BLOCK_BYTES;
+    const uint8_t scale = b[sub];
+    const uint8_t * qs = b + 4 + sub * 8;
+
+    uint2 out;
+    uint8_t * ob = reinterpret_cast<uint8_t *>(&out);
+    #pragma unroll
+    for (int p = 0; p < 4; ++p) {
+        ob[p]     = static_cast<uint8_t>((qs[2 * p] & 0x0F) | ((qs[2 * p + 1] & 0x0F) << 4));
+        ob[p + 4] = static_cast<uint8_t>((qs[2 * p] >> 4)   | ((qs[2 * p + 1] & 0xF0)));
+    }
+
+    dst_packed[static_cast<int64_t>(row) * K16 + t] = out;
+    dst_sf[layout(row, t * 16, 0)] = scale;
+}
+
+} // namespace
+
+int repack_weight_concat3(const void * b0, int N0, const void * b1, int N1,
+                          const void * b2, int N2,
+                          void * dst_packed, void * dst_sf,
+                          int K, cudaStream_t stream) {
+    if (K % 64 != 0) return -1;
+    const int K16 = K / 16;
+    const int N_tot = N0 + N1 + N2;
+    const int threads = 128;
+    dim3 grid((K16 + threads - 1) / threads, N_tot);
+    auto shape = cute::make_shape(1, N_tot, K, 1);
+    auto layout = CfgVec::tile_atom_to_shape_SFB(shape);
+    if (static_cast<int64_t>(cute::cosize(layout)) > sf_bytes(N_tot, K)) return -3;
+    kernel_repack_concat3<<<grid, threads, 0, stream>>>(
+        reinterpret_cast<const uint8_t *>(b0), N0,
+        reinterpret_cast<const uint8_t *>(b1), N1,
+        reinterpret_cast<const uint8_t *>(b2), N2,
+        reinterpret_cast<uint2 *>(dst_packed),
+        reinterpret_cast<uint8_t *>(dst_sf),
+        layout, K16);
+    const cudaError_t e = cudaGetLastError();
+    return (e == cudaSuccess) ? 0 : -static_cast<int>(e);
+}
+
 int repack_weight(const void * ggml_blocks, void * dst_packed, void * dst_sf,
                   int N, int K, cudaStream_t stream) {
     if (K % 64 != 0) return -1;

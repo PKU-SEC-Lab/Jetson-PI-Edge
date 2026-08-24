@@ -83,7 +83,28 @@ int siglip_ffn_down_bias_res_f32(const void * A_packed, const void * SFA,
                                  const void * B_packed, const void * SFB,
                                  const void * bias_f32,
                                  const void * C_f32, void * D_f32,
-                                 int M, int N, int K, cudaStream_t stream);
+                                 int M, int N, int K, cudaStream_t stream, float beta = 1.0f);
+
+// D = A@B + bias (fp32 bias and output).
+int gemm_bias_f32out(const void * A_packed, const void * SFA,
+                     const void * B_packed, const void * SFB,
+                     const void * bias_f32, void * D_f32,
+                     int M, int N, int K, cudaStream_t stream);
+
+// Row-concat repack of three NVFP4 weights (shared K) for the fused QKV GEMM.
+int repack_weight_concat3(const void * b0, int N0, const void * b1, int N1,
+                          const void * b2, int N2,
+                          void * dst_packed, void * dst_sf,
+                          int K, cudaStream_t stream);
+
+// Fused QKV post: RoPE+f16-store K, f16-store V (into the persistent KV
+// suffix), RoPE+scale Q (f32 out) from the fused GEMM's [M, Nk+Nv+Nq] rows.
+int qkv_post(const float * qkv_cat, float * q_out, void * k_out_f16, void * v_out_f16,
+             const int32_t * pos, const float * freq_factors,
+             int M, int Nk, int Nv, int Nq, int head_dim, int n_dims,
+             float freq_scale, float ext_factor, float attn_factor,
+             float corr_low, float corr_high, float theta_scale, float q_scale,
+             cudaStream_t stream);
 
 // Fused adaLN modulate: out[m,c] = norm(x[m])[c] * (1 + scale[c]) + shift[c],
 // norm = rms-normalize when with_rms else identity. x/out are [M, C]
