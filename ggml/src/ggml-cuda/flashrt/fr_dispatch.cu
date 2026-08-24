@@ -3,7 +3,11 @@
 
 #include "fr_ggml.cuh"
 #include "fr_kernels.h"
-#include "fr_geglu.cuh"
+
+// FlashRT kernels consumed directly from the flashrt-public csrc tree
+// (GGML_CUDA_FLASHRT_PUBLIC_DIR); no vendored copies.
+#include "gemm/fp4/cutlass_fp4_gemm_geglu_il_sm100.cuh"
+#include "gemm/fp4/cutlass_fp4_gemm_siglip_ffn_f32out_sm100.cuh"
 
 #include <mutex>
 #include <unordered_map>
@@ -396,7 +400,7 @@ void ggml_cuda_flashrt_ada_norm(ggml_backend_cuda_context & ctx, const ggml_tens
     if (rc == 0) {
         // bias applied in the GEMM epilogue, writing the biased modulation
         // vector (still read later through the gate view) directly
-        rc = ggml_cuda_flashrt::gemm_bias_f32out(q_packed, q_sf, w->packed, w->sf,
+        rc = flash_rt::fp4::gemm_bias_f32out(q_packed, q_sf, w->packed, w->sf,
                                                  bias_add->src[1]->data,
                                                  (float *) bias_add->data, 1, N, K, stream);
     }
@@ -877,14 +881,14 @@ void ggml_cuda_flashrt_siglip_ffn(ggml_backend_cuda_context & ctx, const ggml_te
     ggml_cuda_pool_alloc<uint8_t> hid_sf    (ctx.pool(), ggml_cuda_flashrt::sf_bytes(M, H_pad));
 
     if (rc == 0) {
-        rc = ggml_cuda_flashrt::siglip_ffn_up_gelu_fp4out(
+        rc = flash_rt::fp4::siglip_ffn_up_gelu_fp4out(
             q_packed, q_sf, w->up_packed, w->up_sf, b1->data,
             hid_packed.get(), hid_sf.get(), M, H_pad, K_in, stream);
     }
     if (rc == 0) {
-        rc = ggml_cuda_flashrt::siglip_ffn_down_bias_res_f32(
+        rc = flash_rt::fp4::siglip_ffn_down_bias_res_f32(
             hid_packed.get(), hid_sf.get(), w->dn_packed, w->dn_sf, b2->data,
-            residual->data, res_add->data, M, D_out, H_pad, stream);
+            residual->data, res_add->data, M, D_out, H_pad, stream, 1.0f);
     }
     if (rc != 0) {
         GGML_ABORT("flashrt: siglip ffn failed (M=%d H_pad=%d rc=%d)", M, H_pad, rc);
@@ -1189,7 +1193,7 @@ void ggml_cuda_flashrt_vis_qkv_pad(ggml_backend_cuda_context & ctx,
     for (auto & leg : legs) {
         const grouppad_weight * w = get_repacked_grouppad(
             leg[0]->src[0], leg[1]->src[1], group_in, group_out, n_groups, stream);
-        const int rc = ggml_cuda_flashrt::gemm_bias_f32out(
+        const int rc = flash_rt::fp4::gemm_bias_f32out(
             q_packed, q_sf, w->packed, w->sf, w->bias,
             (float *) leg[2]->data, M, N_pad, K, stream);
         if (rc != 0) {
@@ -1296,7 +1300,7 @@ bool ggml_cuda_flashrt_mm_res(ggml_backend_cuda_context & ctx, const ggml_tensor
         q_sf     = a_sf.get();
     }
 
-    const int rc = ggml_cuda_flashrt::siglip_ffn_down_bias_res_f32(
+    const int rc = flash_rt::fp4::siglip_ffn_down_bias_res_f32(
         q_packed, q_sf, w->packed, w->sf, bias,
         residual->data, (float *) res_add->data, M, N, K, stream, 1.0f);
     if (rc != 0) {

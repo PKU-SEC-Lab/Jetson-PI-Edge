@@ -135,8 +135,22 @@ if (CUDAToolkit_FOUND)
         # FlashRT NVFP4 tcgen05 kernels for Jetson AGX Thor (SM110). Compiled
         # as a separate object library because they require -arch=sm_110a and
         # CUTLASS headers, unlike the rest of ggml-cuda.
+        # FlashRT kernel sources are consumed directly from a flashrt-public
+        # checkout (default: submodule at flashrt/flashrt-public) instead of
+        # vendored copies.
+        if (GGML_CUDA_FLASHRT_PUBLIC_DIR)
+            set(FLASHRT_PUBLIC_DIR "${GGML_CUDA_FLASHRT_PUBLIC_DIR}")
+        else()
+            set(FLASHRT_PUBLIC_DIR "${CMAKE_CURRENT_SOURCE_DIR}/flashrt/flashrt-public")
+        endif()
+        if (NOT EXISTS "${FLASHRT_PUBLIC_DIR}/csrc/gemm/fp4/cutlass_fp4_gemm_geglu_il_sm100.cu")
+            message(FATAL_ERROR "GGML_CUDA_FLASHRT: flashrt-public not found at ${FLASHRT_PUBLIC_DIR} (set GGML_CUDA_FLASHRT_PUBLIC_DIR)")
+        endif()
+
         if (GGML_CUDA_FLASHRT_CUTLASS_DIR)
             set(FLASHRT_CUTLASS_DIR "${GGML_CUDA_FLASHRT_CUTLASS_DIR}")
+        elseif (EXISTS "${FLASHRT_PUBLIC_DIR}/third_party/cutlass/include/cutlass/cutlass.h")
+            set(FLASHRT_CUTLASS_DIR "${FLASHRT_PUBLIC_DIR}/third_party/cutlass")
         else()
             get_filename_component(FLASHRT_CUTLASS_DIR "${CMAKE_CURRENT_SOURCE_DIR}/../../../../cutlass" ABSOLUTE)
         endif()
@@ -146,8 +160,8 @@ if (CUDAToolkit_FOUND)
 
         add_library(ggml-cuda-flashrt OBJECT
             flashrt/fr_gemm_f32out.cu
-            flashrt/fr_geglu.cu
-            flashrt/fr_siglip_ffn.cu
+            ${FLASHRT_PUBLIC_DIR}/csrc/gemm/fp4/cutlass_fp4_gemm_geglu_il_sm100.cu
+            ${FLASHRT_PUBLIC_DIR}/csrc/gemm/fp4/cutlass_fp4_gemm_siglip_ffn_f32out_sm100.cu
             flashrt/fr_ada.cu
             flashrt/fr_qkv_post.cu
             flashrt/fr_quant_act.cu
@@ -158,9 +172,11 @@ if (CUDAToolkit_FOUND)
             POSITION_INDEPENDENT_CODE ON
             CUDA_ARCHITECTURES "110a")
         target_include_directories(ggml-cuda-flashrt PRIVATE
+            ${FLASHRT_PUBLIC_DIR}/csrc
             ${FLASHRT_CUTLASS_DIR}/include
             ${FLASHRT_CUTLASS_DIR}/tools/util/include
             ${CMAKE_CURRENT_SOURCE_DIR}
+            ${CMAKE_CURRENT_SOURCE_DIR}/flashrt
             ${CMAKE_CURRENT_SOURCE_DIR}/..
             ${CMAKE_CURRENT_SOURCE_DIR}/../../include)
         target_link_libraries(ggml-cuda-flashrt PRIVATE CUDA::cudart CUDA::cublas)

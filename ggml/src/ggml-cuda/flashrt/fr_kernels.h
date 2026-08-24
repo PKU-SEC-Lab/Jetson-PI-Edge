@@ -72,24 +72,9 @@ int repack_weight_rows_padded(const void * ggml_blocks, void * dst_packed, void 
 int quantize_weight_f16_padded(const void * w_f16, void * dst_packed, void * dst_sf,
                                int N, int K_src, int K_pad, cudaStream_t stream);
 
-// SigLIP FFN GEMM pair (fr_siglip_ffn.cu): Up = gelu_tanh(A@B + bias) -> FP4+SF,
-// Down = A@B + bias + residual -> f32. Biases are fp32.
-int siglip_ffn_up_gelu_fp4out(const void * A_packed, const void * SFA,
-                              const void * B_packed, const void * SFB,
-                              const void * bias_f32,
-                              void * D_packed, void * D_SFD,
-                              int M, int N, int K, cudaStream_t stream);
-int siglip_ffn_down_bias_res_f32(const void * A_packed, const void * SFA,
-                                 const void * B_packed, const void * SFB,
-                                 const void * bias_f32,
-                                 const void * C_f32, void * D_f32,
-                                 int M, int N, int K, cudaStream_t stream, float beta = 1.0f);
-
-// D = A@B + bias (fp32 bias and output).
-int gemm_bias_f32out(const void * A_packed, const void * SFA,
-                     const void * B_packed, const void * SFB,
-                     const void * bias_f32, void * D_f32,
-                     int M, int N, int K, cudaStream_t stream);
+// The SigLIP FFN GEMM pair and gemm_bias_f32out are declared in
+// flashrt-public's cutlass_fp4_gemm_siglip_ffn_f32out_sm100.cuh
+// (namespace flash_rt::fp4).
 
 // Group-padded rows repack: n_groups groups widened group_in -> group_out
 // rows, pad rows zero (used to widen per-head projections for FA head sizes).
