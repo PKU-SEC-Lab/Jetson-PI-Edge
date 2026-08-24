@@ -91,6 +91,11 @@ int gemm_bias_f32out(const void * A_packed, const void * SFA,
                      const void * bias_f32, void * D_f32,
                      int M, int N, int K, cudaStream_t stream);
 
+// Group-padded rows repack: n_groups groups widened group_in -> group_out
+// rows, pad rows zero (used to widen per-head projections for FA head sizes).
+int repack_weight_rows_grouppad(const void * ggml_blocks, void * dst_packed, void * dst_sf,
+                                int group_in, int group_out, int n_groups, int K, cudaStream_t stream);
+
 // Row-concat repack of three NVFP4 weights (shared K) for the fused QKV GEMM.
 int repack_weight_concat3(const void * b0, int N0, const void * b1, int N1,
                           const void * b2, int N2,

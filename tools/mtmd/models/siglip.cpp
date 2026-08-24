@@ -72,8 +72,19 @@ ggml_tensor * clip_graph_siglip::build_vit_pi0_legacy(ggml_tensor * inp) {
     return inpL;
 }
 
+// PI05 SigLIP attention head_dim is 72, which every CUDA FLASH_ATTN_EXT MMA
+// path rejects (the dispatcher falls back to a tile kernel that costs as much
+// as the unfused chain). Zero-padding each head to 80 keeps the math exact:
+// zero K/Q lanes contribute nothing to QK^T and zero V lanes only produce
+// zero output lanes, which the head-strided view below slices away again.
+static bool pi05_vit_use_flash_attn() {
+    const char * env = std::getenv("GGML_PI05_VIT_FA");
+    return env == nullptr || env[0] != '0';
+}
+
 ggml_tensor * clip_graph_siglip::build_vit_pi05_legacy(ggml_tensor * inp) {
     ggml_tensor * inpL = inp;
+    const bool use_fa = pi05_vit_use_flash_attn();
 
     for (int il = 0; il < n_layer; ++il) {
         const clip_layer & layer = model.layers[il];
@@ -102,21 +113,49 @@ ggml_tensor * clip_graph_siglip::build_vit_pi05_legacy(ggml_tensor * inp) {
         cb(Kcur, "Kcur", il);
         cb(Vcur, "Vcur", il);
 
-        // Match Jetson-PImerge's PI05 graph exactly: scale Q before QK and
-        // leave softmax's scale at one.
         ggml_build_forward_expand(gf, Qcur);
         ggml_build_forward_expand(gf, Kcur);
         ggml_build_forward_expand(gf, Vcur);
-        ggml_tensor * k = ggml_permute(ctx0, Kcur, 0, 2, 1, 3);
-        ggml_tensor * v = ggml_cont(ctx0, ggml_permute(ctx0, Vcur, 1, 2, 0, 3));
-        ggml_tensor * q_scaled = ggml_scale(ctx0, Qcur, kq_scale);
-        q_scaled = ggml_permute(ctx0, q_scaled, 0, 2, 1, 3);
-        ggml_tensor * kq = ggml_mul_mat(ctx0, k, q_scaled);
-        kq = ggml_soft_max_ext(ctx0, kq, nullptr, 1.0f, 0.0f);
-        ggml_tensor * kqv = ggml_mul_mat(ctx0, v, kq);
-        ggml_tensor * kqv_bthd = ggml_permute(ctx0, kqv, 0, 2, 1, 3);
-        ggml_tensor * attn_out = ggml_cont_3d(
-            ctx0, kqv_bthd, d_head * n_head, n_patches, n_batch);
+        ggml_tensor * attn_out = nullptr;
+        if (use_fa) {
+            const int64_t d_pad = 80;
+            ggml_tensor * q_p = ggml_pad(ctx0, Qcur, (int) (d_pad - d_head), 0, 0, 0);
+            ggml_tensor * k_p = ggml_pad(ctx0, Kcur, (int) (d_pad - d_head), 0, 0, 0);
+            ggml_tensor * v_p = ggml_pad(ctx0, Vcur, (int) (d_pad - d_head), 0, 0, 0);
+            // Keep the three pads adjacent right after the projections so the
+            // CUDA backend can collapse {mm, bias, reshape}x3 + {pad}x3 into
+            // three padded-weight GEMMs that write the pad buffers directly.
+            ggml_build_forward_expand(gf, q_p);
+            ggml_build_forward_expand(gf, k_p);
+            ggml_build_forward_expand(gf, v_p);
+            // Cast K/V to f16 while still contiguous (fast copy); FA reads the
+            // permuted views with strides.
+            ggml_tensor * k16 = ggml_cast(ctx0, k_p, GGML_TYPE_F16);
+            ggml_tensor * v16 = ggml_cast(ctx0, v_p, GGML_TYPE_F16);
+            ggml_tensor * q = ggml_permute(ctx0, q_p, 0, 2, 1, 3);          // [80, n_patches, n_head, n_batch]
+            ggml_tensor * k = ggml_permute(ctx0, k16, 0, 2, 1, 3);
+            ggml_tensor * v = ggml_permute(ctx0, v16, 0, 2, 1, 3);
+            ggml_tensor * fa = ggml_flash_attn_ext(ctx0, q, k, v, nullptr, kq_scale, 0.0f, 0.0f);
+            ggml_flash_attn_ext_set_prec(fa, GGML_PREC_F32);
+            // fa: [80, n_head, n_patches, n_batch] -> slice the zero lanes away
+            ggml_tensor * sliced = ggml_view_4d(
+                ctx0, fa, d_head, n_head, n_patches, n_batch,
+                fa->nb[1], fa->nb[2], fa->nb[3], 0);
+            attn_out = ggml_cont_3d(ctx0, sliced, d_head * n_head, n_patches, n_batch);
+        } else {
+            // Match Jetson-PImerge's PI05 graph exactly: scale Q before QK and
+            // leave softmax's scale at one.
+            ggml_tensor * k = ggml_permute(ctx0, Kcur, 0, 2, 1, 3);
+            ggml_tensor * v = ggml_cont(ctx0, ggml_permute(ctx0, Vcur, 1, 2, 0, 3));
+            ggml_tensor * q_scaled = ggml_scale(ctx0, Qcur, kq_scale);
+            q_scaled = ggml_permute(ctx0, q_scaled, 0, 2, 1, 3);
+            ggml_tensor * kq = ggml_mul_mat(ctx0, k, q_scaled);
+            kq = ggml_soft_max_ext(ctx0, kq, nullptr, 1.0f, 0.0f);
+            ggml_tensor * kqv = ggml_mul_mat(ctx0, v, kq);
+            ggml_tensor * kqv_bthd = ggml_permute(ctx0, kqv, 0, 2, 1, 3);
+            attn_out = ggml_cont_3d(
+                ctx0, kqv_bthd, d_head * n_head, n_patches, n_batch);
+        }
 
         cur = build_mm(layer.o_w, attn_out);
         if (layer.o_b) {

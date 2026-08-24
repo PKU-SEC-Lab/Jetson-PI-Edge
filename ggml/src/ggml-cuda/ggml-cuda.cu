@@ -3150,6 +3150,60 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
         }
     }
 
+    // SigLIP FA vision QKV pad window: {mul_mat, add bias, reshape}x3 +
+    // {pad}x3 -> three padded-weight GEMMs (bias in the epilogue) that write
+    // the pad buffers directly (per-head widening baked into the repacked
+    // weights). The pads are the window outputs; the same stream-order
+    // argument as the decode QKV window covers buffer recycling (the shared
+    // activation is quantized before any fused write is enqueued).
+    if (node->op == GGML_OP_MUL_MAT && i + 11 < cgraph->n_nodes &&
+        ggml_cuda_info().devices[cuda_ctx->device].cc == 1100) {
+        static const enum ggml_op vis_ops[12] = {
+            GGML_OP_MUL_MAT, GGML_OP_ADD, GGML_OP_RESHAPE,
+            GGML_OP_MUL_MAT, GGML_OP_ADD, GGML_OP_RESHAPE,
+            GGML_OP_MUL_MAT, GGML_OP_ADD, GGML_OP_RESHAPE,
+            GGML_OP_PAD, GGML_OP_PAD, GGML_OP_PAD };
+        bool vis_ok = true;
+        for (int j = 0; j < 12 && vis_ok; ++j) {
+            const ggml_tensor * t = cgraph->nodes[i + j];
+            if (t->op != vis_ops[j] || (t->flags & GGML_TENSOR_FLAG_COMPUTE) == 0) {
+                vis_ok = false;
+                break;
+            }
+            if (j >= 9) {
+                continue; // pads are the window outputs
+            }
+            if (t->flags & GGML_TENSOR_FLAG_OUTPUT) {
+                vis_ok = false;
+                break;
+            }
+            int uses_in_window = 0;
+            for (int k = j + 1; k < 12; ++k) {
+                const ggml_tensor * o = cgraph->nodes[i + k];
+                for (int si = 0; si < GGML_MAX_SRC; ++si) {
+                    if (o->src[si] == t) {
+                        uses_in_window++;
+                    }
+                }
+            }
+            if (uses_in_window != ggml_node_get_use_count(cgraph, i + j)) {
+                vis_ok = false;
+            }
+        }
+        if (vis_ok &&
+            ggml_cuda_flashrt_should_fuse_vis_qkv_pad(
+                cgraph->nodes[i],     cgraph->nodes[i + 1], cgraph->nodes[i + 2],
+                cgraph->nodes[i + 3], cgraph->nodes[i + 4], cgraph->nodes[i + 5],
+                cgraph->nodes[i + 6], cgraph->nodes[i + 7], cgraph->nodes[i + 8],
+                cgraph->nodes[i + 9], cgraph->nodes[i + 10], cgraph->nodes[i + 11])) {
+            ggml_cuda_flashrt_vis_qkv_pad(*cuda_ctx,
+                cgraph->nodes[i],     cgraph->nodes[i + 1], cgraph->nodes[i + 9],
+                cgraph->nodes[i + 3], cgraph->nodes[i + 4], cgraph->nodes[i + 10],
+                cgraph->nodes[i + 6], cgraph->nodes[i + 7], cgraph->nodes[i + 11]);
+            return 11;
+        }
+    }
+
     // pi0.5 adaLN modulate: {rms_norm?, mul_mat mod, add bias, view, repeat,
     // mul, add, view, repeat, add} -> mod GEMM + one ada kernel.
     if ((node->op == GGML_OP_RMS_NORM || node->op == GGML_OP_MUL_MAT) &&

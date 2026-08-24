@@ -67,6 +67,18 @@ void ggml_cuda_flashrt_qkv(ggml_backend_cuda_context & ctx,
                            const ggml_tensor * q_mm, const ggml_tensor * q_rope, ggml_tensor * q_scale);
 
 // pi0.5 gated residual window: {view gate, repeat, mul, add}.
+// Vision QKV pad window: {mul_mat, add bias, reshape}x3 + {pad}x3 -> three
+// padded-weight GEMMs (bias in epilogue) writing the pad buffers directly.
+bool ggml_cuda_flashrt_should_fuse_vis_qkv_pad(
+        const ggml_tensor * mm_q, const ggml_tensor * add_q, const ggml_tensor * resh_q,
+        const ggml_tensor * mm_k, const ggml_tensor * add_k, const ggml_tensor * resh_k,
+        const ggml_tensor * mm_v, const ggml_tensor * add_v, const ggml_tensor * resh_v,
+        const ggml_tensor * pad_q, const ggml_tensor * pad_k, const ggml_tensor * pad_v);
+void ggml_cuda_flashrt_vis_qkv_pad(ggml_backend_cuda_context & ctx,
+        const ggml_tensor * mm_q, const ggml_tensor * add_q, ggml_tensor * pad_q,
+        const ggml_tensor * mm_k, const ggml_tensor * add_k, ggml_tensor * pad_k,
+        const ggml_tensor * mm_v, const ggml_tensor * add_v, ggml_tensor * pad_v);
+
 bool ggml_cuda_flashrt_should_fuse_gated_res(const ggml_tensor * view, const ggml_tensor * repeat,
                                              const ggml_tensor * mul, const ggml_tensor * add);
 void ggml_cuda_flashrt_gated_residual(ggml_backend_cuda_context & ctx, const ggml_tensor * view,

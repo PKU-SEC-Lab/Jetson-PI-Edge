@@ -926,6 +926,184 @@ void ggml_cuda_flashrt_qkv(ggml_backend_cuda_context & ctx,
     }
 }
 
+// ---------------------------------------------------------------------------
+// Vision QKV pad window: {mul_mat, add bias, reshape}x3 + {pad}x3 -> three
+// padded-weight GEMMs with the bias in the epilogue, writing the pad buffers
+// directly. Widens per-head projections (SigLIP head_dim 72 -> 80) inside the
+// repacked weights, so the runtime pad kernels and separate bias adds vanish.
+
+namespace {
+
+struct grouppad_weight {
+    void * packed = nullptr;
+    void * sf     = nullptr;
+    void * bias   = nullptr; // f32 [group_out * n_groups], zero-interleaved
+};
+
+std::unordered_map<const void *, grouppad_weight> g_grouppad_cache;
+
+const grouppad_weight * get_repacked_grouppad(
+        const ggml_tensor * w, const ggml_tensor * bias,
+        int group_in, int group_out, int n_groups, cudaStream_t stream) {
+    std::lock_guard<std::mutex> lk(g_repack_mu);
+
+    auto it = g_grouppad_cache.find(w->data);
+    if (it != g_grouppad_cache.end()) {
+        return &it->second;
+    }
+
+    cudaStreamCaptureStatus cap = cudaStreamCaptureStatusNone;
+    cudaStreamIsCapturing(stream, &cap);
+    if (cap != cudaStreamCaptureStatusNone) {
+        GGML_ABORT("flashrt: grouppad repack for %s requested during CUDA graph capture", w->name);
+    }
+
+    const int K     = (int) w->ne[0];
+    const int N_pad = group_out * n_groups;
+
+    grouppad_weight g;
+    CUDA_CHECK(cudaMalloc(&g.packed, ggml_cuda_flashrt::packed_bytes(N_pad, K)));
+    CUDA_CHECK(cudaMalloc(&g.sf,     ggml_cuda_flashrt::sf_bytes(N_pad, K)));
+    CUDA_CHECK(cudaMalloc(&g.bias,   (size_t) N_pad * sizeof(float)));
+
+    const int rc = ggml_cuda_flashrt::repack_weight_rows_grouppad(
+        w->data, g.packed, g.sf, group_in, group_out, n_groups, K, stream);
+    if (rc != 0) {
+        GGML_ABORT("flashrt: grouppad repack failed for %s (gi=%d go=%d ng=%d K=%d rc=%d)",
+                   w->name, group_in, group_out, n_groups, K, rc);
+    }
+    CUDA_CHECK(cudaMemsetAsync(g.bias, 0, (size_t) N_pad * sizeof(float), stream));
+    CUDA_CHECK(cudaMemcpy2DAsync(g.bias, (size_t) group_out * sizeof(float),
+                                 bias->data, (size_t) group_in * sizeof(float),
+                                 (size_t) group_in * sizeof(float), (size_t) n_groups,
+                                 cudaMemcpyDeviceToDevice, stream));
+
+    auto res = g_grouppad_cache.emplace(w->data, g);
+    return &res.first->second;
+}
+
+// One projection triple of the window: mul_mat -> add(bias) -> reshape -> pad.
+bool vis_qkv_pad_leg_ok(const ggml_tensor * mm, const ggml_tensor * add,
+                        const ggml_tensor * resh, const ggml_tensor * pad,
+                        const ggml_tensor * shared_src1) {
+    if (mm->op != GGML_OP_MUL_MAT || add->op != GGML_OP_ADD ||
+        resh->op != GGML_OP_RESHAPE || pad->op != GGML_OP_PAD) {
+        return false;
+    }
+    const ggml_tensor * w = mm->src[0];
+    const ggml_tensor * b = add->src[1];
+    if (w == nullptr || w->type != GGML_TYPE_NVFP4 || mm->src[1] != shared_src1) {
+        return false;
+    }
+    if (add->src[0] != mm || resh->src[0] != add || pad->src[0] != resh) {
+        return false;
+    }
+    if (b == nullptr || b->type != GGML_TYPE_F32 || !ggml_is_contiguous(b) ||
+        b->ne[0] != mm->ne[0] || ggml_nrows(b) != 1) {
+        return false;
+    }
+    const int64_t group_in  = resh->ne[0];
+    const int64_t n_groups  = resh->ne[1];
+    const int64_t group_out = pad->ne[0];
+    if (group_in * n_groups != mm->ne[0] || group_out <= group_in) {
+        return false;
+    }
+    // pad only widens dim0
+    if (pad->ne[1] != resh->ne[1] || pad->ne[2] != resh->ne[2] || pad->ne[3] != resh->ne[3]) {
+        return false;
+    }
+    if (pad->type != GGML_TYPE_F32 || !ggml_is_contiguous(pad)) {
+        return false;
+    }
+    const int64_t K     = w->ne[0];
+    const int64_t N_pad = group_out * n_groups;
+    if (K % 64 != 0 || N_pad % 16 != 0) {
+        return false;
+    }
+    return true;
+}
+
+} // namespace
+
+bool ggml_cuda_flashrt_should_fuse_vis_qkv_pad(
+        const ggml_tensor * mm_q, const ggml_tensor * add_q, const ggml_tensor * resh_q,
+        const ggml_tensor * mm_k, const ggml_tensor * add_k, const ggml_tensor * resh_k,
+        const ggml_tensor * mm_v, const ggml_tensor * add_v, const ggml_tensor * resh_v,
+        const ggml_tensor * pad_q, const ggml_tensor * pad_k, const ggml_tensor * pad_v) {
+    static const bool disabled = getenv("GGML_CUDA_FLASHRT_DISABLE") != nullptr;
+    if (disabled) {
+        return false;
+    }
+    const ggml_tensor * src1 = mm_q->src[1];
+    if (src1 == nullptr || src1->type != GGML_TYPE_F32 || !ggml_is_contiguous(src1)) {
+        return false;
+    }
+    if (!vis_qkv_pad_leg_ok(mm_q, add_q, resh_q, pad_q, src1) ||
+        !vis_qkv_pad_leg_ok(mm_k, add_k, resh_k, pad_k, src1) ||
+        !vis_qkv_pad_leg_ok(mm_v, add_v, resh_v, pad_v, src1)) {
+        return false;
+    }
+    // identical geometry across the three legs
+    if (mm_k->ne[0] != mm_q->ne[0] || mm_v->ne[0] != mm_q->ne[0] ||
+        pad_k->ne[0] != pad_q->ne[0] || pad_v->ne[0] != pad_q->ne[0] ||
+        resh_k->ne[0] != resh_q->ne[0] || resh_v->ne[0] != resh_q->ne[0]) {
+        return false;
+    }
+    const int64_t M = ggml_nrows(src1);
+    if (M <= 0 || M > INT32_MAX) {
+        return false;
+    }
+    return true;
+}
+
+void ggml_cuda_flashrt_vis_qkv_pad(ggml_backend_cuda_context & ctx,
+        const ggml_tensor * mm_q, const ggml_tensor * add_q, ggml_tensor * pad_q,
+        const ggml_tensor * mm_k, const ggml_tensor * add_k, ggml_tensor * pad_k,
+        const ggml_tensor * mm_v, const ggml_tensor * add_v, ggml_tensor * pad_v) {
+    cudaStream_t stream = ctx.stream();
+
+    const ggml_tensor * src1 = mm_q->src[1];
+    const int K = (int) mm_q->src[0]->ne[0];
+    const int M = (int) ggml_nrows(src1);
+
+    const int group_in  = (int) (pad_q->src[0]->ne[0]);
+    const int group_out = (int) pad_q->ne[0];
+    const int n_groups  = (int) pad_q->ne[1];
+    const int N_pad     = group_out * n_groups;
+
+    ggml_cuda_pool_alloc<uint8_t> a_packed(ctx.pool());
+    ggml_cuda_pool_alloc<uint8_t> a_sf    (ctx.pool());
+    const void * q_packed = nullptr;
+    const void * q_sf     = nullptr;
+    if (!get_quantized_act(src1, M, K, &q_packed, &q_sf, stream)) {
+        a_packed.alloc(ggml_cuda_flashrt::packed_bytes(M, K));
+        a_sf.alloc(ggml_cuda_flashrt::sf_bytes(M, K));
+        const int qrc = ggml_cuda_flashrt::quantize_act_f32(
+            (const float *) src1->data, a_packed.get(), a_sf.get(), M, K, stream);
+        if (qrc != 0) {
+            GGML_ABORT("flashrt: vis qkv activation quantize failed (M=%d K=%d rc=%d)", M, K, qrc);
+        }
+        q_packed = a_packed.get();
+        q_sf     = a_sf.get();
+    }
+
+    const ggml_tensor * legs[3][3] = {
+        { mm_q, add_q, pad_q },
+        { mm_k, add_k, pad_k },
+        { mm_v, add_v, pad_v },
+    };
+    for (auto & leg : legs) {
+        const grouppad_weight * w = get_repacked_grouppad(
+            leg[0]->src[0], leg[1]->src[1], group_in, group_out, n_groups, stream);
+        const int rc = ggml_cuda_flashrt::gemm_bias_f32out(
+            q_packed, q_sf, w->packed, w->sf, w->bias,
+            (float *) leg[2]->data, M, N_pad, K, stream);
+        if (rc != 0) {
+            GGML_ABORT("flashrt: vis qkv padded gemm failed (M=%d N=%d K=%d rc=%d)", M, N_pad, K, rc);
+        }
+    }
+}
+
 void ggml_cuda_flashrt_begin_eval() {
     g_eval_id++;
 }

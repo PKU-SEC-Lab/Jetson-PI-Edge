@@ -165,6 +165,44 @@ __global__ void kernel_repack_rows_padded(
     dst_sf[layout(row, t * 16, 0)] = scale;
 }
 
+// Group-padded variant: output rows are n_groups groups of group_out rows,
+// the first group_in of each group copied from the source (group g, lane l ->
+// source row g*group_in + l) and the rest zero. Used to widen per-head
+// projections (e.g. SigLIP head_dim 72 -> 80) entirely inside the weights so
+// no runtime pad kernel is needed.
+template <class LayoutSF>
+__global__ void kernel_repack_rows_grouppad(
+        const uint8_t * __restrict__ src,
+        uint2 * __restrict__ dst_packed,
+        uint8_t * __restrict__ dst_sf,
+        LayoutSF layout,
+        int group_in, int group_out, int n_groups, int K16) {
+    const int t = blockIdx.x * blockDim.x + threadIdx.x;
+    const int row = blockIdx.y;
+    if (row >= group_out * n_groups || t >= K16) return;
+
+    const int lane = row % group_out;
+    uint2 out = make_uint2(0, 0);
+    uint8_t scale = 0;
+    if (lane < group_in) {
+        const int src_row = (row / group_out) * group_in + lane;
+        const int blk = t >> 2;
+        const int sub = t & 3;
+        const uint8_t * b = src + (static_cast<int64_t>(src_row) * (K16 >> 2) + blk) * GGML_NVFP4_BLOCK_BYTES;
+        scale = b[sub];
+        const uint8_t * qs = b + 4 + sub * 8;
+        uint8_t * ob = reinterpret_cast<uint8_t *>(&out);
+        #pragma unroll
+        for (int p = 0; p < 4; ++p) {
+            ob[p]     = static_cast<uint8_t>((qs[2 * p] & 0x0F) | ((qs[2 * p + 1] & 0x0F) << 4));
+            ob[p + 4] = static_cast<uint8_t>((qs[2 * p] >> 4)   | ((qs[2 * p + 1] & 0xF0)));
+        }
+    }
+
+    dst_packed[static_cast<int64_t>(row) * K16 + t] = out;
+    dst_sf[layout(row, t * 16, 0)] = scale;
+}
+
 __device__ __forceinline__ uint8_t fr_f32_to_e2m1(float x) {
     uint8_t sign = (x < 0.f) ? 0x8u : 0x0u;
     float ax = fabsf(x);
@@ -238,6 +276,25 @@ int repack_weight_rows_padded(const void * ggml_blocks, void * dst_packed, void 
         reinterpret_cast<uint2 *>(dst_packed),
         reinterpret_cast<uint8_t *>(dst_sf),
         layout, N_src, N_pad, K16);
+    const cudaError_t e = cudaGetLastError();
+    return (e == cudaSuccess) ? 0 : -static_cast<int>(e);
+}
+
+int repack_weight_rows_grouppad(const void * ggml_blocks, void * dst_packed, void * dst_sf,
+                                int group_in, int group_out, int n_groups, int K, cudaStream_t stream) {
+    if (K % 64 != 0 || group_out < group_in || n_groups <= 0) return -1;
+    const int N_pad = group_out * n_groups;
+    const int K16 = K / 16;
+    const int threads = 128;
+    dim3 grid((K16 + threads - 1) / threads, N_pad);
+    auto shape = cute::make_shape(1, N_pad, K, 1);
+    auto layout = CfgVec::tile_atom_to_shape_SFB(shape);
+    if (static_cast<int64_t>(cute::cosize(layout)) > sf_bytes(N_pad, K)) return -3;
+    kernel_repack_rows_grouppad<<<grid, threads, 0, stream>>>(
+        reinterpret_cast<const uint8_t *>(ggml_blocks),
+        reinterpret_cast<uint2 *>(dst_packed),
+        reinterpret_cast<uint8_t *>(dst_sf),
+        layout, group_in, group_out, n_groups, K16);
     const cudaError_t e = cudaGetLastError();
     return (e == cudaSuccess) ? 0 : -static_cast<int>(e);
 }
