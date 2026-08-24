@@ -32,7 +32,7 @@
 #include "ggml-cuda/mmq.cuh"
 #include "ggml-cuda/mmvf.cuh"
 #ifdef GGML_CUDA_FLASHRT
-#include "ggml-cuda/flashrt/fr_ggml.cuh"
+#include "fr_ggml.cuh"
 #endif // GGML_CUDA_FLASHRT
 #include "ggml-cuda/mmvq.cuh"
 #include "ggml-cuda/norm.cuh"

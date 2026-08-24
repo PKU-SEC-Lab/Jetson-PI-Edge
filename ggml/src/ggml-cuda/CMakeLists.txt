@@ -158,27 +158,37 @@ if (CUDAToolkit_FOUND)
             message(FATAL_ERROR "GGML_CUDA_FLASHRT: CUTLASS not found at ${FLASHRT_CUTLASS_DIR} (set GGML_CUDA_FLASHRT_CUTLASS_DIR)")
         endif()
 
+        set(FLASHRT_ADAPTER_DIR "${FLASHRT_PUBLIC_DIR}/flash_rt/structures/adapters/ggml")
+        if (NOT EXISTS "${FLASHRT_ADAPTER_DIR}/fr_dispatch.cu")
+            message(FATAL_ERROR "GGML_CUDA_FLASHRT: ggml adapter not found at ${FLASHRT_ADAPTER_DIR}")
+        endif()
+
         add_library(ggml-cuda-flashrt OBJECT
-            flashrt/fr_gemm_f32out.cu
+            ${FLASHRT_ADAPTER_DIR}/fr_gemm_f32out.cu
             ${FLASHRT_PUBLIC_DIR}/csrc/gemm/fp4/cutlass_fp4_gemm_geglu_il_sm100.cu
             ${FLASHRT_PUBLIC_DIR}/csrc/gemm/fp4/cutlass_fp4_gemm_siglip_ffn_f32out_sm100.cu
-            flashrt/fr_ada.cu
-            flashrt/fr_qkv_post.cu
-            flashrt/fr_quant_act.cu
-            flashrt/fr_repack.cu
-            flashrt/fr_dispatch.cu)
+            ${FLASHRT_ADAPTER_DIR}/fr_ada.cu
+            ${FLASHRT_ADAPTER_DIR}/fr_qkv_post.cu
+            ${FLASHRT_ADAPTER_DIR}/fr_quant_act.cu
+            ${FLASHRT_ADAPTER_DIR}/fr_repack.cu
+            ${FLASHRT_ADAPTER_DIR}/fr_dispatch.cu)
         set_target_properties(ggml-cuda-flashrt PROPERTIES
             CUDA_STANDARD 17
             POSITION_INDEPENDENT_CODE ON
             CUDA_ARCHITECTURES "110a")
         target_include_directories(ggml-cuda-flashrt PRIVATE
+            ${FLASHRT_ADAPTER_DIR}
             ${FLASHRT_PUBLIC_DIR}/csrc
             ${FLASHRT_CUTLASS_DIR}/include
             ${FLASHRT_CUTLASS_DIR}/tools/util/include
             ${CMAKE_CURRENT_SOURCE_DIR}
-            ${CMAKE_CURRENT_SOURCE_DIR}/flashrt
             ${CMAKE_CURRENT_SOURCE_DIR}/..
             ${CMAKE_CURRENT_SOURCE_DIR}/../../include)
+        # ggml-cuda.cu includes the adapter's ggml-facing header directly, and
+        # that header includes common.cuh back from this directory.
+        target_include_directories(ggml-cuda PRIVATE
+            ${FLASHRT_ADAPTER_DIR}
+            ${CMAKE_CURRENT_SOURCE_DIR})
         target_link_libraries(ggml-cuda-flashrt PRIVATE CUDA::cudart CUDA::cublas)
         target_compile_options(ggml-cuda-flashrt PRIVATE
             $<$<COMPILE_LANGUAGE:CUDA>:--expt-relaxed-constexpr --use_fast_math>)
