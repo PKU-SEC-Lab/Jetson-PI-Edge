@@ -420,6 +420,101 @@ void ggml_cuda_flashrt_gated_residual(ggml_backend_cuda_context & ctx, const ggm
     }
 }
 
+// SigLIP FFN weights prepared for the fused FP4 pair, keyed by the two
+// weight pointers. Up rows are padded to a 32 multiple for the FP4 output;
+// the f16 Down weight is quantized with its K padded to the same value.
+struct siglip_ffn_weights {
+    void * up_packed = nullptr;
+    void * up_sf     = nullptr;
+    void * dn_packed = nullptr;
+    void * dn_sf     = nullptr;
+    int    h_pad     = 0;
+};
+
+std::unordered_map<pair_key, siglip_ffn_weights, pair_key_hash> g_sig_ffn_cache;
+
+const siglip_ffn_weights * get_siglip_ffn_weights(const ggml_tensor * up_w, const ggml_tensor * dn_w, cudaStream_t stream) {
+    std::lock_guard<std::mutex> lk(g_repack_mu);
+
+    pair_key key{up_w->data, dn_w->data};
+    auto it = g_sig_ffn_cache.find(key);
+    if (it != g_sig_ffn_cache.end()) {
+        return &it->second;
+    }
+
+    const int64_t K_in  = up_w->ne[0];   // model dim (NVFP4 up weight)
+    const int64_t H     = up_w->ne[1];   // hidden dim
+    const int64_t H_pad = GGML_PAD(H, 64);
+    const int64_t D_out = dn_w->ne[1];   // model dim (f16 down weight, K = H)
+
+    cudaStreamCaptureStatus cap = cudaStreamCaptureStatusNone;
+    cudaStreamIsCapturing(stream, &cap);
+    if (cap != cudaStreamCaptureStatusNone) {
+        GGML_ABORT("flashrt: siglip ffn weight prep for %s requested during CUDA graph capture", up_w->name);
+    }
+
+    siglip_ffn_weights w;
+    w.h_pad = (int) H_pad;
+    CUDA_CHECK(cudaMalloc(&w.up_packed, ggml_cuda_flashrt::packed_bytes(H_pad, K_in)));
+    CUDA_CHECK(cudaMalloc(&w.up_sf,     ggml_cuda_flashrt::sf_bytes(H_pad, K_in)));
+    CUDA_CHECK(cudaMalloc(&w.dn_packed, ggml_cuda_flashrt::packed_bytes(D_out, H_pad)));
+    CUDA_CHECK(cudaMalloc(&w.dn_sf,     ggml_cuda_flashrt::sf_bytes(D_out, H_pad)));
+
+    int rc = ggml_cuda_flashrt::repack_weight_rows_padded(
+        up_w->data, w.up_packed, w.up_sf, (int) H, (int) H_pad, (int) K_in, stream);
+    if (rc == 0) {
+        rc = ggml_cuda_flashrt::quantize_weight_f16_padded(
+            dn_w->data, w.dn_packed, w.dn_sf, (int) D_out, (int) H, (int) H_pad, stream);
+    }
+    if (rc != 0) {
+        GGML_ABORT("flashrt: siglip ffn weight prep failed for %s (H=%lld rc=%d)", up_w->name, (long long) H, rc);
+    }
+
+    auto res = g_sig_ffn_cache.emplace(key, w);
+    return &res.first->second;
+}
+
+bool ggml_cuda_flashrt_should_fuse_ln(const ggml_tensor * norm, const ggml_tensor * mul, const ggml_tensor * add) {
+    const ggml_tensor * x = norm->src[0];
+    const int64_t C = norm->ne[0];
+    if (x->type != GGML_TYPE_F32 || !ggml_is_contiguous(x) || norm->ne[3] != 1) {
+        return false;
+    }
+    const ggml_tensor * w = mul->src[0] == norm ? mul->src[1] : mul->src[0];
+    if ((mul->src[0] != norm && mul->src[1] != norm) || w == norm ||
+        w->type != GGML_TYPE_F32 || !ggml_is_contiguous(w) ||
+        w->ne[0] != C || ggml_nelements(w) != C) {
+        return false;
+    }
+    const ggml_tensor * b = add->src[0] == mul ? add->src[1] : add->src[0];
+    if ((add->src[0] != mul && add->src[1] != mul) || b == mul ||
+        b->type != GGML_TYPE_F32 || !ggml_is_contiguous(b) ||
+        b->ne[0] != C || ggml_nelements(b) != C) {
+        return false;
+    }
+    if (!ggml_is_contiguous(add) || add->ne[0] != C || ggml_nrows(add) != ggml_nrows(x)) {
+        return false;
+    }
+    return true;
+}
+
+void ggml_cuda_flashrt_ln_affine(ggml_backend_cuda_context & ctx, const ggml_tensor * norm, const ggml_tensor * mul, ggml_tensor * add) {
+    const ggml_tensor * x = norm->src[0];
+    const ggml_tensor * w = mul->src[0] == norm ? mul->src[1] : mul->src[0];
+    const ggml_tensor * b = add->src[0] == mul ? add->src[1] : add->src[0];
+
+    const int C = (int) norm->ne[0];
+    const int M = (int) ggml_nrows(x);
+    const float eps = ggml_get_op_params_f32(norm, 0);
+
+    const int rc = ggml_cuda_flashrt::layer_norm_affine(
+        (const float *) x->data, (const float *) w->data, (const float *) b->data,
+        (float *) add->data, M, C, eps, ctx.stream());
+    if (rc != 0) {
+        GGML_ABORT("flashrt: fused layer norm failed (M=%d C=%d rc=%d)", M, C, rc);
+    }
+}
+
 bool ggml_cuda_flashrt_should_fuse_geglu(const ggml_tensor * gate_mm, const ggml_tensor * up_mm, const ggml_tensor * glu, const ggml_tensor * down_mm) {
     if (ggml_get_glu_op(glu) != GGML_GLU_OP_GEGLU) {
         return false;
@@ -505,6 +600,100 @@ void ggml_cuda_flashrt_geglu_ffn(ggml_backend_cuda_context & ctx, const ggml_ten
         (float *) down_mm->data, M, N_out, n_ff, /*alpha=*/1.0f, /*widen=*/false, stream);
     if (rc != 0) {
         GGML_ABORT("flashrt: geglu down gemm failed (M=%d N=%d K=%d rc=%d)", M, N_out, n_ff, rc);
+    }
+}
+
+bool ggml_cuda_flashrt_should_fuse_siglip_ffn(const ggml_tensor * up_mm, const ggml_tensor * bias1, const ggml_tensor * gelu,
+                                              const ggml_tensor * cont1, const ggml_tensor * dn_mm, const ggml_tensor * bias2,
+                                              const ggml_tensor * cont2, const ggml_tensor * res_add) {
+    const ggml_tensor * up_w = up_mm->src[0];
+    const ggml_tensor * src1 = up_mm->src[1];
+    const ggml_tensor * dn_w = dn_mm->src[0];
+
+    if (!ggml_cuda_flashrt_should_use(up_w, src1, up_mm)) {
+        return false;
+    }
+    if (dn_w->type != GGML_TYPE_F16 || !ggml_is_contiguous(dn_w) ||
+        dn_w->ne[0] != up_w->ne[1] || dn_w->ne[0] % 16 != 0 ||
+        dn_w->ne[1] % 16 != 0 || dn_w->ne[2] != 1) {
+        return false;
+    }
+    if (ggml_get_unary_op(gelu) != GGML_UNARY_OP_GELU || gelu->src[0] != bias1) {
+        return false;
+    }
+    const ggml_tensor * b1 = bias1->src[0] == up_mm ? bias1->src[1] : bias1->src[0];
+    if ((bias1->src[0] != up_mm && bias1->src[1] != up_mm) || b1 == up_mm ||
+        b1->type != GGML_TYPE_F32 || !ggml_is_contiguous(b1) || ggml_nelements(b1) != up_w->ne[1]) {
+        return false;
+    }
+    if (cont1->src[0] != gelu || dn_mm->src[1] != cont1) {
+        return false;
+    }
+    const ggml_tensor * b2 = bias2->src[0] == dn_mm ? bias2->src[1] : bias2->src[0];
+    if ((bias2->src[0] != dn_mm && bias2->src[1] != dn_mm) || b2 == dn_mm ||
+        b2->type != GGML_TYPE_F32 || !ggml_is_contiguous(b2) || ggml_nelements(b2) != dn_w->ne[1]) {
+        return false;
+    }
+    if (cont2->src[0] != bias2) {
+        return false;
+    }
+    const ggml_tensor * residual = res_add->src[0] == cont2 ? res_add->src[1] : res_add->src[0];
+    if ((res_add->src[0] != cont2 && res_add->src[1] != cont2) || residual == cont2 ||
+        residual->type != GGML_TYPE_F32 || !ggml_is_contiguous(residual) ||
+        !ggml_is_contiguous(res_add) || res_add->ne[0] != dn_w->ne[1] ||
+        ggml_nrows(res_add) != ggml_nrows(src1) || ggml_nrows(residual) != ggml_nrows(src1)) {
+        return false;
+    }
+    return true;
+}
+
+void ggml_cuda_flashrt_siglip_ffn(ggml_backend_cuda_context & ctx, const ggml_tensor * up_mm, const ggml_tensor * bias1,
+                                  const ggml_tensor * dn_mm, const ggml_tensor * bias2,
+                                  const ggml_tensor * cont2, ggml_tensor * res_add) {
+    const ggml_tensor * up_w = up_mm->src[0];
+    const ggml_tensor * src1 = up_mm->src[1];
+    const ggml_tensor * dn_w = dn_mm->src[0];
+    const ggml_tensor * b1 = bias1->src[0] == up_mm ? bias1->src[1] : bias1->src[0];
+    const ggml_tensor * b2 = bias2->src[0] == dn_mm ? bias2->src[1] : bias2->src[0];
+    const ggml_tensor * residual = res_add->src[0] == cont2 ? res_add->src[1] : res_add->src[0];
+
+    const int K_in  = (int) up_w->ne[0];
+    const int D_out = (int) dn_w->ne[1];
+    const int M     = (int) ggml_nrows(src1);
+
+    cudaStream_t stream = ctx.stream();
+
+    const siglip_ffn_weights * w = get_siglip_ffn_weights(up_w, dn_w, stream);
+    const int H_pad = w->h_pad;
+
+    const void * q_packed = nullptr;
+    const void * q_sf     = nullptr;
+    ggml_cuda_pool_alloc<uint8_t> a_packed(ctx.pool());
+    ggml_cuda_pool_alloc<uint8_t> a_sf    (ctx.pool());
+    int rc = 0;
+    if (!get_quantized_act(src1, M, K_in, &q_packed, &q_sf, stream)) {
+        a_packed.alloc(ggml_cuda_flashrt::packed_bytes(M, K_in));
+        a_sf.alloc(ggml_cuda_flashrt::sf_bytes(M, K_in));
+        rc = ggml_cuda_flashrt::quantize_act_f32((const float *) src1->data, a_packed.get(), a_sf.get(), M, K_in, stream);
+        q_packed = a_packed.get();
+        q_sf     = a_sf.get();
+    }
+
+    ggml_cuda_pool_alloc<uint8_t> hid_packed(ctx.pool(), ggml_cuda_flashrt::packed_bytes(M, H_pad));
+    ggml_cuda_pool_alloc<uint8_t> hid_sf    (ctx.pool(), ggml_cuda_flashrt::sf_bytes(M, H_pad));
+
+    if (rc == 0) {
+        rc = ggml_cuda_flashrt::siglip_ffn_up_gelu_fp4out(
+            q_packed, q_sf, w->up_packed, w->up_sf, b1->data,
+            hid_packed.get(), hid_sf.get(), M, H_pad, K_in, stream);
+    }
+    if (rc == 0) {
+        rc = ggml_cuda_flashrt::siglip_ffn_down_bias_res_f32(
+            hid_packed.get(), hid_sf.get(), w->dn_packed, w->dn_sf, b2->data,
+            residual->data, res_add->data, M, D_out, H_pad, stream);
+    }
+    if (rc != 0) {
+        GGML_ABORT("flashrt: siglip ffn failed (M=%d H_pad=%d rc=%d)", M, H_pad, rc);
     }
 }
 

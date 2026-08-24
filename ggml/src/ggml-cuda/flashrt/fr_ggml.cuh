@@ -40,6 +40,20 @@ void ggml_cuda_flashrt_ada_norm(ggml_backend_cuda_context & ctx, const ggml_tens
                                 ggml_tensor * bias_add, const ggml_tensor * view_scale, const ggml_tensor * mul,
                                 const ggml_tensor * view_shift, ggml_tensor * add2);
 
+// LayerNorm + affine window: {NORM, MUL weight, ADD bias} -> one kernel.
+bool ggml_cuda_flashrt_should_fuse_ln(const ggml_tensor * norm, const ggml_tensor * mul, const ggml_tensor * add);
+void ggml_cuda_flashrt_ln_affine(ggml_backend_cuda_context & ctx, const ggml_tensor * norm, const ggml_tensor * mul, ggml_tensor * add);
+
+// SigLIP FFN window: {mul_mat up (NVFP4), add bias, GELU, cont, mul_mat
+// down (f16), add bias, cont, add residual} -> fused FP4 Up GEMM (gelu
+// epilogue, FP4 hidden) + Down GEMM (bias + residual epilogue).
+bool ggml_cuda_flashrt_should_fuse_siglip_ffn(const ggml_tensor * up_mm, const ggml_tensor * bias1, const ggml_tensor * gelu,
+                                              const ggml_tensor * cont1, const ggml_tensor * dn_mm, const ggml_tensor * bias2,
+                                              const ggml_tensor * cont2, const ggml_tensor * res_add);
+void ggml_cuda_flashrt_siglip_ffn(ggml_backend_cuda_context & ctx, const ggml_tensor * up_mm, const ggml_tensor * bias1,
+                                  const ggml_tensor * dn_mm, const ggml_tensor * bias2,
+                                  const ggml_tensor * cont2, ggml_tensor * res_add);
+
 // pi0.5 gated residual window: {view gate, repeat, mul, add}.
 bool ggml_cuda_flashrt_should_fuse_gated_res(const ggml_tensor * view, const ggml_tensor * repeat,
                                              const ggml_tensor * mul, const ggml_tensor * add);

@@ -14,6 +14,9 @@
 
 #include "fr_kernels.h"
 
+#include <cuda_fp16.h>
+#include <cuda_fp8.h>
+
 #include "cutlass/cutlass.h"
 #include "cutlass/detail/sm100_blockscaled_layout.hpp"
 #include "cute/tensor.hpp"
@@ -123,6 +126,136 @@ int repack_weight_pair_interleaved(const void * gate_blocks, const void * up_blo
         reinterpret_cast<uint8_t *>(dst_sf),
         layout, n_ff, K16);
 
+    const cudaError_t e = cudaGetLastError();
+    return (e == cudaSuccess) ? 0 : -static_cast<int>(e);
+}
+
+namespace {
+
+// Rows-padded variant: rows >= N_src emit zero data and zero scales
+// (mathematically inert; the extra rows exist only for output alignment).
+template <class LayoutSF>
+__global__ void kernel_repack_rows_padded(
+        const uint8_t * __restrict__ src,
+        uint2 * __restrict__ dst_packed,
+        uint8_t * __restrict__ dst_sf,
+        LayoutSF layout,
+        int N_src, int N_pad, int K16) {
+    const int t = blockIdx.x * blockDim.x + threadIdx.x;
+    const int row = blockIdx.y;
+    if (row >= N_pad || t >= K16) return;
+
+    uint2 out = make_uint2(0, 0);
+    uint8_t scale = 0;
+    if (row < N_src) {
+        const int blk = t >> 2;
+        const int sub = t & 3;
+        const uint8_t * b = src + (static_cast<int64_t>(row) * (K16 >> 2) + blk) * GGML_NVFP4_BLOCK_BYTES;
+        scale = b[sub];
+        const uint8_t * qs = b + 4 + sub * 8;
+        uint8_t * ob = reinterpret_cast<uint8_t *>(&out);
+        #pragma unroll
+        for (int p = 0; p < 4; ++p) {
+            ob[p]     = static_cast<uint8_t>((qs[2 * p] & 0x0F) | ((qs[2 * p + 1] & 0x0F) << 4));
+            ob[p + 4] = static_cast<uint8_t>((qs[2 * p] >> 4)   | ((qs[2 * p + 1] & 0xF0)));
+        }
+    }
+
+    dst_packed[static_cast<int64_t>(row) * K16 + t] = out;
+    dst_sf[layout(row, t * 16, 0)] = scale;
+}
+
+__device__ __forceinline__ uint8_t fr_f32_to_e2m1(float x) {
+    uint8_t sign = (x < 0.f) ? 0x8u : 0x0u;
+    float ax = fabsf(x);
+    uint8_t m;
+    if      (ax <= 0.25f) m = 0u;
+    else if (ax <= 0.75f) m = 1u;
+    else if (ax <= 1.25f) m = 2u;
+    else if (ax <= 1.75f) m = 3u;
+    else if (ax <= 2.5f)  m = 4u;
+    else if (ax <= 3.5f)  m = 5u;
+    else if (ax <= 5.0f)  m = 6u;
+    else                  m = 7u;
+    return sign | m;
+}
+
+// Quantize an fp16 weight [N rows, K_src] to the NVFP4 wire format with the
+// K dim zero-padded to K_pad (standard e4m3 amax/6 scales, e2m1 nearest).
+template <class LayoutSF>
+__global__ void kernel_quantize_weight_f16_padded(
+        const __half * __restrict__ src,
+        uint2 * __restrict__ dst_packed,
+        uint8_t * __restrict__ dst_sf,
+        LayoutSF layout,
+        int N, int K_src16, int K_pad16) {
+    const int t = blockIdx.x * blockDim.x + threadIdx.x;
+    const int row = blockIdx.y;
+    if (row >= N || t >= K_pad16) return;
+
+    uint2 out = make_uint2(0, 0);
+    uint8_t sf = 0;
+    if (t < K_src16) {
+        const __half * xr = src + (int64_t) row * (K_src16 * 16) + t * 16;
+        float vals[16];
+        float amax = 0.f;
+        #pragma unroll
+        for (int i = 0; i < 16; ++i) {
+            vals[i] = __half2float(xr[i]);
+            amax = fmaxf(amax, fabsf(vals[i]));
+        }
+        float desired = amax / 6.f;
+        if (desired < 1e-12f) desired = 1e-12f;
+        __nv_fp8_e4m3 q(desired);
+        sf = *reinterpret_cast<uint8_t *>(&q);
+        const float inv = 1.f / static_cast<float>(q);
+        uint8_t * ob = reinterpret_cast<uint8_t *>(&out);
+        #pragma unroll
+        for (int p = 0; p < 8; ++p) {
+            const uint8_t lo = fr_f32_to_e2m1(vals[2 * p]     * inv);
+            const uint8_t hi = fr_f32_to_e2m1(vals[2 * p + 1] * inv);
+            ob[p] = static_cast<uint8_t>(lo | (hi << 4));
+        }
+    }
+
+    dst_packed[static_cast<int64_t>(row) * K_pad16 + t] = out;
+    dst_sf[layout(row, t * 16, 0)] = sf;
+}
+
+} // namespace
+
+int repack_weight_rows_padded(const void * ggml_blocks, void * dst_packed, void * dst_sf,
+                              int N_src, int N_pad, int K, cudaStream_t stream) {
+    if (K % 64 != 0 || N_pad < N_src) return -1;
+    const int K16 = K / 16;
+    const int threads = 128;
+    dim3 grid((K16 + threads - 1) / threads, N_pad);
+    auto shape = cute::make_shape(1, N_pad, K, 1);
+    auto layout = CfgVec::tile_atom_to_shape_SFB(shape);
+    if (static_cast<int64_t>(cute::cosize(layout)) > sf_bytes(N_pad, K)) return -3;
+    kernel_repack_rows_padded<<<grid, threads, 0, stream>>>(
+        reinterpret_cast<const uint8_t *>(ggml_blocks),
+        reinterpret_cast<uint2 *>(dst_packed),
+        reinterpret_cast<uint8_t *>(dst_sf),
+        layout, N_src, N_pad, K16);
+    const cudaError_t e = cudaGetLastError();
+    return (e == cudaSuccess) ? 0 : -static_cast<int>(e);
+}
+
+int quantize_weight_f16_padded(const void * w_f16, void * dst_packed, void * dst_sf,
+                               int N, int K_src, int K_pad, cudaStream_t stream) {
+    if (K_src % 16 != 0 || K_pad % 64 != 0 || K_pad < K_src) return -1;
+    const int K16 = K_pad / 16;
+    const int threads = 128;
+    dim3 grid((K16 + threads - 1) / threads, N);
+    auto shape = cute::make_shape(1, N, K_pad, 1);
+    auto layout = CfgVec::tile_atom_to_shape_SFB(shape);
+    if (static_cast<int64_t>(cute::cosize(layout)) > sf_bytes(N, K_pad)) return -3;
+    kernel_quantize_weight_f16_padded<<<grid, threads, 0, stream>>>(
+        reinterpret_cast<const __half *>(w_f16),
+        reinterpret_cast<uint2 *>(dst_packed),
+        reinterpret_cast<uint8_t *>(dst_sf),
+        layout, N, K_src / 16, K16);
     const cudaError_t e = cudaGetLastError();
     return (e == cudaSuccess) ? 0 : -static_cast<int>(e);
 }

@@ -75,6 +75,57 @@ __global__ void kernel_gated_residual(const float * __restrict__ residual,
     }
 }
 
+// out[m, c] = (x[m, c] - mean(x[m])) * rstd(x[m]) * w[c] + b[c]
+__global__ void kernel_layer_norm_affine(const float * __restrict__ x,
+                                         const float * __restrict__ w,
+                                         const float * __restrict__ b,
+                                         float * __restrict__ out,
+                                         int C, float eps) {
+    const int m = blockIdx.x;
+    const float * xr = x + (int64_t) m * C;
+    float * orow = out + (int64_t) m * C;
+
+    float sum = 0.0f, sumsq = 0.0f;
+    for (int c = threadIdx.x; c < C; c += blockDim.x) {
+        const float v = xr[c];
+        sum   += v;
+        sumsq += v * v;
+    }
+    __shared__ float red[2][32];
+    #pragma unroll
+    for (int off = 16; off > 0; off >>= 1) {
+        sum   += __shfl_xor_sync(0xffffffff, sum, off);
+        sumsq += __shfl_xor_sync(0xffffffff, sumsq, off);
+    }
+    const int warp = threadIdx.x / 32;
+    if (threadIdx.x % 32 == 0) {
+        red[0][warp] = sum;
+        red[1][warp] = sumsq;
+    }
+    __syncthreads();
+    if (warp == 0) {
+        float s  = (threadIdx.x < blockDim.x / 32) ? red[0][threadIdx.x] : 0.0f;
+        float s2 = (threadIdx.x < blockDim.x / 32) ? red[1][threadIdx.x] : 0.0f;
+        #pragma unroll
+        for (int off = 16; off > 0; off >>= 1) {
+            s  += __shfl_xor_sync(0xffffffff, s, off);
+            s2 += __shfl_xor_sync(0xffffffff, s2, off);
+        }
+        if (threadIdx.x == 0) {
+            red[0][0] = s;
+            red[1][0] = s2;
+        }
+    }
+    __syncthreads();
+    const float mean = red[0][0] / C;
+    const float var  = red[1][0] / C - mean * mean;
+    const float rstd = rsqrtf(var + eps);
+
+    for (int c = threadIdx.x; c < C; c += blockDim.x) {
+        orow[c] = (xr[c] - mean) * rstd * w[c] + b[c];
+    }
+}
+
 // out[c] = a[c] + b[c]
 __global__ void kernel_vec_add(const float * __restrict__ a,
                                const float * __restrict__ b,
@@ -104,6 +155,13 @@ int ada_rms_mod(const float * x, const float * scale, const float * shift,
 int gated_residual(const float * residual, const float * branch, const float * gate,
                    float * out, int M, int C, cudaStream_t stream) {
     kernel_gated_residual<<<M, 256, 0, stream>>>(residual, branch, gate, out, C);
+    const cudaError_t e = cudaGetLastError();
+    return (e == cudaSuccess) ? 0 : -static_cast<int>(e);
+}
+
+int layer_norm_affine(const float * x, const float * w, const float * b,
+                      float * out, int M, int C, float eps, cudaStream_t stream) {
+    kernel_layer_norm_affine<<<M, 256, 0, stream>>>(x, w, b, out, C, eps);
     const cudaError_t e = cudaGetLastError();
     return (e == cudaSuccess) ? 0 : -static_cast<int>(e);
 }

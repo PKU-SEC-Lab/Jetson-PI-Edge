@@ -64,6 +64,27 @@ int repack_weight_pair_interleaved(const void * gate_blocks, const void * up_blo
                                    void * dst_packed, void * dst_sf,
                                    int n_ff, int K, cudaStream_t stream);
 
+// Rows-padded repack for the SigLIP FFN Up weight: rows >= N_src are zeros.
+int repack_weight_rows_padded(const void * ggml_blocks, void * dst_packed, void * dst_sf,
+                              int N_src, int N_pad, int K, cudaStream_t stream);
+
+// Quantize an fp16 weight [N, K_src] to NVFP4 wire format, K zero-padded to K_pad.
+int quantize_weight_f16_padded(const void * w_f16, void * dst_packed, void * dst_sf,
+                               int N, int K_src, int K_pad, cudaStream_t stream);
+
+// SigLIP FFN GEMM pair (fr_siglip_ffn.cu): Up = gelu_tanh(A@B + bias) -> FP4+SF,
+// Down = A@B + bias + residual -> f32. Biases are fp32.
+int siglip_ffn_up_gelu_fp4out(const void * A_packed, const void * SFA,
+                              const void * B_packed, const void * SFB,
+                              const void * bias_f32,
+                              void * D_packed, void * D_SFD,
+                              int M, int N, int K, cudaStream_t stream);
+int siglip_ffn_down_bias_res_f32(const void * A_packed, const void * SFA,
+                                 const void * B_packed, const void * SFB,
+                                 const void * bias_f32,
+                                 const void * C_f32, void * D_f32,
+                                 int M, int N, int K, cudaStream_t stream);
+
 // Fused adaLN modulate: out[m,c] = norm(x[m])[c] * (1 + scale[c]) + shift[c],
 // norm = rms-normalize when with_rms else identity. x/out are [M, C]
 // contiguous fp32; scale/shift are [C] vectors.
@@ -74,6 +95,10 @@ int ada_rms_mod(const float * x, const float * scale, const float * shift,
 // Fused gated residual: out[m,c] = residual[m,c] + branch[m,c] * gate[c].
 int gated_residual(const float * residual, const float * branch, const float * gate,
                    float * out, int M, int C, cudaStream_t stream);
+
+// Fused LayerNorm + affine: out[m,c] = normalize(x[m])[c] * w[c] + b[c].
+int layer_norm_affine(const float * x, const float * w, const float * b,
+                      float * out, int M, int C, float eps, cudaStream_t stream);
 
 // out[i] = a[i] + b[i] for n fp32 elements.
 int vec_add_f32(const float * a, const float * b, float * out, int n, cudaStream_t stream);

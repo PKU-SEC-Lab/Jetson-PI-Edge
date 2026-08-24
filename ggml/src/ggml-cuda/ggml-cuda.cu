@@ -3112,6 +3112,103 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
         }
     }
 
+    // SigLIP FFN: {mul_mat, add, GELU, cont, mul_mat, add, cont, add} ->
+    // fused FP4 Up (gelu epilogue) + Down (bias+residual epilogue).
+    if (node->op == GGML_OP_MUL_MAT && i + 7 < cgraph->n_nodes &&
+        ggml_cuda_info().devices[cuda_ctx->device].cc == 1100 &&
+        cgraph->nodes[i+1]->op == GGML_OP_ADD && cgraph->nodes[i+2]->op == GGML_OP_UNARY &&
+        cgraph->nodes[i+3]->op == GGML_OP_CONT && cgraph->nodes[i+4]->op == GGML_OP_MUL_MAT &&
+        cgraph->nodes[i+5]->op == GGML_OP_ADD && cgraph->nodes[i+6]->op == GGML_OP_CONT &&
+        cgraph->nodes[i+7]->op == GGML_OP_ADD &&
+        !ggml_can_fuse_subgraph(cgraph, i, { GGML_OP_MUL_MAT, GGML_OP_ADD, GGML_OP_UNARY, GGML_OP_CONT,
+                                             GGML_OP_MUL_MAT, GGML_OP_ADD, GGML_OP_CONT, GGML_OP_ADD },
+                                { i + 7 }) &&
+        getenv("GGML_FLASHRT_DEBUG") != nullptr) {
+        static int dbg_m = 0;
+        if (dbg_m++ < 8) {
+            fprintf(stderr, "[fr-sigffn] ops match at %d but can_fuse_subgraph=false (%s)\n", i, node->name);
+        }
+    }
+    if (node->op == GGML_OP_MUL_MAT && i + 7 < cgraph->n_nodes &&
+        ggml_cuda_info().devices[cuda_ctx->device].cc == 1100 &&
+        ggml_can_fuse_subgraph(cgraph, i, { GGML_OP_MUL_MAT, GGML_OP_ADD, GGML_OP_UNARY, GGML_OP_CONT,
+                                            GGML_OP_MUL_MAT, GGML_OP_ADD, GGML_OP_CONT, GGML_OP_ADD },
+                               { i + 7 })) {
+        const ggml_tensor * up_mm = cgraph->nodes[i];
+        const ggml_tensor * bias1 = cgraph->nodes[i + 1];
+        const ggml_tensor * gelu  = cgraph->nodes[i + 2];
+        const ggml_tensor * cont1 = cgraph->nodes[i + 3];
+        const ggml_tensor * dn_mm = cgraph->nodes[i + 4];
+        const ggml_tensor * bias2 = cgraph->nodes[i + 5];
+        const ggml_tensor * cont2 = cgraph->nodes[i + 6];
+        ggml_tensor * res_add     = cgraph->nodes[i + 7];
+
+        // Memory-range check with one relaxation: the residual source may
+        // exactly alias the output (the down GEMM's epilogue reads C before
+        // writing D per tile, so an exact C==D alias is safe). Any other
+        // overlap between a non-elided source and the output rejects.
+        const ggml_tensor * residual = res_add->src[0] == cont2 ? res_add->src[1] : res_add->src[0];
+        auto range_of = [](const ggml_tensor * t, int64_t & lo, int64_t & hi) {
+            lo = (int64_t) t->data;
+            hi = lo + (int64_t) ggml_backend_buft_get_alloc_size(t->buffer->buft, t);
+        };
+        bool mem_ok = true;
+        {
+            int64_t d_lo, d_hi;
+            range_of(res_add, d_lo, d_hi);
+            for (int j = i; j <= i + 7 && mem_ok; ++j) {
+                for (int si = 0; si < GGML_MAX_SRC && mem_ok; ++si) {
+                    const ggml_tensor * src = cgraph->nodes[j]->src[si];
+                    if (!src || src->op == GGML_OP_NONE || src->buffer == nullptr) {
+                        continue;
+                    }
+                    bool elided = false;
+                    for (int k = i; k < j; ++k) {
+                        if (cgraph->nodes[k] == src) { elided = true; break; }
+                    }
+                    if (elided) {
+                        continue;
+                    }
+                    int64_t s_lo, s_hi;
+                    range_of(src, s_lo, s_hi);
+                    const bool overlap = (s_lo <= d_lo && d_lo < s_hi) || (d_lo <= s_lo && s_lo < d_hi);
+                    if (overlap && !(src == residual && s_lo == d_lo && s_hi == d_hi)) {
+                        mem_ok = false;
+                    }
+                }
+            }
+        }
+
+        const bool sf_ok = ggml_cuda_flashrt_should_fuse_siglip_ffn(up_mm, bias1, gelu, cont1, dn_mm, bias2, cont2, res_add);
+        if (sf_ok && mem_ok) {
+            ggml_cuda_flashrt_siglip_ffn(*cuda_ctx, up_mm, bias1, dn_mm, bias2, cont2, res_add);
+            return 7;
+        }
+        if (getenv("GGML_FLASHRT_DEBUG") != nullptr) {
+            static int dbg_n = 0;
+            if (dbg_n++ < 8) {
+                fprintf(stderr, "[fr-sigffn] window at %d: should_fuse=%d memrange=%d (up=%s dn=%s)\n",
+                        i, (int) sf_ok, (int) mem_ok, up_mm->src[0]->name, dn_mm->src[0]->name);
+            }
+        }
+    }
+
+    // LayerNorm + affine: {NORM, MUL weight, ADD bias} -> one kernel.
+    if (node->op == GGML_OP_NORM && i + 2 < cgraph->n_nodes &&
+        ggml_cuda_info().devices[cuda_ctx->device].cc == 1100 &&
+        ggml_can_fuse_subgraph(cgraph, i, { GGML_OP_NORM, GGML_OP_MUL, GGML_OP_ADD }, { i + 2 })) {
+        const ggml_tensor * norm = cgraph->nodes[i];
+        const ggml_tensor * mul  = cgraph->nodes[i + 1];
+        ggml_tensor * add        = cgraph->nodes[i + 2];
+
+        int out_nodes[] = { i + 2 };
+        if (ggml_cuda_flashrt_should_fuse_ln(norm, mul, add) &&
+            ggml_cuda_check_fusion_memory_ranges(cgraph, i, 3, out_nodes, 1)) {
+            ggml_cuda_flashrt_ln_affine(*cuda_ctx, norm, mul, add);
+            return 2;
+        }
+    }
+
     // pi0.5 gated residual: {view gate, repeat, mul, add} -> one kernel.
     if (node->op == GGML_OP_VIEW && i + 3 < cgraph->n_nodes &&
         ggml_cuda_info().devices[cuda_ctx->device].cc == 1100 &&

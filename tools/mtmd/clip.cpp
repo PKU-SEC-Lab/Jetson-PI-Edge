@@ -170,6 +170,12 @@ struct clip_ctx {
     clip_flash_attn_type flash_attn_type = CLIP_FLASH_ATTN_TYPE_AUTO;
     bool is_allocated = false;
 
+    // graph reuse: skip the per-encode rebuild/realloc when the batch shape
+    // is unchanged (the graph metadata lives in buf_compute_meta, which is
+    // stable between builds)
+    ggml_cgraph * cached_gf = nullptr;
+    int cached_nx = 0, cached_ny = 0, cached_batch = 0;
+
     bool debug_output_embeddings = false;
 
     // for measuring memory usage
@@ -3594,17 +3600,34 @@ bool clip_image_batch_encode(clip_ctx * ctx, int n_threads, const clip_image_f32
         clip_model_loader::warmup(*ctx, *imgs_c_ptr);
     }
 
-    // build the inference graph
-    ggml_backend_sched_reset(ctx->sched.get());
-    ggml_cgraph * gf = clip_get_graph_builder(ctx, imgs)->build();
-    ggml_backend_sched_alloc_graph(ctx->sched.get(), gf);
+    const int image_size_width  = imgs.entries[0].nx();
+    const int image_size_height = imgs.entries[0].ny();
+    const int n_imgs_batch      = (int) imgs.entries.size();
+
+    // build the inference graph, or reuse the previous one when the batch
+    // shape is unchanged (same graph topology; inputs are re-set below)
+    static const bool disable_graph_reuse = getenv("GGML_CLIP_GRAPH_REUSE") != nullptr &&
+                                            atoi(getenv("GGML_CLIP_GRAPH_REUSE")) == 0;
+    ggml_cgraph * gf;
+    if (!disable_graph_reuse &&
+        ctx->cached_gf != nullptr &&
+        ctx->cached_nx == image_size_width &&
+        ctx->cached_ny == image_size_height &&
+        ctx->cached_batch == n_imgs_batch) {
+        gf = ctx->cached_gf;
+    } else {
+        ggml_backend_sched_reset(ctx->sched.get());
+        gf = clip_get_graph_builder(ctx, imgs)->build();
+        ggml_backend_sched_alloc_graph(ctx->sched.get(), gf);
+        ctx->cached_gf    = gf;
+        ctx->cached_nx    = image_size_width;
+        ctx->cached_ny    = image_size_height;
+        ctx->cached_batch = n_imgs_batch;
+    }
 
     // set inputs
     const auto & model   = ctx->model;
     const auto & hparams = model.hparams;
-
-    const int image_size_width  = imgs.entries[0].nx();
-    const int image_size_height = imgs.entries[0].ny();
 
     const int patch_size    = hparams.patch_size;
     const int num_patches   = ((image_size_width / patch_size) * (image_size_height / patch_size));
