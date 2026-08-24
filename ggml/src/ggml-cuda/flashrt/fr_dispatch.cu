@@ -1198,6 +1198,113 @@ void ggml_cuda_flashrt_vis_qkv_pad(ggml_backend_cuda_context & ctx,
     }
 }
 
+// ---------------------------------------------------------------------------
+// GEMM + (bias) + residual window: {mul_mat, add bias?, add residual} -> one
+// GEMM with the bias and the residual in the epilogue (C may alias D; the
+// epilogue reads C before writing D). Covers the encoder/vision o- and
+// down-projections whose residual adds were separate bandwidth passes.
+
+namespace {
+
+std::unordered_map<int, void *> g_zero_bias_cache; // keyed by N
+
+const void * get_zero_bias(int N, cudaStream_t stream) {
+    std::lock_guard<std::mutex> lk(g_repack_mu);
+    auto it = g_zero_bias_cache.find(N);
+    if (it != g_zero_bias_cache.end()) {
+        return it->second;
+    }
+    cudaStreamCaptureStatus cap = cudaStreamCaptureStatusNone;
+    cudaStreamIsCapturing(stream, &cap);
+    if (cap != cudaStreamCaptureStatusNone) {
+        return nullptr; // caller falls back; allocation is capture-illegal
+    }
+    void * p = nullptr;
+    CUDA_CHECK(cudaMalloc(&p, (size_t) N * sizeof(float)));
+    CUDA_CHECK(cudaMemsetAsync(p, 0, (size_t) N * sizeof(float), stream));
+    g_zero_bias_cache.emplace(N, p);
+    return p;
+}
+
+const ggml_tensor * mm_res_residual(const ggml_tensor * chain, const ggml_tensor * res_add) {
+    const ggml_tensor * r = res_add->src[0] == chain ? res_add->src[1]
+                          : res_add->src[1] == chain ? res_add->src[0] : nullptr;
+    if (r == nullptr || r == chain || r->type != GGML_TYPE_F32 || !ggml_is_contiguous(r) ||
+        !ggml_are_same_shape(r, res_add)) {
+        return nullptr;
+    }
+    return r;
+}
+
+} // namespace
+
+bool ggml_cuda_flashrt_should_fuse_mm_res(const ggml_tensor * mm, const ggml_tensor * bias_add,
+                                          const ggml_tensor * res_add) {
+    if (!ggml_cuda_flashrt_should_use(mm->src[0], mm->src[1], mm)) {
+        return false;
+    }
+    const int64_t N = mm->ne[0];
+    const int64_t K = mm->src[0]->ne[0];
+    if (N % 16 != 0 || K % 64 != 0) {
+        return false;
+    }
+    const ggml_tensor * chain = mm;
+    if (bias_add != nullptr) {
+        const ggml_tensor * b = bias_add->src[1];
+        if (bias_add->src[0] != mm || b == nullptr || b->type != GGML_TYPE_F32 ||
+            !ggml_is_contiguous(b) || b->ne[0] != N || ggml_nrows(b) != 1) {
+            return false;
+        }
+        chain = bias_add;
+    }
+    if (mm_res_residual(chain, res_add) == nullptr ||
+        !ggml_is_contiguous(res_add) || !ggml_are_same_shape(res_add, mm)) {
+        return false;
+    }
+    return true;
+}
+
+bool ggml_cuda_flashrt_mm_res(ggml_backend_cuda_context & ctx, const ggml_tensor * mm,
+                              const ggml_tensor * bias_add, ggml_tensor * res_add) {
+    const ggml_tensor * src1 = mm->src[1];
+    const int M = (int) ggml_nrows(src1);
+    const int N = (int) mm->ne[0];
+    const int K = (int) mm->src[0]->ne[0];
+    cudaStream_t stream = ctx.stream();
+
+    const void * bias = bias_add != nullptr ? bias_add->src[1]->data : get_zero_bias(N, stream);
+    if (bias == nullptr) {
+        return false; // zero-bias alloc during capture: run unfused
+    }
+    const ggml_tensor * residual = mm_res_residual(bias_add != nullptr ? bias_add : mm, res_add);
+
+    const repacked_weight * w = get_repacked(mm->src[0], stream);
+
+    ggml_cuda_pool_alloc<uint8_t> a_packed(ctx.pool());
+    ggml_cuda_pool_alloc<uint8_t> a_sf    (ctx.pool());
+    const void * q_packed = nullptr;
+    const void * q_sf     = nullptr;
+    if (!get_quantized_act(src1, M, K, &q_packed, &q_sf, stream)) {
+        a_packed.alloc(ggml_cuda_flashrt::packed_bytes(M, K));
+        a_sf.alloc(ggml_cuda_flashrt::sf_bytes(M, K));
+        const int qrc = ggml_cuda_flashrt::quantize_act_f32(
+            (const float *) src1->data, a_packed.get(), a_sf.get(), M, K, stream);
+        if (qrc != 0) {
+            GGML_ABORT("flashrt: mm+res activation quantize failed (M=%d K=%d rc=%d)", M, K, qrc);
+        }
+        q_packed = a_packed.get();
+        q_sf     = a_sf.get();
+    }
+
+    const int rc = ggml_cuda_flashrt::siglip_ffn_down_bias_res_f32(
+        q_packed, q_sf, w->packed, w->sf, bias,
+        residual->data, (float *) res_add->data, M, N, K, stream, 1.0f);
+    if (rc != 0) {
+        GGML_ABORT("flashrt: mm+res fused gemm failed (M=%d N=%d K=%d rc=%d)", M, N, K, rc);
+    }
+    return true;
+}
+
 void ggml_cuda_flashrt_begin_eval() {
     g_eval_id++;
 }

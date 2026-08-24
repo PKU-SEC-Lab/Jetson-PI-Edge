@@ -3453,6 +3453,69 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
             return 3;
         }
     }
+
+    // GEMM + (bias) + residual: {mul_mat, add bias?, add residual} -> one
+    // GEMM with bias and residual in the epilogue. Kept last so the more
+    // specific windows above win at the same position. The kernel's C-may-
+    // alias-D contract covers the allocator reusing the residual's memory
+    // for the output; any other overlap of the output with an outside-window
+    // source vetoes the fusion (same policy as the SigLIP FFN window).
+    if (node->op == GGML_OP_MUL_MAT && i + 1 < cgraph->n_nodes &&
+        ggml_cuda_info().devices[cuda_ctx->device].cc == 1100) {
+        for (int form = 0; form < 2; ++form) {
+            const int len = form == 0 ? 3 : 2; // with / without bias add
+            if (i + len - 1 >= cgraph->n_nodes) {
+                continue;
+            }
+            const bool seq = form == 0
+                ? ggml_can_fuse_subgraph(cgraph, i, { GGML_OP_MUL_MAT, GGML_OP_ADD, GGML_OP_ADD }, { i + 2 })
+                : ggml_can_fuse_subgraph(cgraph, i, { GGML_OP_MUL_MAT, GGML_OP_ADD }, { i + 1 });
+            if (!seq) {
+                continue;
+            }
+            const ggml_tensor * mm       = cgraph->nodes[i];
+            const ggml_tensor * bias_add = form == 0 ? cgraph->nodes[i + 1] : nullptr;
+            ggml_tensor       * res_add  = cgraph->nodes[i + len - 1];
+            if (!ggml_cuda_flashrt_should_fuse_mm_res(mm, bias_add, res_add)) {
+                continue;
+            }
+            const ggml_tensor * chain    = bias_add != nullptr ? bias_add : mm;
+            const ggml_tensor * residual = res_add->src[0] == chain ? res_add->src[1] : res_add->src[0];
+            bool mem_ok = true;
+            {
+                const auto range_of = [](const ggml_tensor * t, int64_t & lo, int64_t & hi) {
+                    lo = (int64_t) (uintptr_t) t->data;
+                    hi = lo + (int64_t) ggml_nbytes(t);
+                };
+                int64_t d_lo, d_hi;
+                range_of(res_add, d_lo, d_hi);
+                for (int j = i; j < i + len && mem_ok; ++j) {
+                    for (int si = 0; si < GGML_MAX_SRC && mem_ok; ++si) {
+                        const ggml_tensor * src = cgraph->nodes[j]->src[si];
+                        if (!src || src->op == GGML_OP_NONE || src->buffer == nullptr) {
+                            continue;
+                        }
+                        bool elided = false;
+                        for (int k = i; k < j; ++k) {
+                            if (cgraph->nodes[k] == src) { elided = true; break; }
+                        }
+                        if (elided) {
+                            continue;
+                        }
+                        int64_t s_lo, s_hi;
+                        range_of(src, s_lo, s_hi);
+                        const bool overlap = (s_lo <= d_lo && d_lo < s_hi) || (d_lo <= s_lo && s_lo < d_hi);
+                        if (overlap && !(src == residual && s_lo == d_lo && s_hi == d_hi)) {
+                            mem_ok = false;
+                        }
+                    }
+                }
+            }
+            if (mem_ok && ggml_cuda_flashrt_mm_res(*cuda_ctx, mm, bias_add, res_add)) {
+                return len - 1;
+            }
+        }
+    }
 #endif // GGML_CUDA_FLASHRT
 
     // gated_delta_net -> cpy: scatter recurrent-state snapshots into the cache
