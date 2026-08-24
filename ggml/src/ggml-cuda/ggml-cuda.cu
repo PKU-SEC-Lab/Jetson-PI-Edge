@@ -3154,6 +3154,99 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
         }
     }
 
+    // Prefill fused QKV window (17 nodes): {q mm, reshape, rope, scale,
+    // k mm, reshape, rope, pad, v mm, reshape, pad, view, permute, permute,
+    // cpy, permute, cpy} -> fused QKV GEMM + qkv_post writing the padded f16
+    // K/V tensors directly (pad rows zeroed). View-class nodes are exempt
+    // from the use-count check; window outputs are the q scale and the two
+    // copies.
+    if (node->op == GGML_OP_MUL_MAT && i + 16 < cgraph->n_nodes &&
+        ggml_cuda_info().devices[cuda_ctx->device].cc == 1100) {
+        static const enum ggml_op pf_ops[17] = {
+            GGML_OP_MUL_MAT, GGML_OP_RESHAPE, GGML_OP_ROPE, GGML_OP_SCALE,
+            GGML_OP_MUL_MAT, GGML_OP_RESHAPE, GGML_OP_ROPE, GGML_OP_PAD,
+            GGML_OP_MUL_MAT, GGML_OP_RESHAPE, GGML_OP_PAD,
+            GGML_OP_VIEW, GGML_OP_PERMUTE, GGML_OP_PERMUTE, GGML_OP_CPY,
+            GGML_OP_PERMUTE, GGML_OP_CPY };
+        bool pf_seq = true;
+        int  pf_fail_j = -1, pf_fail_why = 0;
+        for (int j = 0; j < 17 && pf_seq; ++j) {
+            const ggml_tensor * t = cgraph->nodes[i + j];
+            if (t->op != pf_ops[j] || (t->flags & GGML_TENSOR_FLAG_COMPUTE) == 0) {
+                pf_seq = false;
+                pf_fail_j = j; pf_fail_why = t->op != pf_ops[j] ? 1 : 2;
+                break;
+            }
+            // j==6 (K rope): its f32 rows are re-emitted by the fused
+            // kernel, so graph-tail persistent-KV stores may keep reading it
+            const bool is_out  = j == 3 || j == 6 || j == 14 || j == 16;
+            const bool is_view = pf_ops[j] == GGML_OP_VIEW || pf_ops[j] == GGML_OP_PERMUTE ||
+                                 pf_ops[j] == GGML_OP_RESHAPE;
+            if (!is_out && (t->flags & GGML_TENSOR_FLAG_OUTPUT)) {
+                pf_seq = false;
+                break;
+            }
+            if (is_out || is_view) {
+                continue;
+            }
+            int uses_in_window = 0;
+            for (int k = j + 1; k < 17; ++k) {
+                const ggml_tensor * o = cgraph->nodes[i + k];
+                for (int si = 0; si < GGML_MAX_SRC; ++si) {
+                    if (o->src[si] == t) {
+                        uses_in_window++;
+                    }
+                }
+            }
+            if (uses_in_window != ggml_node_get_use_count(cgraph, i + j)) {
+                pf_seq = false;
+                pf_fail_j = j; pf_fail_why = 3;
+            }
+        }
+        if (!pf_seq && pf_fail_j > 2 && getenv("GGML_FLASHRT_DEBUG") != nullptr) {
+            static int dbg_pfs = 0;
+            if (dbg_pfs++ < 6) {
+                fprintf(stderr, "[fr-qkv-prefill] seq fail at %d: j=%d why=%d op=%s\n",
+                        i, pf_fail_j, pf_fail_why,
+                        ggml_op_name(cgraph->nodes[i + pf_fail_j]->op));
+            }
+        }
+        if (pf_seq) {
+            const ggml_tensor * q_mm    = cgraph->nodes[i];
+            const ggml_tensor * q_rope  = cgraph->nodes[i + 2];
+            ggml_tensor * q_scale       = cgraph->nodes[i + 3];
+            const ggml_tensor * k_mm    = cgraph->nodes[i + 4];
+            const ggml_tensor * k_rope  = cgraph->nodes[i + 6];
+            const ggml_tensor * k_pad   = cgraph->nodes[i + 7];
+            const ggml_tensor * v_mm    = cgraph->nodes[i + 8];
+            const ggml_tensor * v_pad   = cgraph->nodes[i + 10];
+            ggml_tensor * k_cpy         = cgraph->nodes[i + 14];
+            ggml_tensor * v_cpy         = cgraph->nodes[i + 16];
+            // wiring of the tail views/copies onto the right producers
+            const bool pf_wire =
+                cgraph->nodes[i + 11]->src[0] == q_scale &&
+                cgraph->nodes[i + 12]->src[0] == cgraph->nodes[i + 11] &&
+                cgraph->nodes[i + 13]->src[0] == k_pad &&
+                k_cpy->src[0] == cgraph->nodes[i + 13] &&
+                cgraph->nodes[i + 15]->src[0] == v_pad &&
+                v_cpy->src[0] == cgraph->nodes[i + 15];
+            const bool pf_sf = pf_wire && ggml_cuda_flashrt_should_fuse_qkv_prefill(
+                q_mm, q_rope, q_scale, k_mm, k_rope, k_pad, v_mm, v_pad, k_cpy, v_cpy);
+            if (pf_sf) {
+                ggml_cuda_flashrt_qkv_prefill(*cuda_ctx, q_mm, q_rope, q_scale,
+                                              k_mm, k_rope, v_mm, k_cpy, v_cpy);
+                return 16;
+            }
+            if (getenv("GGML_FLASHRT_DEBUG") != nullptr) {
+                static int dbg_pf = 0;
+                if (dbg_pf++ < 6) {
+                    fprintf(stderr, "[fr-qkv-prefill] window at %d: wire=%d sf=%d\n",
+                            i, (int) pf_wire, (int) pf_sf);
+                }
+            }
+        }
+    }
+
     // SigLIP FA vision QKV pad window: {mul_mat, add bias, reshape}x3 +
     // {pad}x3 -> three padded-weight GEMMs (bias in the epilogue) that write
     // the pad buffers directly (per-head widening baked into the repacked
