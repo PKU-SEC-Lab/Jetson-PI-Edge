@@ -476,7 +476,15 @@ class llm_graph_input_attn_no_cache_pi0 : public llm_graph_input_i {
         void set_input(const llama_ubatch * ubatch) override;
 
         bool is_static_input() const override { return true; }
-    
+
+        bool can_reuse(const llm_graph_params & params) override {
+            // the mask depends only on the ubatch token count, which
+            // llm_graph_params::allow_reuse has already matched; set_input
+            // refills it on every evaluation
+            GGML_UNUSED(params);
+            return self_kq_mask != nullptr;
+        }
+
         ggml_tensor * get_kq_mask()     const { return self_kq_mask_cnv; }
         ggml_tensor * get_kq_mask_swa() const { return self_kq_mask_swa_cnv; }
     
