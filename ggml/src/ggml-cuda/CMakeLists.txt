@@ -176,14 +176,15 @@ if (CUDAToolkit_FOUND)
             ${FLASHRT_ADAPTER_DIR}/fr_dispatch.cu)
 
         # optional AOT FlashAttention-4 module for the SigLIP vision attention
-        set(FLASHRT_FA4_OBJ "${FLASHRT_ADAPTER_DIR}/fa4_aot/fa4_siglip_fwd.o")
-        if (EXISTS "${FLASHRT_FA4_OBJ}")
+        set(FLASHRT_FA4_OBJ  "${FLASHRT_ADAPTER_DIR}/fa4_aot/fa4_siglip_fwd.o")
+        set(FLASHRT_FA4P_OBJ "${FLASHRT_ADAPTER_DIR}/fa4_aot/fa4_prefill_fwd.o")
+        if (EXISTS "${FLASHRT_FA4_OBJ}" AND EXISTS "${FLASHRT_FA4P_OBJ}")
             target_sources(ggml-cuda-flashrt PRIVATE
                 ${FLASHRT_ADAPTER_DIR}/fr_fa4_vit.cu
                 ${FLASHRT_ADAPTER_DIR}/fr_fa4_shims.c)
             target_compile_definitions(ggml-cuda-flashrt PRIVATE GGML_CUDA_FLASHRT_FA4)
-            target_link_libraries(ggml-cuda PRIVATE ${FLASHRT_FA4_OBJ} CUDA::cuda_driver)
-            message(STATUS "GGML_CUDA_FLASHRT: FA4 vision attention enabled")
+            target_link_libraries(ggml-cuda PRIVATE ${FLASHRT_FA4_OBJ} ${FLASHRT_FA4P_OBJ} CUDA::cuda_driver)
+            message(STATUS "GGML_CUDA_FLASHRT: FA4 vision + prefill attention enabled")
         endif()
         set_target_properties(ggml-cuda-flashrt PROPERTIES
             CUDA_STANDARD 17

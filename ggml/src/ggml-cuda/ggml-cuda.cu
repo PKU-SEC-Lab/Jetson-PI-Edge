@@ -3583,6 +3583,11 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
             ggml_cuda_flashrt_vit_fa4(*cuda_ctx, node);
             return 1;
         }
+        // pi0.5 prefill self-attention (head_dim 256, prefix-LM pad mask)
+        if (ggml_cuda_flashrt_should_fuse_prefill_fa4(node, *cuda_ctx)) {
+            ggml_cuda_flashrt_prefill_fa4(*cuda_ctx, node);
+            return 1;
+        }
     }
 
     // Run of terminal f32->f16 row-copy CPYs (persistent encoder-KV stores
