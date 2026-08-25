@@ -264,8 +264,9 @@ public:
     // can reuse the llm_graph_result instance of the context (for example to update a memory module)
     llm_graph_result * get_gf_res_reserve() const;
 
-    // returns the result of ggml_backend_sched_graph_compute_async execution
-    ggml_status graph_compute(ggml_cgraph * gf, bool batched);
+    // returns the result of ggml_backend_sched_graph_compute_async execution;
+    // sched_use overrides the main sched (the pi0 AE decode pair), default main
+    ggml_status graph_compute(ggml_cgraph * gf, bool batched, ggml_backend_sched_t sched_use = nullptr);
 
     // reserve a graph with a dummy ubatch of the specified size
     ggml_cgraph * graph_reserve(
@@ -390,6 +391,14 @@ private:
     llm_graph_result_ptr gf_res_prev;
     llm_graph_result_ptr gf_res_reserve;
 
+    // pi0 action-expert decode keeps its own sched/result pair so the
+    // denoise-step graph and its allocation survive the per-infer prefill
+    // (which resets the main sched). With separate pairs both the prefill
+    // graph and the decode graph reuse across inferences instead of
+    // rebuilding once per inference each.
+    llm_graph_result_ptr   gf_res_ae;
+    ggml_backend_sched_ptr sched_ae;
+
     struct pi0_encoded_kv_gpu_storage {
         ggml_context_ptr            ctx;
         ggml_backend_buffer_ptr     buf;
@@ -397,6 +406,7 @@ private:
         std::vector<ggml_tensor *>  prefix_views; // first-kv_tokens views for the padded-f16 layout
         int64_t                     kv_tokens = 0;
         bool                        padded_f16 = false;
+        int64_t                     ae_graph_n_token = -1; // encoder length the persistent AE graph was built for
     };
 
     pi0_encoded_kv_gpu_storage pi0_enc_kv_gpu;

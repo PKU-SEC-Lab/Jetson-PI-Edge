@@ -1596,6 +1596,10 @@ void llama_context::pi0_refresh_encoded_kv_gpu(const std::vector<ggml_tensor *> 
         if (!pi0_enc_kv_gpu.tensors.empty()) {
             ggml_backend_sched_reset(sched.get());
             gf_res_prev->reset();
+            if (sched_ae) {
+                ggml_backend_sched_reset(sched_ae.get());
+                gf_res_ae->reset();
+            }
         }
 
         pi0_enc_kv_gpu.ctx.reset();
@@ -1671,7 +1675,13 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
         return nullptr;
     }
 
-    auto * res = gf_res_prev.get();
+    // the pi0 action-expert decode runs on its own sched/result pair so its
+    // graph is not clobbered by the per-inference prefill (and vice versa)
+    const bool use_ae_pair = model.arch == LLM_ARCH_PI0 && gtype == LLM_GRAPH_TYPE_DECODER &&
+                             sched_ae != nullptr && gf_res_ae != nullptr;
+    ggml_backend_sched_t sched_cur = use_ae_pair ? sched_ae.get() : sched.get();
+
+    auto * res = use_ae_pair ? gf_res_ae.get() : gf_res_prev.get();
     auto * gf  = res->get_gf();
 
     // the new graph parameters
@@ -1685,15 +1695,15 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
         // on the GPU. we must synchronize before set_inputs to avoid overwriting input tensors
         // that the previous compute is still reading.
         if (cparams.pipeline_parallel) {
-            ggml_backend_sched_synchronize(sched.get());
+            ggml_backend_sched_synchronize(sched_cur);
         }
 
         n_reused++;
     } else {
         res->reset();
 
-        ggml_backend_sched_reset(sched.get());
-        ggml_backend_sched_set_eval_callback(sched.get(), cparams.cb_eval, cparams.cb_eval_user_data);
+        ggml_backend_sched_reset(sched_cur);
+        ggml_backend_sched_set_eval_callback(sched_cur, cparams.cb_eval, cparams.cb_eval_user_data);
 
         //const auto t_start_us = ggml_time_us();
 
@@ -1707,7 +1717,7 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
             return nullptr;
         }
 
-        if (!ggml_backend_sched_alloc_graph(sched.get(), gf)) {
+        if (!ggml_backend_sched_alloc_graph(sched_cur, gf)) {
             LLAMA_LOG_ERROR("%s: failed to allocate graph\n", __func__);
             ret = GGML_STATUS_ALLOC_FAILED;
             return nullptr;
@@ -1724,7 +1734,7 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
         //LLAMA_LOG_INFO("graph set inputs time: %.3f ms\n", (ggml_time_us() - t_start_us)/1000.0);
     }
 
-    const auto status = graph_compute(res->get_gf(), ubatch.n_tokens > 1);
+    const auto status = graph_compute(res->get_gf(), ubatch.n_tokens > 1, sched_cur);
     if (status != GGML_STATUS_SUCCESS) {
         LLAMA_LOG_ERROR("%s: failed to compute graph, compute status: %d\n", __func__, status);
         ret = status;
@@ -2433,6 +2443,24 @@ int llama_context::decode(const llama_batch & batch_inp) {
                         (int) cross.ae_mod_precomp_enabled, (int) cross.ae_mod_ready);
             }
         }
+        // dedicated sched/result pair for the action-expert decode: the
+        // denoise-step graph survives the per-inference prefill, so both
+        // graphs reuse across inferences (see process_ubatch)
+        if (sched_ae == nullptr) {
+            const uint32_t n_tok_max = std::min(cparams.n_ctx, cparams.n_ubatch);
+            const size_t   max_nodes = this->graph_max_nodes(n_tok_max);
+            gf_res_ae.reset(new llm_graph_result(max_nodes));
+            sched_ae.reset(ggml_backend_sched_new(backend_ptrs.data(), backend_buft.data(),
+                                                  backend_ptrs.size(), max_nodes,
+                                                  false, cparams.op_offload));
+        }
+        // the persisting AE graph bakes the encoder length into its KV and
+        // mask shapes: a different prefix length must force a rebuild
+        if (pi0_enc_kv_gpu.ae_graph_n_token != cross.n_token) {
+            gf_res_ae->reset();
+            pi0_enc_kv_gpu.ae_graph_n_token = cross.n_token;
+        }
+
         for (int32_t step = 0; step < hparams.inference_steps; ) {
             const int32_t steps_left = hparams.inference_steps - step;
             const int32_t unroll = unroll_cfg >= 2 && steps_left >= 2
@@ -2473,7 +2501,7 @@ int llama_context::decode(const llama_batch & batch_inp) {
                 return -3;
             }
             const size_t action_nbytes = (size_t) total_action_elements * ggml_element_size(action);
-            pi0_fetch_action_to_host(sched.get(), action, action_data.data(), action_nbytes);
+            pi0_fetch_action_to_host(sched_ae.get(), action, action_data.data(), action_nbytes);
 
             if (cross.ae_mod_precomp_enabled && !cross.ae_mod_ready && unroll == 1) {
                 ggml_cgraph * gf = res->get_gf();
@@ -2520,7 +2548,7 @@ int llama_context::decode(const llama_batch & batch_inp) {
                         }
                         float * dst = cross.ae_mod_cache.data() +
                                 ((size_t) step * cross.ae_mod_count + mi) * width;
-                        pi0_fetch_action_to_host(sched.get(), t, dst, (size_t) width * sizeof(float));
+                        pi0_fetch_action_to_host(sched_ae.get(), t, dst, (size_t) width * sizeof(float));
                     }
                     if (cross.ae_mod_precomp_enabled &&
                             step + 1 == (int32_t) hparams.inference_steps) {
@@ -2553,6 +2581,12 @@ int llama_context::decode(const llama_batch & batch_inp) {
                         }
                         if (cross.ae_mod_gpu != nullptr) {
                             cross.ae_mod_ready = true;
+                            // the cached-modulation graph has a different
+                            // topology than the fill graph: force a rebuild
+                            // on the persistent AE result
+                            if (gf_res_ae) {
+                                gf_res_ae->reset();
+                            }
                             if (getenv("GGML_PI05_MOD_DEBUG")) {
                                 fprintf(stderr, "[mod-precomp] cache ready: steps=%lld count=%lld width=%lld\n",
                                         (long long) cross.ae_mod_steps, (long long) cross.ae_mod_count,
@@ -3288,7 +3322,11 @@ llm_graph_params llama_context::graph_params(
 
 ggml_status llama_context::graph_compute(
             ggml_cgraph * gf,
-                   bool   batched) {
+                   bool   batched,
+    ggml_backend_sched_t  sched_use) {
+    if (sched_use == nullptr) {
+        sched_use = sched.get();
+    }
     int n_threads        = batched ? cparams.n_threads_batch : cparams.n_threads;
     ggml_threadpool_t tp = batched ? threadpool_batch        : threadpool;
 
@@ -3305,7 +3343,7 @@ ggml_status llama_context::graph_compute(
         set_n_threads_fn.second(set_n_threads_fn.first, n_threads);
     }
 
-    auto status = ggml_backend_sched_graph_compute_async(sched.get(), gf);
+    auto status = ggml_backend_sched_graph_compute_async(sched_use, gf);
     if (status != GGML_STATUS_SUCCESS) {
         LLAMA_LOG_ERROR("%s: ggml_backend_sched_graph_compute_async failed with error %d\n", __func__, status);
     }
