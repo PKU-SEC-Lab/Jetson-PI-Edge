@@ -3560,15 +3560,29 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
     }
 
     // SigLIP vision attention (head_dim 80, no mask) through the AOT FA4
-    // module. Consumes the pure-view node that follows the FA node so the
-    // return value is nonzero (same contract as the decode window above).
+    // module. Preferred form also absorbs the {VIEW (head de-pad), CONT}
+    // pair that follows, writing the packed CONT destination directly;
+    // otherwise it consumes just the pure-view node after the FA node so
+    // the return value is nonzero (same contract as the decode window).
     if (node->op == GGML_OP_FLASH_ATTN_EXT && i + 1 < cgraph->n_nodes &&
         ggml_cuda_info().devices[cuda_ctx->device].cc == 1100 &&
         (cgraph->nodes[i + 1]->op == GGML_OP_VIEW || cgraph->nodes[i + 1]->op == GGML_OP_RESHAPE) &&
-        cgraph->nodes[i + 1]->src[0] == node &&
-        ggml_cuda_flashrt_should_fuse_vit_fa4(node, *cuda_ctx)) {
-        ggml_cuda_flashrt_vit_fa4(*cuda_ctx, node);
-        return 1;
+        cgraph->nodes[i + 1]->src[0] == node) {
+        if (i + 2 < cgraph->n_nodes &&
+            cgraph->nodes[i + 1]->op == GGML_OP_VIEW &&
+            cgraph->nodes[i + 2]->op == GGML_OP_CONT &&
+            cgraph->nodes[i + 2]->src[0] == cgraph->nodes[i + 1] &&
+            ggml_node_get_use_count(cgraph, i) == 1 &&
+            ggml_node_get_use_count(cgraph, i + 1) == 1 &&
+            ggml_cuda_flashrt_should_fuse_vit_fa4_depad(node, cgraph->nodes[i + 1],
+                                                        cgraph->nodes[i + 2], *cuda_ctx)) {
+            ggml_cuda_flashrt_vit_fa4_depad(*cuda_ctx, node, cgraph->nodes[i + 1], cgraph->nodes[i + 2]);
+            return 2;
+        }
+        if (ggml_cuda_flashrt_should_fuse_vit_fa4(node, *cuda_ctx)) {
+            ggml_cuda_flashrt_vit_fa4(*cuda_ctx, node);
+            return 1;
+        }
     }
 
     // Run of terminal f32->f16 row-copy CPYs (persistent encoder-KV stores
