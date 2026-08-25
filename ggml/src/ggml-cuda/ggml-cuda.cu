@@ -3559,6 +3559,18 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
         return 1;
     }
 
+    // SigLIP vision attention (head_dim 80, no mask) through the AOT FA4
+    // module. Consumes the pure-view node that follows the FA node so the
+    // return value is nonzero (same contract as the decode window above).
+    if (node->op == GGML_OP_FLASH_ATTN_EXT && i + 1 < cgraph->n_nodes &&
+        ggml_cuda_info().devices[cuda_ctx->device].cc == 1100 &&
+        (cgraph->nodes[i + 1]->op == GGML_OP_VIEW || cgraph->nodes[i + 1]->op == GGML_OP_RESHAPE) &&
+        cgraph->nodes[i + 1]->src[0] == node &&
+        ggml_cuda_flashrt_should_fuse_vit_fa4(node, *cuda_ctx)) {
+        ggml_cuda_flashrt_vit_fa4(*cuda_ctx, node);
+        return 1;
+    }
+
     // Run of terminal f32->f16 row-copy CPYs (persistent encoder-KV stores
     // at the prefill graph tail) -> one batched copy launch. Semantics are
     // unchanged: every copy is still performed, with identical rounding.
