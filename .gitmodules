@@ -1,0 +1,4 @@
+[submodule "ggml/src/ggml-cuda/flashrt/flashrt-public"]
+	path = ggml/src/ggml-cuda/flashrt/flashrt-public
+	url = https://github.com/flashrt-project/FlashRT.git
+	branch = feat/structures-ggml-adapter
