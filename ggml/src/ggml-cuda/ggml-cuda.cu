@@ -3559,6 +3559,29 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
         return 1;
     }
 
+    // Run of terminal f32->f16 row-copy CPYs (persistent encoder-KV stores
+    // at the prefill graph tail) -> one batched copy launch. Semantics are
+    // unchanged: every copy is still performed, with identical rounding.
+    // Nodes whose copy result is read again inside the graph are excluded.
+    if (node->op == GGML_OP_CPY && i + 1 < cgraph->n_nodes &&
+        ggml_cuda_info().devices[cuda_ctx->device].cc == 1100) {
+        int64_t kt_hd = 0, kt_rows = 0;
+        int kt_n = 0;
+        ggml_tensor * kt_nodes[40];
+        while (i + kt_n < cgraph->n_nodes && kt_n < 40) {
+            ggml_tensor * c = cgraph->nodes[i + kt_n];
+            if (c->op != GGML_OP_CPY || (c->flags & GGML_TENSOR_FLAG_COMPUTE) == 0 ||
+                !ggml_cuda_flashrt_kv_tail_cpy_ok(c, &kt_hd, &kt_rows) ||
+                ggml_node_get_use_count(cgraph, i + kt_n) != 0) {
+                break;
+            }
+            kt_nodes[kt_n++] = c;
+        }
+        if (kt_n >= 2 && ggml_cuda_flashrt_kv_tail_cpy(*cuda_ctx, kt_nodes, kt_n)) {
+            return kt_n - 1;
+        }
+    }
+
     // {RMS_NORM, MUL(w), ADD(mul, norm)} -> one Gemma-norm kernel
     // (out = rms_norm(x)*(1+w)). ggml's fused rms_norm cannot express the
     // add-of-norm-output form, so this chain otherwise runs as 3 kernels.
