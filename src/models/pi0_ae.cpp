@@ -310,6 +310,9 @@ llm_build_pi0_ae::llm_build_pi0_ae(const llama_model & model, const llm_graph_pa
         }
 
         ggml_tensor * cur_local = build_lora_mm(model.action_in, actions_in);
+        // full fp32: the projection feeds every denoise step and the CUDA
+        // f16 fallback for f32 matmuls visibly shifts the final actions
+        ggml_mul_mat_set_prec(cur_local, GGML_PREC_F32);
         cur_local = ggml_add(ctx0, cur_local, model.action_in_b);
 
         if (dbg_this) {

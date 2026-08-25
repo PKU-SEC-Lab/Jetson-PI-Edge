@@ -3708,10 +3708,20 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
 
         int out_nodes[] = { i + 3 };
         if (nodes_match &&
-            ggml_cuda_flashrt_should_fuse_geglu(gate_mm, up_mm, glu, down_mm) &&
-            ggml_cuda_check_fusion_memory_ranges(cgraph, i, 4, out_nodes, 1)) {
-            ggml_cuda_flashrt_geglu_ffn(*cuda_ctx, gate_mm, up_mm, glu, down_mm);
-            return 3;
+            ggml_cuda_flashrt_should_fuse_geglu(gate_mm, up_mm, glu, down_mm)) {
+            // the allocator may hand the down output the shared activation
+            // input's block (the input is dead after the gate/up reads).
+            // The fused path consumes that input entirely in its first
+            // kernel (the activation quantize), before the down GEMM
+            // writes, so the exact alias is safe; the weights live in
+            // model buffers and can never overlap the compute pool. Any
+            // other overlap still vetoes via the generic range check.
+            const bool dst_aliases_input = down_mm->data == gate_mm->src[1]->data;
+            if (dst_aliases_input ||
+                ggml_cuda_check_fusion_memory_ranges(cgraph, i, 4, out_nodes, 1)) {
+                ggml_cuda_flashrt_geglu_ffn(*cuda_ctx, gate_mm, up_mm, glu, down_mm);
+                return 3;
+            }
         }
     }
 

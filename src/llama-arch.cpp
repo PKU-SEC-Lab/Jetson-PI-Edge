@@ -662,7 +662,10 @@ static const std::map<llm_tensor, const char *> LLM_TENSOR_NAMES = {
 //
 static const std::map<llm_tensor, llm_tensor_info> LLM_TENSOR_INFOS = {
     {LLM_TENSOR_TOKEN_EMBD,                 {LLM_TENSOR_LAYER_INPUT,     GGML_OP_GET_ROWS}},
-    {LLM_TENSOR_ACTION_IN,                  {LLM_TENSOR_LAYER_INPUT,     GGML_OP_MUL_MAT}},
+    // classified as an output-layer tensor so it offloads with -ngl: the
+    // action projection runs every denoise step and a host-resident weight
+    // forces a CPU split into the decode graph
+    {LLM_TENSOR_ACTION_IN,                  {LLM_TENSOR_LAYER_OUTPUT,    GGML_OP_MUL_MAT}},
     {LLM_TENSOR_ACTION_OUT,                 {LLM_TENSOR_LAYER_OUTPUT,    GGML_OP_MUL_MAT}},
     {LLM_TENSOR_ACTION_TIME_IN,             {LLM_TENSOR_LAYER_INPUT,     GGML_OP_MUL_MAT}},
     {LLM_TENSOR_ACTION_TIME_OUT,            {LLM_TENSOR_LAYER_INPUT,     GGML_OP_MUL_MAT}},
