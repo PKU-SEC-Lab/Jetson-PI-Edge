@@ -12,6 +12,7 @@
 
   <p>
     <a href="https://arxiv.org/abs/2607.12659"><img src="https://img.shields.io/badge/arXiv-2607.12659-b31b1b.svg" alt="arXiv" /></a>
+    <a href="https://www.corl.org/"><img src="https://img.shields.io/badge/CoRL-2026_Accepted-6f42c1.svg" alt="Accepted at CoRL 2026" /></a>
     <a href="https://github.com/PKU-SEC-Lab/Jetson-PI"><img src="https://img.shields.io/badge/Jetson--PI-Algorithm-35b8a9.svg" alt="Jetson-PI algorithm" /></a>
     <a href="https://huggingface.co/diantoudefengshan/Jetson-PI-GGUF"><img src="https://img.shields.io/badge/Model-GGUF-f5c542.svg" alt="GGUF checkpoints" /></a>
     <a href="https://github.com/ggml-org/llama.cpp"><img src="https://img.shields.io/badge/Based_on-llama.cpp-3578c8.svg" alt="Based on llama.cpp" /></a>
@@ -33,6 +34,7 @@
 
 ## News
 
+- **[2026/09] Jetson-PI has been accepted at CoRL 2026!**
 - **[2026/08] Pre-converted GGUF checkpoints are available.** Ready-to-use PI0, PI0.5, and GR00T N1.7 main-model and vision-projector GGUF files are released on [Hugging Face](https://huggingface.co/diantoudefengshan/Jetson-PI-GGUF).
 - **[2026/08] NVIDIA Isaac GR00T N1.7 inference is available.** Convert the official checkpoint to GGUF and run the complete Qwen3-VL backbone, Action Head, and four-step action flow through either `libjetson_pi_gr00t` or the foreground HTTP server.
 - **[2026/07] Python APIs are available.** Use the managed foreground NumPy client for persistent `llama-server` sessions or the optional pybind11 module for in-process PI0/PI0.5 action inference.
@@ -46,7 +48,7 @@ Jetson-PI-Edge is the inference engine accompanying our paper:
 
 > **[Jetson-PI: Towards Onboard Real-Time Robot Control via Foresight-Aligned Asynchronous Inference](https://arxiv.org/abs/2607.12659)**<br>
 > Zebin Yang, Qi Wang, Yunhe Wang, Xiurui Guo, Bo Yu, Shaoshan Liu, Jiafeng Xu, Hao Dong, and Meng Li.<br>
-> arXiv:2607.12659, 2026.
+> Accepted at the Conference on Robot Learning (CoRL), 2026.
 
 Deploying VLA policies on low-power onboard hardware is difficult because model latency directly limits control frequency and responsiveness. Jetson-PI combines foresight-aligned asynchronous correction with confidence-aware scheduling and system-level acceleration. This repository provides the llama.cpp-based execution layer: GGUF model loading, multimodal encoding, PI and GR00T action inference, graph reuse, and robot-facing runtime interfaces.
 
@@ -443,11 +445,12 @@ Latency is measured in milliseconds on NVIDIA Jetson Orin in MAXN mode. See the 
 If Jetson-PI or Jetson-PI-Edge helps your research, please cite our paper:
 
 ```bibtex
-@article{yang2026jetson,
+@inproceedings{yang2026jetson,
   title={Jetson-PI: Towards Onboard Real-Time Robot Control via Foresight-Aligned Asynchronous Inference},
   author={Yang, Zebin and Wang, Qi and Wang, Yunhe and Guo, Xiurui and Yu, Bo and Liu, Shaoshan and Xu, Jiafeng and Dong, Hao and Li, Meng},
-  journal={arXiv preprint arXiv:2607.12659},
-  year={2026}
+  booktitle={Conference on Robot Learning (CoRL)},
+  year={2026},
+  url={https://arxiv.org/abs/2607.12659}
 }
 ```
 
