@@ -34,7 +34,7 @@
 
 ## News
 
-- **[2026/09] Jetson-PI has been accepted at CoRL 2026!**
+- **[2026/09] 🎉🎉🎉 Jetson-PI has been accepted at CoRL 2026!**
 - **[2026/08] Pre-converted GGUF checkpoints are available.** Ready-to-use PI0, PI0.5, and GR00T N1.7 main-model and vision-projector GGUF files are released on [Hugging Face](https://huggingface.co/diantoudefengshan/Jetson-PI-GGUF).
 - **[2026/08] NVIDIA Isaac GR00T N1.7 inference is available.** Convert the official checkpoint to GGUF and run the complete Qwen3-VL backbone, Action Head, and four-step action flow through either `libjetson_pi_gr00t` or the foreground HTTP server.
 - **[2026/07] Python APIs are available.** Use the managed foreground NumPy client for persistent `llama-server` sessions or the optional pybind11 module for in-process PI0/PI0.5 action inference.
@@ -445,12 +445,11 @@ Latency is measured in milliseconds on NVIDIA Jetson Orin in MAXN mode. See the 
 If Jetson-PI or Jetson-PI-Edge helps your research, please cite our paper:
 
 ```bibtex
-@inproceedings{yang2026jetson,
+@article{yang2026jetson,
   title={Jetson-PI: Towards Onboard Real-Time Robot Control via Foresight-Aligned Asynchronous Inference},
   author={Yang, Zebin and Wang, Qi and Wang, Yunhe and Guo, Xiurui and Yu, Bo and Liu, Shaoshan and Xu, Jiafeng and Dong, Hao and Li, Meng},
-  booktitle={Conference on Robot Learning (CoRL)},
-  year={2026},
-  url={https://arxiv.org/abs/2607.12659}
+  journal={arXiv preprint arXiv:2607.12659},
+  year={2026}
 }
 ```
 
